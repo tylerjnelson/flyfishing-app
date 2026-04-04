@@ -26,3 +26,15 @@ dist/
 
 # Logs
 *.log
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Certificates / keys (safety net)
+*.pem
+*.key
+
+# Alembic (versions folder should be committed, but not this if generated)
+alembic.ini
