@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Environment / secrets
+.env
+app.env
+*.env
+
+# Node
+node_modules/
+dist/
+
+# OS
+.DS_Store
+*.swp
+
+# Uploads / data
+/data/
+
+# Spec
+/dev-instructions/
+
+# Logs
+*.log
