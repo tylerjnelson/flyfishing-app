@@ -33,6 +33,11 @@ REFRESH_TOKEN_EXPIRE_DAYS = 90
 ALGORITHM = "HS256"
 
 
+def _as_utc(dt: datetime) -> datetime:
+    """Make dt timezone-aware (UTC). SQLite returns naive datetimes; PostgreSQL returns aware."""
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
 # ---------------------------------------------------------------------------
 # Token utilities
 # ---------------------------------------------------------------------------
@@ -126,7 +131,7 @@ async def verify_magic_link(
         raise ValueError("Invalid token")
     if record.used_at is not None:
         raise ValueError("Token already used")
-    if record.expires_at < datetime.now(tz=timezone.utc):
+    if _as_utc(record.expires_at) < datetime.now(tz=timezone.utc):
         raise ValueError("Token expired")
 
     # Mark used — single-use enforcement
@@ -174,7 +179,7 @@ async def rotate_refresh_token(
 
     if not session:
         raise ValueError("Invalid refresh token")
-    if session.expires_at < datetime.now(tz=timezone.utc):
+    if _as_utc(session.expires_at) < datetime.now(tz=timezone.utc):
         raise ValueError("Refresh token expired")
 
     result = await db.execute(select(User).where(User.id == session.user_id))
