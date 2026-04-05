@@ -9,13 +9,15 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Integer,
+    JSON,
     Numeric,
     String,
     Text,
     UniqueConstraint,
+    Uuid,
     func,
 )
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, relationship
 from sqlalchemy.types import UserDefinedType
 
@@ -63,10 +65,10 @@ class Base(DeclarativeBase):
 class User(Base):
     __tablename__ = "users"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id = Column(Uuid(), primary_key=True, default=uuid.uuid4)
     email = Column(Text, unique=True, nullable=False)
     display_name = Column(Text)
-    preferences = Column(JSONB, default=dict)  # profile-scoped intake answers
+    preferences = Column(JSON, default=dict)  # profile-scoped intake answers
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     is_active = Column(Boolean, default=True)
 
@@ -80,8 +82,8 @@ class User(Base):
 class Session(Base):
     __tablename__ = "sessions"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"))
+    id = Column(Uuid(), primary_key=True, default=uuid.uuid4)
+    user_id = Column(Uuid(), ForeignKey("users.id"))
     refresh_token = Column(Text, unique=True, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     expires_at = Column(DateTime(timezone=True), nullable=False)
@@ -94,7 +96,7 @@ class Session(Base):
 class MagicLinkToken(Base):
     __tablename__ = "magic_link_tokens"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id = Column(Uuid(), primary_key=True, default=uuid.uuid4)
     email = Column(Text, nullable=False)
     token_hash = Column(Text, unique=True, nullable=False)  # SHA-256, never plaintext
     expires_at = Column(DateTime(timezone=True), nullable=False)  # NOW() + 15 min
@@ -104,7 +106,7 @@ class MagicLinkToken(Base):
 class Spot(Base):
     __tablename__ = "spots"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id = Column(Uuid(), primary_key=True, default=uuid.uuid4)
     name = Column(Text, nullable=False)
     aliases = Column(ARRAY(Text))
     type = Column(String, nullable=False)  # river | lake | creek | coastal
@@ -155,8 +157,8 @@ class Spot(Base):
 class Note(Base):
     __tablename__ = "notes"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    spot_id = Column(UUID(as_uuid=True), ForeignKey("spots.id"))
+    id = Column(Uuid(), primary_key=True, default=uuid.uuid4)
+    spot_id = Column(Uuid(), ForeignKey("spots.id"))
     note_date = Column(Date)
     title = Column(Text)
     content = Column(Text, nullable=False)
@@ -172,10 +174,10 @@ class Note(Base):
     time_of_day = Column(Text)
     embedding = Column(Vector(768))
     # fts is a GENERATED column — defined in migration, not mapped here
-    author_id = Column(UUID(as_uuid=True), ForeignKey("users.id"))
+    author_id = Column(Uuid(), ForeignKey("users.id"))
     # trip_id FK is added by migration 0002 (circular FK resolution)
-    trip_id: Optional[Column] = Column(UUID(as_uuid=True), ForeignKey("trips.id"), nullable=True)
-    parent_note_id = Column(UUID(as_uuid=True), ForeignKey("notes.id"), nullable=True)
+    trip_id: Optional[Column] = Column(Uuid(), ForeignKey("trips.id"), nullable=True)
+    parent_note_id = Column(Uuid(), ForeignKey("notes.id"), nullable=True)
     # set on extracted map records; points to source handwritten note
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     processing_notes = Column(Text)
@@ -191,9 +193,9 @@ class Note(Base):
 class Trip(Base):
     __tablename__ = "trips"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"))
-    spot_id = Column(UUID(as_uuid=True), ForeignKey("spots.id"))
+    id = Column(Uuid(), primary_key=True, default=uuid.uuid4)
+    user_id = Column(Uuid(), ForeignKey("users.id"))
+    spot_id = Column(Uuid(), ForeignKey("spots.id"))
     trip_date = Column(Date)
     departure_time = Column(DateTime(timezone=True))
     return_time = Column(DateTime(timezone=True))
@@ -201,7 +203,7 @@ class Trip(Base):
     state = Column(String, default="PLANNED")
     # PLANNED | IMMINENT | IN_WINDOW | POST_TRIP | DEBRIEFED
     conditions_snapshot = Column(JSONB)
-    debrief_note_id = Column(UUID(as_uuid=True), ForeignKey("notes.id"), nullable=True)
+    debrief_note_id = Column(Uuid(), ForeignKey("notes.id"), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     user = relationship("User", back_populates="trips")
@@ -214,14 +216,14 @@ class Trip(Base):
 class Conversation(Base):
     __tablename__ = "conversations"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"))
-    trip_id = Column(UUID(as_uuid=True), ForeignKey("trips.id"))
+    id = Column(Uuid(), primary_key=True, default=uuid.uuid4)
+    user_id = Column(Uuid(), ForeignKey("users.id"))
+    trip_id = Column(Uuid(), ForeignKey("trips.id"))
     started_at = Column(DateTime(timezone=True), server_default=func.now())
     last_active = Column(DateTime(timezone=True))
     session_candidates = Column(JSONB)
-    excluded_spot_ids = Column(ARRAY(UUID(as_uuid=True)))
-    surfaced_spot_ids = Column(ARRAY(UUID(as_uuid=True)))
+    excluded_spot_ids = Column(ARRAY(Uuid()))
+    surfaced_spot_ids = Column(ARRAY(Uuid()))
     pending_filter_update = Column(JSONB)
     # written by streaming handler when [FILTER_UPDATE] intercepted;
     # read by POST /chat/confirm-filter; cleared after Yes or No
@@ -234,8 +236,8 @@ class Conversation(Base):
 class Message(Base):
     __tablename__ = "messages"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    conversation_id = Column(UUID(as_uuid=True), ForeignKey("conversations.id"))
+    id = Column(Uuid(), primary_key=True, default=uuid.uuid4)
+    conversation_id = Column(Uuid(), ForeignKey("conversations.id"))
     role = Column(String, nullable=False)  # user | assistant
     content = Column(Text, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -246,8 +248,8 @@ class Message(Base):
 class ConditionsCache(Base):
     __tablename__ = "conditions_cache"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    spot_id = Column(UUID(as_uuid=True), ForeignKey("spots.id"))
+    id = Column(Uuid(), primary_key=True, default=uuid.uuid4)
+    spot_id = Column(Uuid(), ForeignKey("spots.id"))
     source = Column(Text, nullable=False)
     fetched_at = Column(DateTime(timezone=True), server_default=func.now())
     data = Column(JSONB, nullable=False)
@@ -260,8 +262,8 @@ class ConditionsCache(Base):
 class ResponseCache(Base):
     __tablename__ = "response_cache"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    spot_id = Column(UUID(as_uuid=True), ForeignKey("spots.id"))
+    id = Column(Uuid(), primary_key=True, default=uuid.uuid4)
+    spot_id = Column(Uuid(), ForeignKey("spots.id"))
     conditions_hash = Column(Text, nullable=False)
     response_text = Column(Text, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -274,8 +276,8 @@ class ResponseCache(Base):
 class StockingEvent(Base):
     __tablename__ = "stocking_events"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    spot_id = Column(UUID(as_uuid=True), ForeignKey("spots.id"))
+    id = Column(Uuid(), primary_key=True, default=uuid.uuid4)
+    spot_id = Column(Uuid(), ForeignKey("spots.id"))
     stocked_date = Column(Date)
     species = Column(Text)
     count = Column(Integer)
@@ -289,8 +291,8 @@ class StockingEvent(Base):
 class EmergencyClosure(Base):
     __tablename__ = "emergency_closures"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    spot_id = Column(UUID(as_uuid=True), ForeignKey("spots.id"))
+    id = Column(Uuid(), primary_key=True, default=uuid.uuid4)
+    spot_id = Column(Uuid(), ForeignKey("spots.id"))
     rule_text = Column(Text, nullable=False)
     effective = Column(Date)
     expires = Column(Date)
@@ -303,9 +305,9 @@ class EmergencyClosure(Base):
 class SavedSpot(Base):
     __tablename__ = "saved_spots"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"))
-    spot_id = Column(UUID(as_uuid=True), ForeignKey("spots.id"))
+    id = Column(Uuid(), primary_key=True, default=uuid.uuid4)
+    user_id = Column(Uuid(), ForeignKey("users.id"))
+    spot_id = Column(Uuid(), ForeignKey("spots.id"))
     personal_notes = Column(Text)
     saved_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -318,7 +320,7 @@ class SavedSpot(Base):
 class BackupChecksum(Base):
     __tablename__ = "backup_checksums"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id = Column(Uuid(), primary_key=True, default=uuid.uuid4)
     recorded_at = Column(DateTime(timezone=True), server_default=func.now())
     spots_count = Column(Integer, nullable=False)
     notes_count = Column(Integer, nullable=False)
