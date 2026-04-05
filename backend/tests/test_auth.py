@@ -148,7 +148,8 @@ class TestRequestMagicLink:
         record = result.scalar_one_or_none()
         assert record is not None
         assert record.used_at is None
-        assert record.expires_at > datetime.now(tz=timezone.utc)
+        # SQLite returns naive datetimes; compare naive to naive
+        assert record.expires_at > datetime.now()
 
     async def test_unknown_email_writes_no_token(self, db):
         with patch("auth.service._send_magic_link_email") as mock_send:
