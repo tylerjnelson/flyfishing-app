@@ -1,0 +1,23 @@
+# Fly Fish WA — application log rotation
+# Deploy to: /etc/logrotate.d/flyfish
+#
+# The app writes structured JSON logs to /var/log/flyfish/app.log via
+# WatchedFileHandler in main.py.  WatchedFileHandler detects the inode
+# change produced by copytruncate and reopens the file automatically —
+# no postrotate signal required.
+#
+# Setup (once, on the server):
+#   mkdir -p /var/log/flyfish
+#   chown flyfish:flyfish /var/log/flyfish
+#   chmod 750 /var/log/flyfish
+
+/var/log/flyfish/app.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    create 0640 flyfish flyfish
+}
