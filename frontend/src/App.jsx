@@ -7,6 +7,8 @@ import Login from './pages/Login'
 import AuthVerify from './pages/AuthVerify'
 import Onboarding from './pages/Onboarding'
 import Settings from './pages/Settings'
+import Spots from './pages/Spots'
+import SpotDetail from './pages/SpotDetail'
 
 // Placeholder pages for routes built in later phases
 const Placeholder = ({ name }) => (
@@ -58,10 +60,10 @@ export default function App() {
           <ProtectedRoute><Placeholder name="Trip" /></ProtectedRoute>
         } />
         <Route path="/spots" element={
-          <ProtectedRoute><Placeholder name="Spots" /></ProtectedRoute>
+          <ProtectedRoute><Spots /></ProtectedRoute>
         } />
         <Route path="/spots/:spotId" element={
-          <ProtectedRoute><Placeholder name="Spot" /></ProtectedRoute>
+          <ProtectedRoute><SpotDetail /></ProtectedRoute>
         } />
         <Route path="/notes" element={
           <ProtectedRoute><Placeholder name="Notes" /></ProtectedRoute>

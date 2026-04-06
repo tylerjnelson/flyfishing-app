@@ -121,13 +121,13 @@ async def correlation_id_middleware(request: Request, call_next) -> Response:
 # ---------------------------------------------------------------------------
 
 from auth.router import router as auth_router
+from spots.router import router as spots_router
 from users.router import router as users_router
 
 app.include_router(auth_router, prefix="/api/auth", tags=["auth"])
 app.include_router(users_router, prefix="/api/users", tags=["users"])
+app.include_router(spots_router, prefix="/api/spots", tags=["spots"])
 
-# Phase 3:  from spots.router import router as spots_router
-#           app.include_router(spots_router, prefix="/api/spots")
 # Phase 4:  from notes.router import router as notes_router
 #           app.include_router(notes_router, prefix="/api/notes")
 # Phase 5:  from chat.router import router as chat_router

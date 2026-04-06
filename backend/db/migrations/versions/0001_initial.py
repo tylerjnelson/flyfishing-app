@@ -118,7 +118,7 @@ def upgrade() -> None:
         "WITH (m = 16, ef_construction = 64)"
     )
     op.execute("CREATE INDEX ON spots USING gin(name gin_trgm_ops)")
-    op.execute("CREATE INDEX ON spots USING gin(aliases gin_trgm_ops)")
+    op.execute("CREATE INDEX ON spots USING gin(aliases)")  # text[] — plain GIN, no trgm
 
     # ------------------------------------------------------------------
     # trips  (must exist before notes so notes can FK to it in 0002)

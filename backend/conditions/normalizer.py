@@ -231,21 +231,30 @@ def normalize_snotel(raw: dict, station_id: str, fetched_at: datetime) -> dict:
 
 def normalize_wdfw_stocking(records: list, fetched_at: datetime) -> list[dict]:
     """
-    Normalizes WDFW Socrata stocking records into a flat list suitable for
-    upsert into the stocking_events table.
+    Normalizes WDFW Fish Plants Socrata records (dataset 6fex-3r7d) into a
+    flat list suitable for upsert into the stocking_events table.
+
+    Field mapping for dataset 6fex-3r7d:
+      release_location  → water_name
+      county            → county
+      release_start_date → stocked_date
+      species           → species
+      number_released   → count
+      lifestage         → size_description
+      geo_code          → source_record_id
     """
     normalized = []
     for r in records:
         normalized.append({
             "source": "wdfw_stocking",
             "fetched_at": fetched_at.isoformat(),
-            "water_name": r.get("waterbody_name") or r.get("water_name"),
-            "county": r.get("county"),
-            "stocked_date": r.get("stocking_date") or r.get("date"),
+            "water_name": r.get("release_location"),
+            "county": (r.get("county") or "").strip() or None,
+            "stocked_date": r.get("release_start_date") or r.get("release_end_date"),
             "species": r.get("species"),
-            "count": _safe_int(r.get("number_of_fish") or r.get("count")),
-            "size_description": r.get("average_length") or r.get("size"),
-            "source_record_id": r.get(":id") or r.get("id"),
+            "count": _safe_int(r.get("number_released")),
+            "size_description": r.get("lifestage"),
+            "source_record_id": r.get("geo_code") or r.get(":id"),
         })
     return normalized
 
