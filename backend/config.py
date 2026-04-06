@@ -18,6 +18,9 @@ class Settings:
         self.mail_from = _require("MAIL_FROM")
         self.airnow_api_key = _require("AIRNOW_API_KEY")
         self.here_api_key = _require("HERE_API_KEY")
+        # NPS Developer API key — free at https://www.nps.gov/subjects/developer/get-started.htm
+        # Falls back to DEMO_KEY (50 req/hr) if not set; real key allows 1000 req/hr.
+        self.nps_api_key = os.environ.get("NPS_API_KEY", "DEMO_KEY")
 
 
 settings = Settings()

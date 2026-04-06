@@ -177,7 +177,7 @@ async def _run(dry_run: bool) -> None:
         "seed_wta_complete",
         extra={
             "updated": updated,
-            "created": created,
+            "spots_created": created,
             "no_reports": no_reports,
             "dry_run": dry_run,
         },

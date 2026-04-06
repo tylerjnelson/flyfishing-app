@@ -39,3 +39,4 @@ inciweb_breaker = pybreaker.CircuitBreaker(**_CB, name="inciweb")
 routing_breaker = pybreaker.CircuitBreaker(fail_max=2, reset_timeout=60, name="routing")
 # HERE routing: tighter thresholds (fail_max=2, reset_timeout=60) per §6.3 —
 # faster fallback to Haversine estimate when HERE is unavailable.
+nps_breaker = pybreaker.CircuitBreaker(**_CB, name="nps")

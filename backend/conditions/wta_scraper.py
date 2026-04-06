@@ -1,6 +1,6 @@
-# Fingerprint: .trip-report-list, .trip-report, article.trip-report — validated YYYY-MM-DD
-# NOTE: validate selector against https://www.wta.org/go-hiking/hikes/{slug}
-#       at Phase 1 exit and update the date above.
+# Fingerprint: h3 a[href*="trip_report"] in @@related_tripreport_listing — validated 2026-04-06
+# NOTE: validate selector against https://www.wta.org/go-hiking/hikes/{slug}/@@related_tripreport_listing
+#       and update the date above if structure changes.
 """
 WTA trail report scraper — daily 3AM Pacific via APScheduler.
 
@@ -8,11 +8,16 @@ For each spot with a wta_trail_url, fetches recent trip reports and runs
 them through the WTA fishing-intent classifier (§18.7).  Reports with no
 fishing signal are discarded entirely — no location extraction attempted.
 
+Trip reports are fetched from the @@related_tripreport_listing sub-URL
+(WTA loads reports via AJAX on the main page; the listing URL returns
+pre-rendered HTML directly).
+
 Wrapped with the wta_breaker circuit breaker.
 Raises ScraperStructureError if the page structure has changed.
 """
 
 import logging
+import re
 from datetime import datetime, timezone
 
 import httpx
@@ -29,8 +34,11 @@ log = logging.getLogger(__name__)
 _TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=5.0, pool=5.0)
 _REPORT_LIMIT = 10  # max recent reports to process per trail per run
 
-# Structural fingerprints — at least one must be present
-_FINGERPRINT_SELECTORS = ".trip-report-list, .trip-report, article.trip-report"
+# Fingerprint: trip report headings link to URLs containing /trip_report (matches trip_report- slugs)
+_FINGERPRINT_SELECTOR = 'h3 a[href*="trip_report"]'
+
+# Date pattern embedded in report headings: "Trail Name — Mar. 26, 2026"
+_DATE_RE = re.compile(r"—\s+(\w+\.?\s+\d+,\s+\d{4})")
 
 _WTA_FISHING_INTENT_DEFAULT = {"fishing_intent": False}
 
@@ -71,27 +79,45 @@ async def fetch_wta_reports(wta_trail_url: str) -> list[dict] | None:
 
 @wta_breaker
 async def _scrape_reports(url: str) -> list[dict]:
+    listing_url = url.rstrip("/") + "/@@related_tripreport_listing"
+
     async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True) as client:
-        resp = await client.get(url)
+        resp = await client.get(listing_url)
         resp.raise_for_status()
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    if not soup.select_one(_FINGERPRINT_SELECTORS):
+    if not soup.select_one(_FINGERPRINT_SELECTOR):
         raise ScraperStructureError(
             source="wta",
-            url=url,
-            detail="Expected trip report selector not found — WTA page structure may have changed",
+            url=listing_url,
+            detail="Expected 'h3 a[href*=trip_report]' not found — WTA listing structure may have changed",
         )
 
     reports = []
-    for item in soup.select(".trip-report, article.trip-report")[:_REPORT_LIMIT]:
-        text = item.get_text(separator=" ", strip=True)
-        if not text:
-            continue
-        date_tag = item.select_one("time, .date, .trip-report-date")
-        date_str = date_tag.get("datetime") or date_tag.get_text(strip=True) if date_tag else None
-        reports.append({"text": text, "date": date_str})
+    headings = soup.select("h3")[:_REPORT_LIMIT]
+
+    for h3 in headings:
+        # Extract date from heading text: "Trail Name — Mar. 26, 2026"
+        heading_text = h3.get_text(separator=" ", strip=True)
+        date_str = None
+        m = _DATE_RE.search(heading_text)
+        if m:
+            date_str = m.group(1)
+
+        # Collect all text from siblings until the next h3
+        parts = [heading_text]
+        for sibling in h3.next_siblings:
+            if getattr(sibling, "name", None) == "h3":
+                break
+            if hasattr(sibling, "get_text"):
+                text = sibling.get_text(separator=" ", strip=True)
+                if text:
+                    parts.append(text)
+
+        full_text = " ".join(parts)
+        if full_text:
+            reports.append({"text": full_text, "date": date_str})
 
     return reports
 

@@ -33,6 +33,7 @@ from sqlalchemy import select, text
 from config import settings
 from conditions.noaa_nwrfc import fetch_noaa_nwrfc, resolve_gauge_id
 from conditions.inciweb import fetch_inciweb
+from conditions.nps_alerts import fetch_nps_alerts
 from conditions.snotel import fetch_snotel
 from conditions.wdfw_emergency import fetch_wdfw_emergency
 from conditions.wdfw_regulations import fetch_and_update_regulations
@@ -84,6 +85,12 @@ def start_scheduler() -> None:
         job_noaa_nwrfc,
         trigger=IntervalTrigger(hours=2),
         id="noaa_nwrfc",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        job_nps_alerts,
+        trigger=IntervalTrigger(hours=2),
+        id="nps_alerts",
         replace_existing=True,
     )
 
@@ -175,6 +182,27 @@ async def job_inciweb() -> None:
         "job": "inciweb",
         "wa_fires": len(data.get("active_wa_fires", [])),
     })
+
+
+# ---------------------------------------------------------------------------
+# NPS park alerts — 2-hour (NOCA + OLYM)
+# ---------------------------------------------------------------------------
+
+async def job_nps_alerts() -> None:
+    log.info("job_start", extra={"job": "nps_alerts"})
+    data = await fetch_nps_alerts()
+    if data is None:
+        log.warning("job_stale_fallback", extra={"job": "nps_alerts"})
+        return
+
+    async with AsyncSessionLocal() as session:
+        async with session.begin():
+            await _write_conditions_cache(
+                session, spot_id=None, source="nps_alerts", data=data
+            )
+
+    total = sum(p["alert_count"] for p in data.get("parks", {}).values())
+    log.info("job_done", extra={"job": "nps_alerts", "total_alerts": total})
 
 
 # ---------------------------------------------------------------------------
