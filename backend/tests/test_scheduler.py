@@ -14,13 +14,19 @@ _EXPECTED_JOB_IDS = {
     "wdfw_emergency",
     "inciweb",
     "noaa_nwrfc",
+    "nps_alerts",
     "wdfw_stocking",
     "wta",
     "snotel",
+    "score_all_spots",
+    "wdfw_regulations",
 }
 
-_TWO_HOUR_JOBS = {"wdfw_emergency", "inciweb", "noaa_nwrfc"}
-_DAILY_JOBS = {"wdfw_stocking", "wta", "snotel"}
+_TWO_HOUR_JOBS = {"wdfw_emergency", "inciweb", "noaa_nwrfc", "nps_alerts"}
+# All scheduled non-realtime jobs that use CronTrigger
+_CRON_JOBS = {"wdfw_stocking", "wta", "snotel", "score_all_spots", "wdfw_regulations"}
+# 3 AM Pacific jobs (excludes score_all_spots at 3:30, wdfw_regulations annual)
+_THREE_AM_JOBS = {"wdfw_stocking", "wta", "snotel"}
 
 
 def _make_test_scheduler() -> AsyncIOScheduler:
@@ -37,8 +43,9 @@ def _register_jobs(scheduler: AsyncIOScheduler) -> None:
     from apscheduler.triggers.cron import CronTrigger
     from apscheduler.triggers.interval import IntervalTrigger
     from conditions.scheduler import (
-        job_inciweb, job_noaa_nwrfc, job_snotel,
+        job_inciweb, job_noaa_nwrfc, job_nps_alerts, job_snotel,
         job_wdfw_emergency, job_wdfw_stocking, job_wta,
+        job_score_all_spots, job_wdfw_regulations,
     )
 
     scheduler.add_job(job_wdfw_emergency, IntervalTrigger(hours=2),
@@ -49,11 +56,19 @@ def _register_jobs(scheduler: AsyncIOScheduler) -> None:
                       next_run_time=datetime.now(tz=timezone.utc))
     scheduler.add_job(job_noaa_nwrfc, IntervalTrigger(hours=2),
                       id="noaa_nwrfc", replace_existing=True)
+    scheduler.add_job(job_nps_alerts, IntervalTrigger(hours=2),
+                      id="nps_alerts", replace_existing=True)
 
     _daily = CronTrigger(hour=3, minute=0, timezone="America/Los_Angeles")
     scheduler.add_job(job_wdfw_stocking, _daily, id="wdfw_stocking", replace_existing=True)
     scheduler.add_job(job_wta, _daily, id="wta", replace_existing=True)
     scheduler.add_job(job_snotel, _daily, id="snotel", replace_existing=True)
+    scheduler.add_job(job_score_all_spots,
+                      CronTrigger(hour=3, minute=30, timezone="America/Los_Angeles"),
+                      id="score_all_spots", replace_existing=True)
+    scheduler.add_job(job_wdfw_regulations,
+                      CronTrigger(month=12, day=1, hour=4, minute=0, timezone="America/Los_Angeles"),
+                      id="wdfw_regulations", replace_existing=True)
 
 
 class TestSchedulerJobRegistration:
@@ -72,10 +87,10 @@ class TestSchedulerJobRegistration:
                 assert isinstance(job.trigger, IntervalTrigger), \
                     f"{job.id} should use IntervalTrigger"
 
-    def test_daily_jobs_use_cron_trigger(self):
+    def test_cron_jobs_use_cron_trigger(self):
         from apscheduler.triggers.cron import CronTrigger
         for job in self.scheduler.get_jobs():
-            if job.id in _DAILY_JOBS:
+            if job.id in _CRON_JOBS:
                 assert isinstance(job.trigger, CronTrigger), \
                     f"{job.id} should use CronTrigger"
 
@@ -87,14 +102,20 @@ class TestSchedulerJobRegistration:
                 assert job.trigger.interval == timedelta(hours=2), \
                     f"{job.id} interval should be 2 hours"
 
-    def test_daily_jobs_fire_at_3am(self):
+    def test_three_am_jobs_fire_at_3am(self):
         for job in self.scheduler.get_jobs():
-            if job.id in _DAILY_JOBS:
+            if job.id in _THREE_AM_JOBS:
                 fields = {f.name: f for f in job.trigger.fields}
                 assert str(fields["hour"]) == "3", \
                     f"{job.id} should fire at hour 3"
                 assert str(fields["minute"]) == "0", \
                     f"{job.id} should fire at minute 0"
+
+    def test_score_all_spots_fires_at_3_30am(self):
+        job = next(j for j in self.scheduler.get_jobs() if j.id == "score_all_spots")
+        fields = {f.name: f for f in job.trigger.fields}
+        assert str(fields["hour"]) == "3"
+        assert str(fields["minute"]) == "30"
 
     def test_no_realtime_fetchers_scheduled(self):
         """USGS, NOAA NWS, AirNow are session-triggered — must not appear here."""
@@ -110,9 +131,11 @@ class TestJobFunctionCallables:
     def test_job_functions_are_coroutines(self):
         import asyncio
         from conditions.scheduler import (
-            job_inciweb, job_noaa_nwrfc, job_snotel,
+            job_inciweb, job_noaa_nwrfc, job_nps_alerts, job_snotel,
             job_wdfw_emergency, job_wdfw_stocking, job_wta,
+            job_score_all_spots, job_wdfw_regulations,
         )
-        for fn in [job_wdfw_emergency, job_inciweb, job_noaa_nwrfc,
-                   job_wdfw_stocking, job_wta, job_snotel]:
+        for fn in [job_wdfw_emergency, job_inciweb, job_noaa_nwrfc, job_nps_alerts,
+                   job_wdfw_stocking, job_wta, job_snotel,
+                   job_score_all_spots, job_wdfw_regulations]:
             assert asyncio.iscoroutinefunction(fn), f"{fn.__name__} must be async"

@@ -11,6 +11,7 @@ from conditions.circuit_breaker import (
     inciweb_breaker,
     noaa_nwrfc_breaker,
     noaa_nws_breaker,
+    nps_breaker,
     routing_breaker,
     snotel_breaker,
     usgs_breaker,
@@ -30,6 +31,7 @@ _BREAKERS = [
     ("airnow", airnow_breaker, _STANDARD),
     ("snotel", snotel_breaker, _STANDARD),
     ("inciweb", inciweb_breaker, _STANDARD),
+    ("nps", nps_breaker, _STANDARD),
     ("routing", routing_breaker, _ROUTING),
 ]
 
