@@ -35,6 +35,7 @@ from conditions.noaa_nwrfc import fetch_noaa_nwrfc, resolve_gauge_id
 from conditions.inciweb import fetch_inciweb
 from conditions.snotel import fetch_snotel
 from conditions.wdfw_emergency import fetch_wdfw_emergency
+from conditions.wdfw_regulations import fetch_and_update_regulations
 from conditions.wdfw_stocking import fetch_wdfw_stocking
 from conditions.wta_scraper import fetch_wta_reports
 from db.connection import AsyncSessionLocal
@@ -91,6 +92,21 @@ def start_scheduler() -> None:
     scheduler.add_job(job_wdfw_stocking, trigger=_daily, id="wdfw_stocking", replace_existing=True)
     scheduler.add_job(job_wta, trigger=_daily, id="wta", replace_existing=True)
     scheduler.add_job(job_snotel, trigger=_daily, id="snotel", replace_existing=True)
+    # Nightly scorer runs at 3:30 AM — after stocking and WTA jobs have written new data
+    scheduler.add_job(
+        job_score_all_spots,
+        trigger=CronTrigger(hour=3, minute=30, timezone="America/Los_Angeles"),
+        id="score_all_spots",
+        replace_existing=True,
+    )
+
+    # --- Annual December 1 — WDFW regulations re-scrape ---
+    scheduler.add_job(
+        job_wdfw_regulations,
+        trigger=CronTrigger(month=12, day=1, hour=4, minute=0, timezone="America/Los_Angeles"),
+        id="wdfw_regulations",
+        replace_existing=True,
+    )
 
     scheduler.start()
     log.info("scheduler_started", extra={"jobs": [j.id for j in scheduler.get_jobs()]})
@@ -277,6 +293,50 @@ async def job_snotel() -> None:
         wrote += 1
 
     log.info("job_done", extra={"job": "snotel", "records_written": wrote})
+
+
+# ---------------------------------------------------------------------------
+# Nightly Tier 1 scorer — 3:30 AM Pacific, all spots
+# ---------------------------------------------------------------------------
+
+async def job_score_all_spots() -> None:
+    log.info("job_start", extra={"job": "score_all_spots"})
+    from spots.scorer import compute_and_store_score
+
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(select(Spot))
+        spot_ids = [str(s.id) for s in result.scalars().all()]
+
+    scored = 0
+    failed = 0
+    for spot_id in spot_ids:
+        try:
+            async with AsyncSessionLocal() as session:
+                await compute_and_store_score(spot_id, session)
+            scored += 1
+        except Exception as exc:
+            log.warning(
+                "score_spot_failed",
+                extra={"spot_id": spot_id, "error": str(exc)},
+            )
+            failed += 1
+
+    log.info("job_done", extra={"job": "score_all_spots", "scored": scored, "failed": failed})
+
+
+# ---------------------------------------------------------------------------
+# Annual WDFW regulations re-scrape — December 1, 4 AM Pacific
+# ---------------------------------------------------------------------------
+
+async def job_wdfw_regulations() -> None:
+    log.info("job_start", extra={"job": "wdfw_regulations"})
+    try:
+        async with AsyncSessionLocal() as session:
+            async with session.begin():
+                await fetch_and_update_regulations(session)
+        log.info("job_done", extra={"job": "wdfw_regulations"})
+    except Exception as exc:
+        log.warning("wdfw_regulations_job_failed", extra={"error": str(exc)})
 
 
 # ---------------------------------------------------------------------------

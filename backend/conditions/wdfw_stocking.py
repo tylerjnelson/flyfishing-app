@@ -19,7 +19,8 @@ from conditions.normalizer import normalize_wdfw_stocking
 
 log = logging.getLogger(__name__)
 
-_SOCRATA_URL = "https://data.wa.gov/resource/9b4n-hquz.json"
+# Dataset: WDFW Fish Plants — https://data.wa.gov/Natural-Resources-Environment/WDFW-Fish-Plants/6fex-3r7d
+_SOCRATA_URL = "https://data.wa.gov/resource/6fex-3r7d.json"
 _PAGE_SIZE = 1000
 _TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=5.0, pool=5.0)
 
@@ -50,7 +51,7 @@ async def _fetch_all(year: int) -> list:
             params = {
                 "$limit": _PAGE_SIZE,
                 "$offset": offset,
-                "$where": f"year = {year}",
+                "$where": f"release_year = '{year}'",
                 "$order": ":id",
             }
             resp = await client.get(_SOCRATA_URL, params=params)

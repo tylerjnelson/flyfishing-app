@@ -19,7 +19,7 @@ if config.config_file_name is not None:
 
 
 def run_migrations_offline() -> None:
-    url = config.get_main_option("sqlalchemy.url")
+    url = config.get_main_option("sqlalchemy.url") or os.environ.get("DATABASE_URL")
     context.configure(
         url=url,
         target_metadata=target_metadata,
@@ -31,7 +31,7 @@ def run_migrations_offline() -> None:
 
 
 async def run_async_migrations() -> None:
-    url = config.get_main_option("sqlalchemy.url")
+    url = config.get_main_option("sqlalchemy.url") or os.environ.get("DATABASE_URL")
     connectable = create_async_engine(url)
     async with connectable.connect() as connection:
         await connection.run_sync(_do_run_migrations)

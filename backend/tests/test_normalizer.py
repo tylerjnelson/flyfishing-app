@@ -195,18 +195,19 @@ class TestNormalizeInciweb:
 
 class TestNormalizeWdfwStocking:
     def test_basic_record(self):
-        raw = [{"waterbody_name": "Lake X", "county": "King",
-                "stocking_date": "2026-03-01", "species": "Rainbow Trout",
-                "number_of_fish": "500", "average_length": "10 in", ":id": "abc123"}]
+        # Uses dataset 6fex-3r7d field names (release_location, number_released, geo_code)
+        raw = [{"release_location": "Lake X", "county": "King",
+                "release_start_date": "2026-03-01T00:00:00.000", "species": "Rainbow Trout",
+                "number_released": "500", "lifestage": "Legals", "geo_code": "L1234"}]
         result = normalize_wdfw_stocking(raw, datetime.now(tz=timezone.utc))
         assert len(result) == 1
         assert result[0]["water_name"] == "Lake X"
         assert result[0]["count"] == 500
-        assert result[0]["source_record_id"] == "abc123"
+        assert result[0]["source_record_id"] == "L1234"
 
     def test_missing_count_returns_none(self):
-        raw = [{"waterbody_name": "Lake Y", "stocking_date": "2026-03-01",
-                "species": "Cutthroat", ":id": "xyz"}]
+        raw = [{"release_location": "Lake Y", "release_start_date": "2026-03-01T00:00:00.000",
+                "species": "Cutthroat", "geo_code": "L5678"}]
         result = normalize_wdfw_stocking(raw, datetime.now(tz=timezone.utc))
         assert result[0]["count"] is None
 
