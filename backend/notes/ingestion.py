@@ -189,13 +189,13 @@ async def _ingest_handwritten(note_id: UUID, author_id: UUID, db: AsyncSession) 
     image_bytes = read_upload(str(note_id))
     b64 = _encode_image(image_bytes)
 
-    # Step A — Map detection
+    # Step A — Map detection (passes image; VISION_MODEL uses keep_alive=0)
     detection = await call_json_llm(
         MAP_DETECTION_PROMPT,
         VISION_MODEL,
         _MAP_DETECTION_DEFAULT,
+        images=[b64],
     )
-    # Note: VISION_MODEL uses keep_alive=0 per call_json_llm (not in RESIDENT_MODELS)
 
     map_note_id: UUID | None = None
     if detection.get("contains_map") and detection.get("bounding_box"):
