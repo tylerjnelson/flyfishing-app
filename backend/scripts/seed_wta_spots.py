@@ -43,31 +43,31 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
 _WTA_SPOTS: list[tuple[str, str, str]] = [
     # Yakima drainage
-    ("https://www.wta.org/go-hiking/hikes/yakima-river-canyon", "Yakima River", "river"),
-    ("https://www.wta.org/go-hiking/hikes/teanaway-river", "Teanaway River", "river"),
-    ("https://www.wta.org/go-hiking/hikes/cle-elum-river", "Cle Elum River", "river"),
+    ("https://www.wta.org/go-hiking/hikes/umtanum-creek-canyon", "Yakima River", "river"),  # Yakima River Canyon area; replaces broken yakima-river-canyon
+    ("https://www.wta.org/go-hiking/hikes/middle-fork-teanaway-river", "Teanaway River", "river"),  # replaces broken teanaway-river
+    ("https://www.wta.org/go-hiking/hikes/cle-elum-river", "Cle Elum River", "river"),  # TODO: no replacement found yet
     # Methow Valley
-    ("https://www.wta.org/go-hiking/hikes/methow-river", "Methow River", "river"),
+    ("https://www.wta.org/go-hiking/hikes/methow-community-trail", "Methow River", "river"),  # replaces broken methow-river
     ("https://www.wta.org/go-hiking/hikes/twisp-river", "Twisp River", "river"),
-    ("https://www.wta.org/go-hiking/hikes/chewuch-river", "Chewuch River", "river"),
-    ("https://www.wta.org/go-hiking/hikes/early-winters-creek", "Early Winters Creek", "creek"),
+    ("https://www.wta.org/go-hiking/hikes/chewuch", "Chewuch River", "river"),  # replaces broken chewuch-river
+    ("https://www.wta.org/go-hiking/hikes/early-winters-creek", "Early Winters Creek", "creek"),  # TODO: no replacement found yet
     # Wenatchee / Icicle
     ("https://www.wta.org/go-hiking/hikes/icicle-creek", "Icicle Creek", "creek"),
-    ("https://www.wta.org/go-hiking/hikes/wenatchee-river", "Wenatchee River", "river"),
+    ("https://www.wta.org/go-hiking/hikes/wenatchee-river", "Wenatchee River", "river"),  # TODO: no replacement found yet
     # Snoqualmie / Skykomish
-    ("https://www.wta.org/go-hiking/hikes/snoqualmie-river", "Snoqualmie River", "river"),
-    ("https://www.wta.org/go-hiking/hikes/skykomish-river", "Skykomish River", "river"),
+    ("https://www.wta.org/go-hiking/hikes/snoqualmie-valley-trail", "Snoqualmie River", "river"),  # replaces broken snoqualmie-river
+    ("https://www.wta.org/go-hiking/hikes/north-fork-skykomish-river", "Skykomish River", "river"),  # replaces broken skykomish-river
     # Skagit / Sauk
-    ("https://www.wta.org/go-hiking/hikes/sauk-river", "Sauk River", "river"),
+    ("https://www.wta.org/go-hiking/hikes/north-fork-sauk-river", "Sauk River", "river"),  # replaces broken sauk-river
     # Olympic Peninsula
     ("https://www.wta.org/go-hiking/hikes/sol-duc-river", "Sol Duc River", "river"),
-    ("https://www.wta.org/go-hiking/hikes/hoh-river-trail", "Hoh River", "river"),
+    ("https://www.wta.org/go-hiking/hikes/hoh-river-trail", "Hoh River", "river"),  # TODO: no replacement found yet
     ("https://www.wta.org/go-hiking/hikes/bogachiel-river", "Bogachiel River", "river"),
     # Fly-fishing-only lakes
     ("https://www.wta.org/go-hiking/hikes/chopaka-lake", "Chopaka Lake", "lake"),
-    ("https://www.wta.org/go-hiking/hikes/lenice-lake", "Lenice Lake", "lake"),
-    ("https://www.wta.org/go-hiking/hikes/nunnally-lake", "Nunnally Lake", "lake"),
-    ("https://www.wta.org/go-hiking/hikes/dry-falls-lake", "Dry Falls Lake", "lake"),
+    ("https://www.wta.org/go-hiking/hikes/lenice-lake", "Lenice Lake", "lake"),  # TODO: no replacement found yet
+    ("https://www.wta.org/go-hiking/hikes/nunnally-lake", "Nunnally Lake", "lake"),  # TODO: no replacement found yet
+    ("https://www.wta.org/go-hiking/hikes/dry-falls-lake", "Dry Falls Lake", "lake"),  # TODO: no replacement found yet
     ("https://www.wta.org/go-hiking/hikes/pass-lake", "Pass Lake", "lake"),
 ]
 
