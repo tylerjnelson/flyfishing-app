@@ -9,6 +9,8 @@ import Onboarding from './pages/Onboarding'
 import Settings from './pages/Settings'
 import Spots from './pages/Spots'
 import SpotDetail from './pages/SpotDetail'
+import Notes from './pages/Notes'
+import NoteUpload from './pages/NoteUpload'
 
 // Placeholder pages for routes built in later phases
 const Placeholder = ({ name }) => (
@@ -66,10 +68,10 @@ export default function App() {
           <ProtectedRoute><SpotDetail /></ProtectedRoute>
         } />
         <Route path="/notes" element={
-          <ProtectedRoute><Placeholder name="Notes" /></ProtectedRoute>
+          <ProtectedRoute><Notes /></ProtectedRoute>
         } />
         <Route path="/notes/upload" element={
-          <ProtectedRoute><Placeholder name="Upload Note" /></ProtectedRoute>
+          <ProtectedRoute><NoteUpload /></ProtectedRoute>
         } />
         <Route path="/settings" element={
           <ProtectedRoute><Settings /></ProtectedRoute>
