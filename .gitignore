@@ -38,3 +38,6 @@ htmlcov/
 
 # Alembic (versions folder should be committed, but not this if generated)
 alembic.ini
+
+# Testing
+/test-notes/

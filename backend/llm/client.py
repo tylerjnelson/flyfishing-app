@@ -61,13 +61,19 @@ async def ollama_generate(
         return resp.json()["response"]
 
 
-async def call_json_llm(prompt: str, model: str, default: dict) -> dict:
+async def call_json_llm(
+    prompt: str,
+    model: str,
+    default: dict,
+    images: list[str] | None = None,
+) -> dict:
     """
     Call the LLM expecting a JSON response.  Retries once with a correction
     nudge before returning the safe default.
 
     temperature=0.0 and format="json" are always used for JSON calls.
     keep_alive is set per the resident-model policy.
+    images: list of base64-encoded image strings (required for vision model calls).
     """
     keep_alive = -1 if model in RESIDENT_MODELS else 0
 
@@ -78,6 +84,7 @@ async def call_json_llm(prompt: str, model: str, default: dict) -> dict:
             temperature=0.0,
             format="json",
             keep_alive=keep_alive,
+            images=images,
         )
         cleaned = raw.strip().lstrip("```json").rstrip("```").strip()
         try:
