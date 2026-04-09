@@ -1,15 +1,14 @@
 /**
  * Note upload flow.
- * Supports three entry types:
- *   typed     — text area entry
- *   handwritten — file picker (notebook page image)
- *   map       — file picker (standalone map image, applies OpenCV correction)
+ * Supports two entry types:
+ *   typed  — text area entry
+ *   map    — file picker (standalone map image, applies OpenCV correction)
  *
  * After upload, polls the note detail endpoint until ingestion is complete
- * (no awaiting_* pending flags remain), then presents any confirmation prompts.
+ * (no awaiting_* pending flags remain).
  */
 
-import { useEffect, useRef, useState } from 'react'
+import { useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import axios from 'axios'
 import useAuthStore from '../store/auth'
@@ -112,17 +111,8 @@ export default function NoteUpload() {
               Processing your note…
             </h2>
             <p className="text-gray-500 text-sm">
-              {Array.isArray(processingStatus)
-                ? 'Waiting for confirmation steps to complete.'
-                : 'Extracting text, resolving location, and generating embeddings.'}
+              Applying corrections and generating spatial description.
             </p>
-            {Array.isArray(processingStatus) && processingStatus.length > 0 && (
-              <div className="mt-4 space-y-2">
-                {processingStatus.includes('awaiting_date_confirmation') && (
-                  <DateConfirmationBanner noteId={uploadedNoteId} headers={headers} />
-                )}
-              </div>
-            )}
           </>
         ) : processingStatus === 'done' ? (
           <>
@@ -158,7 +148,6 @@ export default function NoteUpload() {
       <div className="flex gap-2 mb-6">
         {[
           { key: 'typed', label: 'Type it' },
-          { key: 'handwritten', label: 'Notebook page' },
           { key: 'map', label: 'Map only' },
         ].map(({ key, label }) => (
           <button
@@ -194,12 +183,10 @@ export default function NoteUpload() {
         ) : (
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">
-              {sourceType === 'map' ? 'Map image' : 'Notebook page photo'}
+              Map image
             </label>
             <p className="text-xs text-gray-400 mb-2">
-              {sourceType === 'map'
-                ? 'Upload a standalone hand-drawn map. OpenCV will correct perspective and contrast automatically.'
-                : 'Upload a photo of a handwritten notebook page. Text will be extracted via OCR. If a map sketch is detected, it will be extracted as a separate entry.'}
+              Upload a standalone hand-drawn map. OpenCV will correct perspective and contrast automatically.
             </p>
             <input
               ref={fileInputRef}
@@ -258,56 +245,4 @@ export default function NoteUpload() {
   )
 }
 
-/**
- * Inline date confirmation banner shown during processing.
- */
-function DateConfirmationBanner({ noteId, headers }) {
-  const [noteData, setNoteData] = useState(null)
-  const [confirmed, setConfirmed] = useState(false)
-  const [dateInput, setDateInput] = useState('')
-
-  useEffect(() => {
-    axios.get(`/api/notes/${noteId}`, { headers }).then(({ data }) => {
-      setNoteData(data)
-      if (data.note_date) setDateInput(data.note_date)
-    })
-  }, [noteId])
-
-  const handleConfirm = async () => {
-    if (!dateInput) return
-    await axios.patch(
-      `/api/notes/${noteId}/confirm-date`,
-      null,
-      { headers, params: { confirmed_date: dateInput } }
-    )
-    setConfirmed(true)
-  }
-
-  if (!noteData || confirmed) return null
-
-  return (
-    <div className="bg-amber-50 border border-amber-200 rounded-lg p-4 text-left">
-      <p className="text-sm font-medium text-amber-800 mb-2">
-        Confirm trip date
-      </p>
-      <p className="text-xs text-amber-600 mb-3">
-        We extracted this date from your note. Please confirm or correct it.
-      </p>
-      <div className="flex gap-2 items-center">
-        <input
-          type="date"
-          value={dateInput}
-          onChange={e => setDateInput(e.target.value)}
-          className="border border-amber-300 rounded px-2 py-1 text-sm flex-1"
-        />
-        <button
-          onClick={handleConfirm}
-          className="px-3 py-1 bg-amber-600 text-white rounded text-sm"
-        >
-          Confirm
-        </button>
-      </div>
-    </div>
-  )
-}
 

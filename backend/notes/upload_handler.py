@@ -13,7 +13,7 @@ import logging
 from pathlib import Path
 
 import magic
-from PIL import Image
+from PIL import Image, ImageOps
 
 from config import settings
 
@@ -30,10 +30,11 @@ ALLOWED_MIMES = {
 
 def validate_and_encode(data: bytes) -> bytes:
     """
-    Validate MIME type, strip EXIF, re-encode to WebP quality=85.
+    Validate MIME type, apply EXIF orientation, strip EXIF, re-encode to WebP quality=85.
 
     Returns WebP bytes on success. Raises ValueError on unsupported MIME type.
-    EXIF is stripped implicitly — Pillow does not copy EXIF when saving WebP
+    EXIF orientation is applied first (so upside-down phone photos are corrected),
+    then EXIF is stripped implicitly — Pillow does not copy EXIF when saving WebP
     unless exif= is explicitly passed.
     """
     mime = magic.from_buffer(data, mime=True)
@@ -41,10 +42,19 @@ def validate_and_encode(data: bytes) -> bytes:
         raise ValueError(f"Unsupported file type: {mime}")
 
     img = Image.open(io.BytesIO(data))
+    # Apply EXIF orientation (rotate/flip per tag) before stripping metadata.
+    # Phone cameras store rotation as an EXIF tag and leave pixels unrotated —
+    # without this, an upside-down photo stays upside-down after EXIF is stripped.
+    img = ImageOps.exif_transpose(img)
     # Convert to RGB to ensure WebP compatibility (strips alpha channel too,
     # acceptable for scanned notebook pages).
     if img.mode not in ("RGB", "L"):
         img = img.convert("RGB")
+
+    # Cap at 1120px on the long side — Llama 3.2 Vision's native training resolution.
+    # Full-resolution phone photos (3000–4000px) produce excessive visual tokens with
+    # no accuracy benefit for OCR or map detection, and cause severe CPU inference slowdowns.
+    img.thumbnail((1120, 1120), Image.LANCZOS)
 
     buf = io.BytesIO()
     # quality=85 for all uploads at this stage (pre-extraction default per §6.8).

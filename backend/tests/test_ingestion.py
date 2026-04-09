@@ -171,14 +171,6 @@ class TestPromptContracts:
         assert "Index" in result
         assert "{note_text}" not in result
 
-    def test_map_detection_prompt_no_placeholders(self):
-        """MAP_DETECTION_PROMPT has no format placeholders — used directly."""
-        from prompts.registry import MAP_DETECTION_PROMPT
-
-        assert "{" not in MAP_DETECTION_PROMPT or "contains_map" in MAP_DETECTION_PROMPT
-        # Should not raise when inspected
-        assert len(MAP_DETECTION_PROMPT) > 50
-
     def test_map_description_prompt_no_placeholders(self):
         """MAP_DESCRIPTION_PROMPT is passed directly to ollama_generate — no .format()."""
         from prompts.registry import MAP_DESCRIPTION_PROMPT
