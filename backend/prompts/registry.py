@@ -10,11 +10,12 @@ JSON-returning prompts (routed through call_json_llm):
 
 Prose-returning prompts (call ollama_generate() directly — NOT call_json_llm):
   §18.1 RECOMMENDATION_SYSTEM_PROMPT  — system message for trip planning conversations
-  §18.4 MAP_DESCRIPTION_PROMPT        — spatial description of uploaded map image
-  §18.5 DEBRIEF_SUMMARY_PROMPT        — debrief conversation summarisation
+  §18.5 DEBRIEF_SUMMARY_PROMPT        — debrief conversation summarisation (Phase 6)
 
-Note: MAP_DETECTION_PROMPT (§18.3) was removed. Maps are now explicitly uploaded
-by the user rather than auto-detected from handwritten note photos.
+Removed:
+  §18.3 MAP_DETECTION_PROMPT  — maps are explicitly uploaded, not auto-detected
+  §18.4 MAP_DESCRIPTION_PROMPT — vision model spatial description removed; maps are
+                                  visual references only, not semantically queryable
 """
 
 # ---------------------------------------------------------------------------
@@ -65,29 +66,6 @@ Rules:
 
 Note text:
 {note_text}
-"""
-
-# ---------------------------------------------------------------------------
-# §18.4 — Map spatial description prompt
-# ---------------------------------------------------------------------------
-
-MAP_DESCRIPTION_PROMPT = """
-Describe this hand-drawn fishing map in structured detail for a fly fishing
-knowledge base. The map was drawn by an experienced angler and contains
-location-specific knowledge about a Washington State fishing spot.
-
-Extract and describe everything visible:
-- Water body name or description if legible
-- Named or marked pools, runs, riffles, or holding water
-- Access points, parking areas, or trail entry markers
-- Wading routes, crossing points, or bank access notes
-- Structure markers (logjams, boulders, drop-offs, confluences)
-- Compass orientation if indicated; scale or distance markers if present
-- All written annotations, labels, or notes on the map (transcribe verbatim in quotes)
-
-Write as dense, searchable prose using standard fly fishing terminology.
-Do not speculate about unmarked areas. Do not describe the drawing style.
-Focus on information an angler would use to navigate and fish this water.
 """
 
 # ---------------------------------------------------------------------------
