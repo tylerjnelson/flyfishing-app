@@ -11,13 +11,9 @@ import Spots from './pages/Spots'
 import SpotDetail from './pages/SpotDetail'
 import Notes from './pages/Notes'
 import NoteUpload from './pages/NoteUpload'
-
-// Placeholder pages for routes built in later phases
-const Placeholder = ({ name }) => (
-  <div className="flex items-center justify-center min-h-screen text-gray-500">
-    {name} — coming soon
-  </div>
-)
+import Trips from './pages/Trips'
+import TripNew from './pages/TripNew'
+import TripThread from './pages/TripThread'
 
 export default function App() {
   const { setAuth, accessToken } = useAuthStore()
@@ -53,13 +49,13 @@ export default function App() {
           <ProtectedRoute><Onboarding /></ProtectedRoute>
         } />
         <Route path="/trips" element={
-          <ProtectedRoute><Placeholder name="Trips" /></ProtectedRoute>
+          <ProtectedRoute><Trips /></ProtectedRoute>
         } />
         <Route path="/trips/new" element={
-          <ProtectedRoute><Placeholder name="New Trip" /></ProtectedRoute>
+          <ProtectedRoute><TripNew /></ProtectedRoute>
         } />
         <Route path="/trips/:tripId" element={
-          <ProtectedRoute><Placeholder name="Trip" /></ProtectedRoute>
+          <ProtectedRoute><TripThread /></ProtectedRoute>
         } />
         <Route path="/spots" element={
           <ProtectedRoute><Spots /></ProtectedRoute>
