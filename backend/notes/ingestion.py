@@ -2,11 +2,8 @@
 Note ingestion pipeline — runs as a FastAPI BackgroundTask after initial note creation.
 
 Source type dispatch:
-  typed  — field extraction, spot resolution, embedding
-  map    — OpenCV correction, vision spatial description, embedding
-
-All LLM calls use the resident Llama 3.1 8B for text tasks and the evict-after-use
-Llama 3.2 11B Vision for image tasks (per §6.1 keep_alive rules).
+  typed  — field extraction (Llama 3.1 8B), spot resolution, embedding
+  map    — OpenCV contrast/shadow correction, store corrected image; no LLM, no embedding
 
 Processing state is tracked in notes.processing_notes as a pipe-separated string:
   'awaiting_date_confirmation'  — date not yet confirmed by user
@@ -15,7 +12,6 @@ Processing state is tracked in notes.processing_notes as a pipe-separated string
   'spot_auto_linked'            — spot resolved at >= 0.85 confidence (non-blocking)
 """
 
-import base64
 import json
 import logging
 import uuid
@@ -27,11 +23,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.connection import AsyncSessionLocal
 from db.models import Note
-from llm.client import CHAT_MODEL, VISION_MODEL, call_json_llm, ollama_generate
+from llm.client import CHAT_MODEL, call_json_llm
 from notes.map_extractor import correct_standalone_map
 from notes.spot_resolver import resolve_spot
 from notes.upload_handler import read_upload, store_upload
-from prompts.registry import FIELD_EXTRACTION_PROMPT, MAP_DESCRIPTION_PROMPT
+from prompts.registry import FIELD_EXTRACTION_PROMPT
 from rag.embedder import embed_text
 
 log = logging.getLogger(__name__)
@@ -73,11 +69,6 @@ def _sanitise_fields(fields: dict) -> dict:
         fields["time_of_day"] = None
 
     return fields
-
-
-def _encode_image(image_bytes: bytes) -> str:
-    """Base64-encode image bytes for Ollama vision payload."""
-    return base64.b64encode(image_bytes).decode("utf-8")
 
 
 def _flags_to_str(flags: list[str]) -> str:
@@ -166,8 +157,10 @@ async def _ingest_typed(note_id: UUID, db: AsyncSession) -> None:
 
 async def _ingest_standalone_map(note_id: UUID, db: AsyncSession) -> None:
     """
-    Standalone map upload: OpenCV correction → vision spatial description → embedding.
-    User confirms spot and date manually (no parent to inherit from).
+    Standalone map upload: OpenCV correction → store corrected image.
+
+    No Ollama vision call, no embedding. Maps are visual reference material only —
+    not semantically queryable. User confirms spot and date manually.
     """
     image_bytes = read_upload(str(note_id))
 
@@ -175,24 +168,10 @@ async def _ingest_standalone_map(note_id: UUID, db: AsyncSession) -> None:
     flags = ["low_quality_scan"] if is_low_quality else []
     flags += ["awaiting_date_confirmation", "awaiting_spot_confirmation"]
 
-    map_img_bytes = read_upload(str(note_id))
-    b64 = _encode_image(map_img_bytes)
-    spatial_desc = await ollama_generate(
-        VISION_MODEL,
-        MAP_DESCRIPTION_PROMPT,
-        temperature=0.3,
-        keep_alive=0,
-        images=[b64],
-    )
-
-    embedding = await embed_text(spatial_desc)
-
     await _update_note(
         note_id,
         {
-            "content": spatial_desc,
             "image_path": path,
-            "embedding": embedding,
             "processing_notes": _build_processing_notes(flags, None),
         },
         db,

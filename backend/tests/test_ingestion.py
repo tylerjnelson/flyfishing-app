@@ -171,11 +171,13 @@ class TestPromptContracts:
         assert "Index" in result
         assert "{note_text}" not in result
 
-    def test_map_description_prompt_no_placeholders(self):
-        """MAP_DESCRIPTION_PROMPT is passed directly to ollama_generate — no .format()."""
-        from prompts.registry import MAP_DESCRIPTION_PROMPT
+    def test_debrief_summary_prompt_formats(self):
+        """DEBRIEF_SUMMARY_PROMPT uses .format(conversation_text=...)."""
+        from prompts.registry import DEBRIEF_SUMMARY_PROMPT
 
-        assert len(MAP_DESCRIPTION_PROMPT) > 50
+        result = DEBRIEF_SUMMARY_PROMPT.format(conversation_text="Fished the Yakima. Caught two rainbows.")
+        assert "Yakima" in result
+        assert "{conversation_text}" not in result
 
 
 # ---------------------------------------------------------------------------
