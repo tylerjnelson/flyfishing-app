@@ -40,7 +40,7 @@ log = logging.getLogger(__name__)
 
 router = APIRouter()
 
-_VALID_SOURCE_TYPES = {"typed", "handwritten", "map"}
+_VALID_SOURCE_TYPES = {"typed", "map"}
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +123,7 @@ async def upload_note(
         )
         return {"note_id": str(note.id), "status": "processing"}
 
-    # Image upload (handwritten or standalone map)
+    # Image upload (standalone map)
     if not file:
         raise HTTPException(400, "file is required for image notes")
 
@@ -227,8 +227,8 @@ async def serve_map(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Serve the extracted map for a handwritten note (its first child map record),
-    or serve the image directly if this note is itself a map note.
+    Serve the map image for a note. If this note is a map note, serve it directly.
+    Otherwise find its first child map note (e.g. a map attached to a debrief note).
     """
     from sqlalchemy import select as sa_select
 
