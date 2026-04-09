@@ -10,6 +10,7 @@ PATCH  /api/notes/{note_id}/confirm-date  — confirm extracted date
 PATCH  /api/notes/{note_id}/confirm-spot  — confirm or correct spot resolution
 """
 
+import asyncio
 import logging
 from datetime import date
 from pathlib import Path
@@ -81,6 +82,29 @@ def _note_detail(note) -> dict:
         }
     )
     return base
+
+
+# ---------------------------------------------------------------------------
+# Transcribe
+# ---------------------------------------------------------------------------
+
+
+@router.post("/transcribe")
+async def transcribe_audio(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Transcribe an audio recording using faster-whisper (whisper-small, CPU).
+    Accepts any format ffmpeg can decode (webm, ogg, mp4, wav).
+    Returns {"text": "..."}.
+    """
+    from llm.client import transcribe_audio as _transcribe
+
+    audio_bytes = await file.read()
+    loop = asyncio.get_event_loop()
+    text = await loop.run_in_executor(None, _transcribe, audio_bytes)
+    return {"text": text}
 
 
 # ---------------------------------------------------------------------------

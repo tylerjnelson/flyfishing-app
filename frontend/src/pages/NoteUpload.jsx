@@ -15,6 +15,12 @@ import useAuthStore from '../store/auth'
 
 const ACCEPTED_IMAGE_TYPES = 'image/jpeg,image/png,image/webp,image/heic,image/heif'
 
+// Voice recording states
+const REC_IDLE        = 'idle'
+const REC_RECORDING   = 'recording'
+const REC_TRANSCRIBING = 'transcribing'
+const REC_DONE        = 'done'
+
 export default function NoteUpload() {
   const { accessToken } = useAuthStore()
   const navigate = useNavigate()
@@ -28,7 +34,68 @@ export default function NoteUpload() {
   const [uploadedNoteId, setUploadedNoteId] = useState(null)
   const [processingStatus, setProcessingStatus] = useState(null)
 
+  // Voice state
+  const [recState, setRecState] = useState(REC_IDLE)
+  const [transcription, setTranscription] = useState('')
+  const mediaRecorderRef = useRef(null)
+  const audioChunksRef = useRef([])
+
   const headers = { Authorization: `Bearer ${accessToken}` }
+
+  // ---------------------------------------------------------------------------
+  // Voice recording
+  // ---------------------------------------------------------------------------
+
+  const startRecording = async () => {
+    setError(null)
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      const mimeType = MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : ''
+      const mr = new MediaRecorder(stream, mimeType ? { mimeType } : {})
+      audioChunksRef.current = []
+      mr.ondataavailable = (e) => {
+        if (e.data.size > 0) audioChunksRef.current.push(e.data)
+      }
+      mr.onstop = async () => {
+        stream.getTracks().forEach(t => t.stop())
+        const blob = new Blob(audioChunksRef.current, { type: mr.mimeType || 'audio/webm' })
+        await sendAudioForTranscription(blob)
+      }
+      mediaRecorderRef.current = mr
+      mr.start()
+      setRecState(REC_RECORDING)
+    } catch {
+      setError('Microphone access denied. Please allow microphone access and try again.')
+    }
+  }
+
+  const stopRecording = () => {
+    mediaRecorderRef.current?.stop()
+    setRecState(REC_TRANSCRIBING)
+  }
+
+  const sendAudioForTranscription = async (blob) => {
+    try {
+      const form = new FormData()
+      form.append('file', blob, 'recording.webm')
+      const { data } = await axios.post('/api/notes/transcribe', form, {
+        headers: { ...headers, 'Content-Type': 'multipart/form-data' },
+      })
+      setTranscription(data.text)
+      setRecState(REC_DONE)
+    } catch {
+      setError('Transcription failed. Please try again.')
+      setRecState(REC_IDLE)
+    }
+  }
+
+  const resetRecording = () => {
+    setTranscription('')
+    setRecState(REC_IDLE)
+    setError(null)
+  }
+
+  // ---------------------------------------------------------------------------
 
   const handleFileChange = (e) => {
     const f = e.target.files?.[0]
@@ -40,11 +107,15 @@ export default function NoteUpload() {
     setError(null)
     setUploading(true)
 
+    // Voice tab submits transcription as a typed note
+    const effectiveSourceType = sourceType === 'voice' ? 'typed' : sourceType
+    const effectiveContent    = sourceType === 'voice' ? transcription : content
+
     try {
       const form = new FormData()
-      form.append('source_type', sourceType)
-      if (sourceType === 'typed') {
-        form.append('content', content)
+      form.append('source_type', effectiveSourceType)
+      if (effectiveSourceType === 'typed') {
+        form.append('content', effectiveContent)
       } else {
         if (!file) {
           setError('Please select an image file')
@@ -148,12 +219,13 @@ export default function NoteUpload() {
       <div className="flex gap-2 mb-6">
         {[
           { key: 'typed', label: 'Type it' },
-          { key: 'map', label: 'Map only' },
+          { key: 'voice', label: 'Voice' },
+          { key: 'map',   label: 'Map only' },
         ].map(({ key, label }) => (
           <button
             key={key}
             type="button"
-            onClick={() => setSourceType(key)}
+            onClick={() => { setSourceType(key); resetRecording() }}
             className={`flex-1 py-2 px-3 rounded-lg border text-sm font-medium transition-colors ${
               sourceType === key
                 ? 'bg-blue-600 text-white border-blue-600'
@@ -179,6 +251,60 @@ export default function NoteUpload() {
               className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
               required
             />
+          </div>
+        ) : sourceType === 'voice' ? (
+          <div>
+            {recState === REC_IDLE && (
+              <button
+                type="button"
+                onClick={startRecording}
+                className="w-full border-2 border-dashed border-gray-300 rounded-lg px-4 py-10 text-center text-gray-500 hover:border-blue-400 hover:text-blue-500 transition-colors"
+              >
+                <span className="block text-3xl mb-2">🎙</span>
+                <span className="text-sm">Tap to start recording</span>
+              </button>
+            )}
+
+            {recState === REC_RECORDING && (
+              <div className="text-center py-6">
+                <div className="inline-block w-4 h-4 bg-red-500 rounded-full animate-pulse mb-3" />
+                <p className="text-sm text-gray-600 mb-4">Recording…</p>
+                <button
+                  type="button"
+                  onClick={stopRecording}
+                  className="px-6 py-2 bg-red-600 text-white rounded-lg text-sm font-medium hover:bg-red-700"
+                >
+                  Stop
+                </button>
+              </div>
+            )}
+
+            {recState === REC_TRANSCRIBING && (
+              <div className="text-center py-8 text-gray-500 text-sm">
+                Transcribing…
+              </div>
+            )}
+
+            {recState === REC_DONE && (
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Transcription — review and edit before submitting
+                </label>
+                <textarea
+                  value={transcription}
+                  onChange={e => setTranscription(e.target.value)}
+                  rows={8}
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                />
+                <button
+                  type="button"
+                  onClick={resetRecording}
+                  className="mt-2 text-xs text-gray-400 hover:text-gray-600 underline"
+                >
+                  Re-record
+                </button>
+              </div>
+            )}
           </div>
         ) : (
           <div>
@@ -224,22 +350,25 @@ export default function NoteUpload() {
           <p className="text-sm text-red-600">{error}</p>
         )}
 
-        <div className="flex gap-3 pt-2">
-          <button
-            type="button"
-            onClick={() => navigate('/notes')}
-            className="flex-1 py-2 px-4 border border-gray-300 rounded-lg text-sm text-gray-600 hover:bg-gray-50"
-          >
-            Cancel
-          </button>
-          <button
-            type="submit"
-            disabled={uploading}
-            className="flex-1 py-2 px-4 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50"
-          >
-            {uploading ? 'Uploading…' : 'Upload'}
-          </button>
-        </div>
+        {/* Hide submit row while recording or transcribing */}
+        {!(sourceType === 'voice' && recState !== REC_DONE) && (
+          <div className="flex gap-3 pt-2">
+            <button
+              type="button"
+              onClick={() => navigate('/notes')}
+              className="flex-1 py-2 px-4 border border-gray-300 rounded-lg text-sm text-gray-600 hover:bg-gray-50"
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              disabled={uploading || (sourceType === 'voice' && !transcription.trim())}
+              className="flex-1 py-2 px-4 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50"
+            >
+              {uploading ? 'Uploading…' : 'Upload'}
+            </button>
+          </div>
+        )}
       </form>
     </div>
   )
