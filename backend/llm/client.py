@@ -1,5 +1,5 @@
 """
-Ollama LLM client.
+Ollama LLM client + faster-whisper transcription.
 
 RESIDENT_MODELS are kept loaded at all times (keep_alive=-1).
 The vision model uses keep_alive=0 — evicted immediately after response
@@ -8,16 +8,61 @@ to avoid displacing the resident 8B model from RAM (§6.1).
 call_json_llm() is the single entry point for all prompts that require
 structured JSON output.  Prose-generating prompts (map spatial description,
 debrief summarisation) call ollama_generate() directly.
+
+transcribe_audio() uses faster-whisper (whisper-small, CPU int8) for
+server-side voice transcription.  The model is loaded once and cached.
 """
 
 import json
 import logging
+import os
+import tempfile
 
 import httpx
+from faster_whisper import WhisperModel
 
 from config import settings
 
 log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# faster-whisper (voice transcription)
+# ---------------------------------------------------------------------------
+
+_whisper_model: WhisperModel | None = None
+
+
+def _get_whisper() -> WhisperModel:
+    global _whisper_model
+    if _whisper_model is None:
+        log.info("whisper_load_start", extra={"model": "small"})
+        _whisper_model = WhisperModel("small", device="cpu", compute_type="int8")
+        log.info("whisper_load_done")
+    return _whisper_model
+
+
+def transcribe_audio(audio_bytes: bytes) -> str:
+    """
+    Transcribe audio bytes using faster-whisper (whisper-small, CPU int8).
+
+    Accepts any format ffmpeg can decode (webm, ogg, mp4, wav).
+    The model singleton is loaded on first call and reused for all subsequent calls.
+    Runs synchronously — call via run_in_executor from async contexts.
+    """
+    model = _get_whisper()
+    fd, tmp_path = tempfile.mkstemp()
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(audio_bytes)
+        segments, _ = model.transcribe(tmp_path, beam_size=5)
+        return " ".join(seg.text.strip() for seg in segments).strip()
+    finally:
+        os.unlink(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Ollama
+# ---------------------------------------------------------------------------
 
 RESIDENT_MODELS = {"llama3.1:8b-instruct-q4_K_M", "nomic-embed-text"}
 CHAT_MODEL = "llama3.1:8b-instruct-q4_K_M"
