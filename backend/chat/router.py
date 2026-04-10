@@ -26,7 +26,7 @@ from chat.response_cache import store_response
 from chat.streaming import StreamHandler
 from config import settings
 from db.connection import get_db
-from db.models import Conversation, Message, Note, Trip, User
+from db.models import Conversation, Message, Note, Spot, Trip, User
 from llm.client import CHAT_MODEL
 from notes.ingestion import ingest_note_task
 from trips.service import get_trip, get_trip_conversation, refresh_state
@@ -234,6 +234,41 @@ async def chat_endpoint(
             updated = handler.advance_candidates()
             conversation.session_candidates = {
                 **build_result.session_candidates,
+                "candidates": updated,
+            }
+
+        # Promote or re-insert SURFACE_ALTERNATE spot
+        if handler.surface_alternate:
+            current_candidates = (conversation.session_candidates or {}).get("candidates", [])
+            updated, found = handler.apply_surface_alternate(current_candidates)
+            if not found:
+                # Spot was hard-filtered — fetch from DB and re-insert with caveat
+                alt_spot_id = handler.surface_alternate["spot_id"]
+                spot_res = await db.execute(select(Spot).where(Spot.id == alt_spot_id))
+                alt_spot = spot_res.scalar_one_or_none()
+                if alt_spot:
+                    caveat_candidate = {
+                        "spot_id": str(alt_spot.id),
+                        "spot_name": alt_spot.name,
+                        "spot_type": alt_spot.type,
+                        "session_score": 0.0,
+                        "drive_minutes": None,
+                        "is_haversine": False,
+                        "straight_line_miles": None,
+                        "last_visited": (
+                            alt_spot.last_visited.isoformat() if alt_spot.last_visited else None
+                        ),
+                        "conditions": {},
+                        "surfaced_with_caveat": True,
+                    }
+                    updated = [caveat_candidate] + current_candidates
+                else:
+                    log.debug(
+                        "surface_alternate_spot_not_found",
+                        extra={"spot_id": alt_spot_id},
+                    )
+            conversation.session_candidates = {
+                **(conversation.session_candidates or {}),
                 "candidates": updated,
             }
 

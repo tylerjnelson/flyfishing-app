@@ -190,3 +190,21 @@ class StreamHandler:
             return self._candidates
         excluded_set = set(self.excluded_spot_ids)
         return [c for c in self._candidates if c.get("spot_id") not in excluded_set]
+
+    def apply_surface_alternate(self, candidates: list[dict]) -> tuple[list[dict], bool]:
+        """
+        Promote the surface_alternate spot to index 0 in the candidate list.
+
+        Returns (updated_candidates, found) where found=False means the spot
+        was absent from the current pool (hard-filtered) and the router must
+        do a DB lookup and re-insert with surfaced_with_caveat=True.
+        """
+        if not self.surface_alternate:
+            return candidates, False
+        spot_id = self.surface_alternate["spot_id"]
+        for i, c in enumerate(candidates):
+            if c.get("spot_id") == spot_id:
+                if i == 0:
+                    return list(candidates), True
+                return [candidates[i]] + candidates[:i] + candidates[i + 1:], True
+        return candidates, False
