@@ -53,10 +53,11 @@ def make_spot(**kwargs) -> MagicMock:
     return spot
 
 
-def make_closure(effective=None, expires=None) -> MagicMock:
+def make_closure(effective=None, expires=None, rule_text="Emergency closure — Yakima River closed") -> MagicMock:
     cl = MagicMock()
     cl.effective = effective
     cl.expires = expires
+    cl.rule_text = rule_text
     return cl
 
 
@@ -65,40 +66,44 @@ def make_closure(effective=None, expires=None) -> MagicMock:
 # ---------------------------------------------------------------------------
 
 class TestHasActiveClosure:
-    TODAY = date.today()
+    """
+    _has_active_closure(spot_name, active_closures) — text-based matching.
+    active_closures is a pre-filtered list (date range already applied by caller).
+    """
 
-    def test_active_closure_blocks_spot(self):
-        cl = make_closure(
-            effective=self.TODAY - timedelta(days=1),
-            expires=self.TODAY + timedelta(days=1),
-        )
-        assert _has_active_closure("spot-1", {"spot-1": [cl]}) is True
+    def test_active_closure_matches_spot_name(self):
+        cl = make_closure(rule_text="Emergency closure — Yakima River closed to fishing")
+        assert _has_active_closure("Yakima River", [cl]) is True
 
-    def test_expired_closure_passes(self):
-        cl = make_closure(
-            effective=self.TODAY - timedelta(days=10),
-            expires=self.TODAY - timedelta(days=1),
-        )
-        assert _has_active_closure("spot-1", {"spot-1": [cl]}) is False
+    def test_closure_without_spot_name_does_not_match(self):
+        cl = make_closure(rule_text="Emergency closure — Methow River closed to fishing")
+        assert _has_active_closure("Yakima River", [cl]) is False
 
-    def test_future_closure_passes(self):
-        cl = make_closure(
-            effective=self.TODAY + timedelta(days=1),
-            expires=self.TODAY + timedelta(days=10),
-        )
-        assert _has_active_closure("spot-1", {"spot-1": [cl]}) is False
+    def test_no_closures_returns_false(self):
+        assert _has_active_closure("Yakima River", []) is False
 
-    def test_open_ended_closure_effective_today(self):
-        # expires=None → date.max → always active once effective
-        cl = make_closure(effective=self.TODAY, expires=None)
-        assert _has_active_closure("spot-1", {"spot-1": [cl]}) is True
+    def test_empty_spot_name_returns_false(self):
+        cl = make_closure(rule_text="Emergency closure — Yakima River closed")
+        assert _has_active_closure("", [cl]) is False
 
-    def test_no_closure_for_spot_passes(self):
-        assert _has_active_closure("spot-99", {}) is False
+    def test_closure_without_keyword_does_not_match(self):
+        # rule_text mentions the spot but has no closure keyword
+        cl = make_closure(rule_text="Yakima River regulation update — check local rules")
+        assert _has_active_closure("Yakima River", [cl]) is False
 
-    def test_closure_for_different_spot_passes(self):
-        cl = make_closure(effective=self.TODAY, expires=self.TODAY)
-        assert _has_active_closure("spot-1", {"spot-2": [cl]}) is False
+    def test_partial_name_word_match(self):
+        # "Yakima" alone is enough to match "Yakima River closed"
+        cl = make_closure(rule_text="Yakima closed to all angling")
+        assert _has_active_closure("Yakima River", [cl]) is True
+
+    def test_multiple_closures_any_match_returns_true(self):
+        cl1 = make_closure(rule_text="Methow River prohibited — emergency")
+        cl2 = make_closure(rule_text="Icicle Creek emergency closure")
+        assert _has_active_closure("Icicle Creek", [cl1, cl2]) is True
+
+    def test_none_rule_text_does_not_raise(self):
+        cl = make_closure(rule_text=None)
+        assert _has_active_closure("Yakima River", [cl]) is False
 
 
 # ---------------------------------------------------------------------------

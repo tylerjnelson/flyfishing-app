@@ -162,14 +162,16 @@ def normalize_airnow(raw: list, fetched_at: datetime) -> dict:
 def normalize_noaa_nwrfc(raw: dict, gauge_id: str, fetched_at: datetime) -> dict:
     """
     Normalizes a NOAA NWPS stageflow forecast for a single gauge.
+
+    Stageflow response shape: {observed: {...}, forecast: {data: [{validTime, primary, secondary}]}}
+    primary = stage (ft), secondary = flow (kcfs).
     """
-    data = raw.get("data", {})
-    forecasts = data.get("forecast", {}).get("data", [])
+    forecasts = raw.get("forecast", {}).get("data", [])
     return {
         "source": "noaa_nwrfc",
         "fetched_at": fetched_at.isoformat(),
         "gauge_id": gauge_id,
-        "forecast": forecasts,  # list of {validTime, primary (stage ft), secondary (flow cfs)}
+        "forecast": forecasts,  # list of {validTime, primary (stage ft), secondary (flow kcfs)}
         "stale": False,
     }
 

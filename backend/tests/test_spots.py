@@ -271,20 +271,3 @@ class TestSearchSpots:
         result = await search_spots("Methow", db)
         assert len(result) == 1
 
-
-# ---------------------------------------------------------------------------
-# spec §11.1 Phase 3 test — requires Phase 5 context_builder
-# ---------------------------------------------------------------------------
-
-@pytest.mark.skip(reason="Requires context_builder.py (Phase 5): session intake + conversation pipeline")
-@pytest.mark.asyncio
-async def test_spot_under_active_closure_absent_from_session_candidates():
-    """
-    Session intake with spot under active emergency closure →
-    spot absent from session_candidates JSONB in conversations table.
-
-    Implementation: context_builder filters spots where emergency_closures
-    has a non-expired entry before populating session_candidates.
-    Wire this test when context_builder.py is built in Phase 5.
-    """
-    pass

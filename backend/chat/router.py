@@ -229,13 +229,19 @@ async def chat_endpoint(
                         build_result.conditions_hash, full_response,
                     )
 
-        # Update session_candidates after EXCLUDE_SPOT
+        # Update session_candidates after EXCLUDE_SPOT and persist excluded IDs
         if handler.excluded_spot_ids:
             updated = handler.advance_candidates()
             conversation.session_candidates = {
                 **build_result.session_candidates,
                 "candidates": updated,
             }
+            existing_excluded = list(conversation.excluded_spot_ids or [])
+            new_ids = [
+                uuid.UUID(sid) for sid in handler.excluded_spot_ids
+                if sid not in {str(e) for e in existing_excluded}
+            ]
+            conversation.excluded_spot_ids = existing_excluded + new_ids
 
         # Promote or re-insert SURFACE_ALTERNATE spot
         if handler.surface_alternate:
