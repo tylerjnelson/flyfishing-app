@@ -22,7 +22,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.connection import AsyncSessionLocal
-from db.models import Note
+from db.models import Note, Trip
 from llm.client import CHAT_MODEL, call_json_llm
 from notes.map_extractor import correct_standalone_map
 from notes.spot_resolver import resolve_spot
@@ -155,6 +155,91 @@ async def _ingest_typed(note_id: UUID, db: AsyncSession) -> None:
     log.info("typed_note_ingested", extra={"note_id": str(note_id)})
 
 
+async def _ingest_debrief(note_id: UUID, db: AsyncSession) -> None:
+    """
+    Debrief note ingestion.
+
+    Content is the prose summary already written by the debrief endpoint.
+    Pipeline:
+      1. Field extraction (spec divergence: applied to debrief like typed notes)
+      2. Spot resolution — uses trip.spot_id if already set, else resolves from content
+      3. Embedding
+      4. Immediate Tier 1 re-score for the confirmed spot (§13.6)
+    """
+    from spots.scorer import compute_and_store_score
+
+    result = await db.execute(select(Note).where(Note.id == note_id))
+    note = result.scalar_one_or_none()
+    if not note or not note.content:
+        return
+
+    # Field extraction
+    prompt = FIELD_EXTRACTION_PROMPT.format(note_text=note.content)
+    fields = await call_json_llm(prompt, CHAT_MODEL, _FIELD_EXTRACTION_DEFAULT)
+    fields = _sanitise_fields(fields)
+
+    # Embedding
+    embedding = await embed_text(note.content)
+
+    # Spot resolution — prefer trip.spot_id if already known
+    spot_id = None
+    flags: list[str] = []
+    spot_resolution_json = None
+
+    if note.trip_id:
+        trip_result = await db.execute(select(Trip).where(Trip.id == note.trip_id))
+        trip = trip_result.scalar_one_or_none()
+        if trip and trip.spot_id:
+            spot_id = trip.spot_id
+            flags.append("spot_auto_linked")
+
+    if not spot_id:
+        resolution = await resolve_spot(note.content, db)
+        if resolution["band"] == "auto":
+            spot_id = resolution["auto_spot_id"]
+            flags.append("spot_auto_linked")
+        elif resolution["band"] == "medium":
+            spot_resolution_json = json.dumps(
+                {
+                    "band": resolution["band"],
+                    "location_string": resolution["location_string"],
+                    "candidates": resolution["candidates"],
+                }
+            )
+            flags.append("awaiting_spot_confirmation")
+        else:
+            flags.append("awaiting_spot_confirmation")
+            spot_resolution_json = json.dumps(
+                {
+                    "band": "low",
+                    "location_string": resolution["location_string"],
+                    "candidates": [],
+                }
+            )
+
+    updates: dict[str, Any] = {
+        "species": fields.get("species") or [],
+        "flies": fields.get("flies") or [],
+        "outcome": fields.get("outcome"),
+        "negative_reason": fields.get("negative_reason"),
+        "approx_cfs": fields.get("approx_cfs"),
+        "approx_temp": fields.get("approx_temp"),
+        "time_of_day": fields.get("time_of_day"),
+        "embedding": embedding,
+        "processing_notes": _build_processing_notes(flags, spot_resolution_json),
+    }
+    if spot_id:
+        updates["spot_id"] = spot_id
+
+    await _update_note(note_id, updates, db)
+
+    # Trigger immediate re-score for confirmed spot (§13.6)
+    if spot_id:
+        await compute_and_store_score(str(spot_id), db)
+
+    log.info("debrief_note_ingested", extra={"note_id": str(note_id)})
+
+
 async def _ingest_standalone_map(note_id: UUID, db: AsyncSession) -> None:
     """
     Standalone map upload: OpenCV correction → store corrected image.
@@ -208,6 +293,8 @@ async def ingest_note_task(note_id: UUID, source_type: str, author_id: UUID) -> 
                 await _ingest_typed(note_id, db)
             elif source_type == "map":
                 await _ingest_standalone_map(note_id, db)
+            elif source_type == "debrief":
+                await _ingest_debrief(note_id, db)
             else:
                 log.warning(
                     "unknown_source_type",

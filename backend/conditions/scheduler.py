@@ -216,7 +216,7 @@ async def job_noaa_nwrfc() -> None:
 
     for spot in spots:
         for usgs_id in (spot.usgs_site_ids or []):
-            gauge_id = await resolve_gauge_id(usgs_id)
+            gauge_id = resolve_gauge_id(usgs_id)
             if not gauge_id:
                 continue
             data = await fetch_noaa_nwrfc(gauge_id)

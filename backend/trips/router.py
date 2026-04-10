@@ -8,14 +8,15 @@ PATCH /api/trips/{trip_id}/state — manual state override (cancellation)
 """
 
 import logging
+import uuid
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth.middleware import get_current_user
 from db.connection import get_db
-from db.models import Spot, User
+from db.models import Note, Spot, User
 from sqlalchemy import select
 from trips.service import (
     assign_spot,
@@ -166,6 +167,86 @@ async def get_trip_endpoint(
         "drive_time_unavailable": drive_time_unavailable,
         "session_candidates": session_candidates,
         "messages": [_message_out(m) for m in messages],
+    }
+
+
+@router.post("/{trip_id}/debrief", status_code=201)
+async def save_debrief_endpoint(
+    trip_id: UUID,
+    background_tasks: BackgroundTasks,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Save a trip debrief.
+
+    Serialises the conversation, summarises it via LLM using DEBRIEF_SUMMARY_PROMPT,
+    stores the prose as a debrief note, sets trip.debrief_note_id (which transitions
+    the trip to DEBRIEFED), and fires note ingestion (field extraction + spot
+    resolution + embedding + immediate re-score) as a BackgroundTask.
+
+    Only valid when trip.state == POST_TRIP.
+    """
+    from llm.client import CHAT_MODEL, ollama_generate
+    from notes.ingestion import ingest_note_task
+    from prompts.registry import DEBRIEF_SUMMARY_PROMPT
+
+    trip = await get_trip(trip_id, user.id, db)
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip not found")
+
+    await refresh_state(trip, db)
+    if trip.state != "POST_TRIP":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Debrief requires POST_TRIP state, got {trip.state}",
+        )
+
+    conversation = await get_trip_conversation(trip_id, db)
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    messages = await get_conversation_messages(conversation.id, db)
+    if not messages:
+        raise HTTPException(status_code=400, detail="No conversation to debrief")
+
+    # Serialise conversation for the summarisation prompt
+    conversation_text = "\n".join(
+        f"{m.role.upper()}: {m.content}" for m in messages
+    )
+
+    # Summarise with Llama 3.1 8B (prose, not JSON — §18.5)
+    prose_summary = await ollama_generate(
+        DEBRIEF_SUMMARY_PROMPT.format(conversation_text=conversation_text),
+        model=CHAT_MODEL,
+    )
+
+    # Create the debrief note
+    note = Note(
+        id=uuid.uuid4(),
+        content=prose_summary,
+        source_type="debrief",
+        author_id=user.id,
+        trip_id=trip.id,
+    )
+    db.add(note)
+    await db.flush()
+
+    # Setting debrief_note_id auto-transitions trip to DEBRIEFED (§9)
+    trip.debrief_note_id = note.id
+    await db.commit()
+
+    # Fire ingestion: field extraction + spot resolution + embedding + score
+    background_tasks.add_task(ingest_note_task, note.id, "debrief", user.id)
+
+    log.info(
+        "debrief_saved",
+        extra={"trip_id": str(trip_id), "note_id": str(note.id)},
+    )
+    return {
+        "note_id": str(note.id),
+        "trip_id": str(trip_id),
+        "state": "DEBRIEFED",
     }
 
 

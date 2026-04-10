@@ -339,4 +339,13 @@ async def confirm_spot(
 
     updated = await service.confirm_spot(note_id, UUID(spot_id), db)
     await db.commit()
+
+    # Debrief notes trigger immediate spot re-score when spot is confirmed (§13.6)
+    if note.source_type == "debrief":
+        from spots.scorer import compute_and_store_score
+        from db.connection import AsyncSessionLocal
+        async with AsyncSessionLocal() as score_db:
+            await compute_and_store_score(spot_id, score_db)
+            await score_db.commit()
+
     return {"note_id": str(note_id), "spot_id": spot_id}

@@ -1,8 +1,9 @@
 """
-Spot query service — list, detail, and search.
+Spot query service — list, detail, search, and creation.
 """
 
 import logging
+import uuid
 from datetime import date
 from uuid import UUID
 
@@ -48,6 +49,48 @@ async def get_spot_closures(spot_id: UUID, db: AsyncSession) -> list[EmergencyCl
             | (EmergencyClosure.expires >= date.today())
         )
         .order_by(EmergencyClosure.effective)
+    )
+    return list(result.scalars().all())
+
+
+async def create_spot(name: str, spot_type: str, db: AsyncSession) -> Spot:
+    """
+    Create a minimal spot from user input (debrief or manual entry).
+
+    Latitude/longitude are left null — null coordinates signal that this spot
+    needs geocoding. Listed by GET /api/spots/unresolved until resolved.
+    seed_confidence='unvalidated', source='notes'.
+    """
+    from rag.embedder import embed_text
+
+    spot = Spot(
+        id=uuid.uuid4(),
+        name=name,
+        type=spot_type,
+        source="notes",
+        seed_confidence="unvalidated",
+    )
+    db.add(spot)
+    await db.flush()
+
+    embedding = await embed_text(name)
+    spot.name_embedding = embedding
+    await db.flush()
+    log.info("spot_created_from_note", extra={"spot_id": str(spot.id), "name": name})
+    return spot
+
+
+async def list_unresolved_spots(db: AsyncSession) -> list[Spot]:
+    """
+    Return spots with seed_confidence='unvalidated' and null coordinates.
+    These were created from debrief or user input and need geocoding before
+    they can appear in recommendations.
+    """
+    result = await db.execute(
+        select(Spot).where(
+            Spot.seed_confidence == "unvalidated",
+            Spot.latitude.is_(None),
+        ).order_by(Spot.name)
     )
     return list(result.scalars().all())
 

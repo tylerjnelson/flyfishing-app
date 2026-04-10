@@ -1,9 +1,11 @@
 """
-Spots API — list, detail, and search endpoints.
+Spots API — list, detail, search, and creation endpoints.
 
-GET /api/spots                    — paginated list, sorted by score desc
-GET /api/spots/search?q=yakima    — fuzzy name search (pg_trgm)
-GET /api/spots/{spot_id}          — full detail with closures and regs
+GET  /api/spots                    — paginated list, sorted by score desc
+GET  /api/spots/search?q=yakima    — fuzzy name search (pg_trgm)
+GET  /api/spots/unresolved         — spots needing geocoding (seed_confidence=unvalidated, null coords)
+GET  /api/spots/{spot_id}          — full detail with closures and regs
+POST /api/spots                    — create a new spot from user input (debrief / manual)
 """
 
 import logging
@@ -15,7 +17,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from auth.middleware import get_current_user
 from db.connection import get_db
 from db.models import User
-from spots.service import get_spot, get_spot_closures, list_spots, search_spots
+from spots.service import (
+    create_spot,
+    get_spot,
+    get_spot_closures,
+    list_spots,
+    list_unresolved_spots,
+    search_spots,
+)
 
 log = logging.getLogger(__name__)
 
@@ -100,6 +109,55 @@ async def search_spots_endpoint(
 ):
     spots = await search_spots(q, db, limit=limit)
     return {"spots": [_spot_summary(s) for s in spots]}
+
+
+@router.get("/unresolved")
+async def list_unresolved_spots_endpoint(
+    _: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Return spots with null coordinates that need geocoding before they appear
+    in recommendations. Created when a debrief references an unknown location.
+    """
+    spots = await list_unresolved_spots(db)
+    return {
+        "spots": [
+            {
+                "id": str(s.id),
+                "name": s.name,
+                "type": s.type,
+                "source": s.source,
+                "seed_confidence": s.seed_confidence,
+            }
+            for s in spots
+        ]
+    }
+
+
+@router.post("", status_code=201)
+async def create_spot_endpoint(
+    body: dict,
+    _: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Create a new spot from user input.
+
+    Body: {"name": "...", "type": "river"|"lake"|"creek"|"coastal"}
+
+    Spot is created with seed_confidence='unvalidated' and null coordinates.
+    It will appear in GET /api/spots/unresolved until geocoded.
+    """
+    name = (body.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name is required")
+    spot_type = body.get("type", "river")
+    if spot_type not in ("river", "lake", "creek", "coastal"):
+        raise HTTPException(status_code=400, detail="type must be river, lake, creek, or coastal")
+    spot = await create_spot(name=name, spot_type=spot_type, db=db)
+    await db.commit()
+    return {"spot_id": str(spot.id), "name": spot.name, "type": spot.type}
 
 
 @router.get("/{spot_id}")

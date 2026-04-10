@@ -38,7 +38,7 @@ from db.models import (
     Trip,
     User,
 )
-from prompts.registry import RECOMMENDATION_SYSTEM_PROMPT
+from prompts.registry import DEBRIEF_CONVERSATION_PROMPT, RECOMMENDATION_SYSTEM_PROMPT
 from rag.embedder import embed_text
 from spots.scorer import cfs_similarity
 
@@ -89,12 +89,40 @@ def _matches_water_type(spot: Spot, water_types: list[str]) -> bool:
     return spot.type in water_types
 
 
-def _has_active_closure(spot_id, closures_by_spot: dict[str, list]) -> bool:
-    today = date.today()
-    for cl in closures_by_spot.get(str(spot_id), []):
-        effective = cl.effective or date.min
-        expires = cl.expires or date.max
-        if effective <= today <= expires:
+_CLOSURE_KEYWORDS: frozenset[str] = frozenset(
+    {"close", "closed", "closure", "closes", "prohibited", "emergency"}
+)
+
+# Generic geographic type words stripped before name matching to avoid
+# false positives where two spots share "River", "Creek", "Lake" etc.
+_GEO_TYPE_WORDS: frozenset[str] = frozenset({
+    "river", "creek", "lake", "pond", "reservoir", "stream",
+    "tributary", "bay", "channel", "fork", "run",
+})
+
+
+def _has_active_closure(spot_name: str, active_closures: list) -> bool:
+    """
+    Return True if any active closure's rule_text references this spot by name
+    and contains at least one closure keyword.
+
+    Generic geographic words ("River", "Creek", "Lake", …) are excluded from
+    the name match to prevent false positives between different spots that share
+    the same type suffix.  All remaining name words must appear in the rule text.
+
+    'active_closures' contains only date-filtered rows (effective <= today <= expires).
+    """
+    if not active_closures or not spot_name:
+        return False
+    all_name_words = frozenset(spot_name.lower().split())
+    content_words = all_name_words - _GEO_TYPE_WORDS
+    if not content_words:
+        # Spot name is entirely generic type words — fall back to full name match
+        content_words = all_name_words
+    for cl in active_closures:
+        text_lower = (cl.rule_text or "").lower()
+        text_words = frozenset(text_lower.split())
+        if content_words <= text_words and _CLOSURE_KEYWORDS & text_words:
             return True
     return False
 
@@ -480,6 +508,69 @@ def _truncate(text: str, max_chars: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# POST_TRIP debrief conversation context (§13.6)
+# ---------------------------------------------------------------------------
+
+async def _build_debrief_context(
+    user: User,
+    trip: Trip,
+    conversation: Conversation,
+    query: str,
+    db,
+) -> BuildResult:
+    """
+    Minimal context for debrief conversations.
+
+    Skips all spot filtering, scoring, and RAG retrieval. Injects trip context
+    (planned spot name + dates) alongside DEBRIEF_CONVERSATION_PROMPT.
+    """
+    # Planned spot context
+    trip_context_lines: list[str] = []
+    if trip.spot_id:
+        spot_result = await db.execute(select(Spot).where(Spot.id == trip.spot_id))
+        spot = spot_result.scalar_one_or_none()
+        if spot:
+            trip_context_lines.append(f"PLANNED SPOT: {spot.name}")
+    elif conversation.session_candidates:
+        candidates = (conversation.session_candidates or {}).get("candidates", [])
+        if candidates:
+            trip_context_lines.append(f"PLANNED SPOT: {candidates[0].get('spot_name', 'unknown')}")
+
+    if trip.trip_date:
+        trip_context_lines.append(f"TRIP DATE: {trip.trip_date}")
+    if trip.departure_time:
+        trip_context_lines.append(f"DEPARTURE: {trip.departure_time.strftime('%Y-%m-%d %H:%M UTC')}")
+
+    trip_context = "\n".join(trip_context_lines)
+
+    # Conversation history
+    msg_result = await db.execute(
+        select(Message.role, Message.content)
+        .where(Message.conversation_id == conversation.id)
+        .order_by(Message.created_at)
+    )
+    prior_messages = [{"role": r.role, "content": r.content} for r in msg_result.all()]
+
+    system_content = "\n\n".join(filter(None, [
+        DEBRIEF_CONVERSATION_PROMPT.strip(),
+        trip_context,
+    ]))
+
+    messages = [{"role": "system", "content": system_content}]
+    for m in prior_messages:
+        messages.append({"role": m["role"], "content": m["content"]})
+    messages.append({"role": "user", "content": query})
+
+    return BuildResult(
+        messages=messages,
+        session_candidates=conversation.session_candidates or {},
+        conditions_hash=None,
+        drive_time_unavailable=False,
+        cached_response=None,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -498,7 +589,16 @@ async def build_context(
     force_rerun=True is passed by POST /chat/confirm-filter when the user
     confirms a FILTER_UPDATE — triggers a full pipeline re-run and replaces
     session_candidates.
+
+    When trip.state == POST_TRIP, the full recommendation pipeline is skipped
+    and a debrief conversation context is returned instead.
     """
+    # ------------------------------------------------------------------
+    # POST_TRIP — debrief conversation path (§13.6)
+    # ------------------------------------------------------------------
+    if trip.state == "POST_TRIP":
+        return await _build_debrief_context(user, trip, conversation, query, db)
+
     intake = trip.session_intake or {}
     prefs = user.preferences or {}
 
@@ -551,13 +651,15 @@ async def build_context(
 
         spot_ids = [s.id for s in spots]
 
-        # Active emergency closures
+        # Active emergency closures — text-based matching, no spot_id required
+        today_date = date.today()
         closure_result = await db.execute(
-            select(EmergencyClosure).where(EmergencyClosure.spot_id.in_(spot_ids))
+            select(EmergencyClosure).where(
+                (EmergencyClosure.effective <= today_date) | EmergencyClosure.effective.is_(None),
+                (EmergencyClosure.expires >= today_date) | EmergencyClosure.expires.is_(None),
+            )
         )
-        closures_by_spot: dict[str, list] = {}
-        for cl in closure_result.scalars().all():
-            closures_by_spot.setdefault(str(cl.spot_id), []).append(cl)
+        active_closures: list = closure_result.scalars().all()
 
         # InciWeb active WA fires (global — spot_id IS NULL in conditions_cache)
         inciweb_result = await db.execute(
@@ -585,7 +687,7 @@ async def build_context(
             sid = str(spot.id)
             if spot.permit_required:
                 continue
-            if _has_active_closure(spot.id, closures_by_spot):
+            if _has_active_closure(spot.name, active_closures):
                 continue
             if _wildfire_near_spot(float(spot.latitude), float(spot.longitude), active_fires):
                 continue

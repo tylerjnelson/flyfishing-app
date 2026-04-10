@@ -154,6 +154,9 @@ export default function TripThread() {
   const [confirmLoading, setConfirmLoading] = useState(false)
 
   const [showInWindowNudge, setShowInWindowNudge] = useState(false)
+  const [debriefSaving, setDebriefSaving] = useState(false)
+  const [debriefSaved, setDebriefSaved] = useState(false)
+  const [userMessageCount, setUserMessageCount] = useState(0)
 
   const bottomRef = useRef(null)
   const inputRef = useRef(null)
@@ -168,6 +171,7 @@ export default function TripThread() {
         setConversationId(data.conversation_id)
         setMessages(data.messages || [])
         setDriveTimeUnavailable(data.drive_time_unavailable || false)
+        setUserMessageCount((data.messages || []).filter(m => m.role === 'user').length)
 
         const candidates = data.session_candidates || []
         setTopSpotIds(candidates.slice(0, 5).map(c => c.spot_id).filter(Boolean))
@@ -197,6 +201,7 @@ export default function TripThread() {
     // Optimistically add user message
     const userMsg = { id: Date.now(), role: 'user', content: text }
     setMessages(prev => [...prev, userMsg])
+    setUserMessageCount(prev => prev + 1)
 
     try {
       const resp = await fetch('/api/chat', {
@@ -293,6 +298,23 @@ export default function TripThread() {
   }
 
   // ------------------------------------------------------------------
+  // Save debrief
+  // ------------------------------------------------------------------
+  async function handleSaveDebrief() {
+    if (debriefSaving || debriefSaved) return
+    setDebriefSaving(true)
+    try {
+      await api.post(`/trips/${tripId}/debrief`)
+      setDebriefSaved(true)
+      setTrip(prev => ({ ...prev, state: 'DEBRIEFED' }))
+    } catch {
+      // Silent — user can retry
+    } finally {
+      setDebriefSaving(false)
+    }
+  }
+
+  // ------------------------------------------------------------------
   // Keyboard
   // ------------------------------------------------------------------
   function handleKeyDown(e) {
@@ -323,6 +345,8 @@ export default function TripThread() {
 
   const stateLabel = trip ? STATE_LABELS[trip.state] || trip.state : ''
   const isInWindow = trip?.state === 'IN_WINDOW'
+  const isPostTrip = trip?.state === 'POST_TRIP'
+  const canSaveDebrief = isPostTrip && userMessageCount >= 1 && !debriefSaved
 
   return (
     <div className="flex flex-col h-screen bg-gray-50">
@@ -354,9 +378,11 @@ export default function TripThread() {
       <div className="flex-1 overflow-y-auto py-4">
         {messages.length === 0 && !streaming && (
           <div className="text-center py-16 text-gray-400 text-sm px-8">
-            {isInWindow
-              ? "You're on the water. Ask for a quick spot lookup or log what you're seeing."
-              : "Ask for spot recommendations, or tell me what you're looking for."}
+            {isPostTrip
+              ? "Your trip window has passed. Tell me how it went."
+              : isInWindow
+                ? "You're on the water. Ask for a quick spot lookup or log what you're seeing."
+                : "Ask for spot recommendations, or tell me what you're looking for."}
           </div>
         )}
 
@@ -406,6 +432,23 @@ export default function TripThread() {
 
       {/* Input */}
       <div className="bg-white border-t border-gray-200 px-4 py-3 shrink-0">
+        {isPostTrip && (
+          <div className="mb-2">
+            <button
+              onClick={handleSaveDebrief}
+              disabled={!canSaveDebrief || debriefSaving}
+              className="w-full py-2 px-4 rounded-lg text-sm font-medium transition-colors
+                disabled:bg-gray-100 disabled:text-gray-400 disabled:cursor-not-allowed
+                enabled:bg-green-600 enabled:text-white enabled:hover:bg-green-700"
+            >
+              {debriefSaved
+                ? 'Debrief saved'
+                : debriefSaving
+                  ? 'Saving…'
+                  : 'Save Debrief'}
+            </button>
+          </div>
+        )}
         <div className="flex gap-2 items-end">
           <textarea
             ref={inputRef}
@@ -413,9 +456,11 @@ export default function TripThread() {
             onChange={e => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
             placeholder={
-              isInWindow
-                ? "Quick lookup or log what you're seeing…"
-                : "Ask about spots, conditions, or fishing…"
+              isPostTrip
+                ? "Tell me how the trip went…"
+                : isInWindow
+                  ? "Quick lookup or log what you're seeing…"
+                  : "Ask about spots, conditions, or fishing…"
             }
             rows={1}
             disabled={streaming}
