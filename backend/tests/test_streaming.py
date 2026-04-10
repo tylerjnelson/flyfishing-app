@@ -178,6 +178,61 @@ class TestSurfaceAlternate:
         assert "[SURFACE_ALTERNATE" not in out
         assert VALID_UUID not in out
 
+    def test_apply_promotes_to_index_0(self):
+        candidates = [
+            {"spot_id": ANOTHER_UUID, "spot_name": "Lake A"},
+            {"spot_id": VALID_UUID, "spot_name": "Lake X"},
+        ]
+        h = StreamHandler(candidates)
+        feed(h, f"[SURFACE_ALTERNATE: {VALID_UUID}, great hatch]")
+        h.flush_remaining()
+        updated, found = h.apply_surface_alternate(candidates)
+        assert found is True
+        assert updated[0]["spot_id"] == VALID_UUID
+
+    def test_apply_already_at_index_0(self):
+        candidates = [{"spot_id": VALID_UUID, "spot_name": "Lake X"}]
+        h = StreamHandler(candidates)
+        feed(h, f"[SURFACE_ALTERNATE: {VALID_UUID}, top pick]")
+        h.flush_remaining()
+        updated, found = h.apply_surface_alternate(candidates)
+        assert found is True
+        assert updated[0]["spot_id"] == VALID_UUID
+
+    def test_apply_absent_returns_false(self):
+        THIRD_UUID = str(uuid.uuid4())
+        h = StreamHandler([{"spot_id": VALID_UUID}])
+        feed(h, f"[SURFACE_ALTERNATE: {THIRD_UUID}, alternate spot]")
+        h.flush_remaining()
+        candidates = [{"spot_id": VALID_UUID}]
+        updated, found = h.apply_surface_alternate(candidates)
+        assert found is False
+        assert updated == candidates
+
+    def test_apply_preserves_all_other_candidates(self):
+        THIRD_UUID = str(uuid.uuid4())
+        candidates = [
+            {"spot_id": ANOTHER_UUID, "spot_name": "Lake A"},
+            {"spot_id": VALID_UUID, "spot_name": "Lake X"},
+            {"spot_id": THIRD_UUID, "spot_name": "Lake Z"},
+        ]
+        h = StreamHandler(candidates)
+        feed(h, f"[SURFACE_ALTERNATE: {VALID_UUID}, great hatch]")
+        h.flush_remaining()
+        updated, found = h.apply_surface_alternate(candidates)
+        assert found is True
+        assert len(updated) == 3
+        assert updated[0]["spot_id"] == VALID_UUID
+        assert {c["spot_id"] for c in updated} == {VALID_UUID, ANOTHER_UUID, THIRD_UUID}
+
+    def test_apply_no_surface_alternate_set(self):
+        candidates = [{"spot_id": VALID_UUID}]
+        h = StreamHandler(candidates)
+        # No SURFACE_ALTERNATE token fed — surface_alternate is None
+        updated, found = h.apply_surface_alternate(candidates)
+        assert found is False
+        assert updated == candidates
+
 
 # ---------------------------------------------------------------------------
 # [SAVE_NOTE]
