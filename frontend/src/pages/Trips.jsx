@@ -83,7 +83,7 @@ export default function Trips() {
   const total = grouped.upcoming.length + grouped.needs_debrief.length + grouped.past.length
 
   return (
-    <div className="max-w-lg mx-auto px-4 py-8">
+    <div className="max-w-lg mx-auto px-4 py-8 pb-24">
       <div className="flex items-center justify-between mb-6">
         <h1 className="text-2xl font-bold text-gray-900">Trips</h1>
       </div>
@@ -119,12 +119,18 @@ export default function Trips() {
       )}
 
       {/* Bottom nav */}
-      <div className="fixed bottom-0 left-0 right-0 border-t border-gray-200 bg-white flex">
+      <div
+        className="fixed bottom-0 left-0 right-0 border-t border-gray-200 bg-white flex"
+        style={{ paddingBottom: 'env(safe-area-inset-bottom)' }}
+      >
         <Link to="/trips" className="flex-1 py-3 text-center text-sm font-medium text-blue-600">
           Trips
         </Link>
         <Link to="/spots" className="flex-1 py-3 text-center text-sm font-medium text-gray-500 hover:text-gray-700">
           Spots
+        </Link>
+        <Link to="/spots/saved" className="flex-1 py-3 text-center text-sm font-medium text-gray-500 hover:text-gray-700">
+          Saved
         </Link>
         <Link to="/notes" className="flex-1 py-3 text-center text-sm font-medium text-gray-500 hover:text-gray-700">
           Notes

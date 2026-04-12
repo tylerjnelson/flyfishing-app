@@ -349,7 +349,7 @@ export default function TripThread() {
   const canSaveDebrief = isPostTrip && userMessageCount >= 1 && !debriefSaved
 
   return (
-    <div className="flex flex-col h-screen bg-gray-50">
+    <div className="flex flex-col h-dvh bg-gray-50">
       {/* Header */}
       <div className="bg-white border-b border-gray-200 px-4 py-3 flex items-center gap-3 shrink-0">
         <Link to="/trips" className="text-gray-500 hover:text-gray-700 text-lg leading-none">
@@ -431,7 +431,10 @@ export default function TripThread() {
       </div>
 
       {/* Input */}
-      <div className="bg-white border-t border-gray-200 px-4 py-3 shrink-0">
+      <div
+        className="bg-white border-t border-gray-200 px-4 py-3 shrink-0"
+        style={{ paddingBottom: 'max(0.75rem, env(safe-area-inset-bottom))' }}
+      >
         {isPostTrip && (
           <div className="mb-2">
             <button

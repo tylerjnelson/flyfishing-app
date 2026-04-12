@@ -9,6 +9,7 @@ import Onboarding from './pages/Onboarding'
 import Settings from './pages/Settings'
 import Spots from './pages/Spots'
 import SpotDetail from './pages/SpotDetail'
+import SavedSpots from './pages/SavedSpots'
 import Notes from './pages/Notes'
 import NoteUpload from './pages/NoteUpload'
 import Trips from './pages/Trips'
@@ -59,6 +60,9 @@ export default function App() {
         } />
         <Route path="/spots" element={
           <ProtectedRoute><Spots /></ProtectedRoute>
+        } />
+        <Route path="/spots/saved" element={
+          <ProtectedRoute><SavedSpots /></ProtectedRoute>
         } />
         <Route path="/spots/:spotId" element={
           <ProtectedRoute><SpotDetail /></ProtectedRoute>
