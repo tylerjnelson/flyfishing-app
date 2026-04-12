@@ -332,7 +332,7 @@ export default function NoteUpload() {
               onChange={e => setContent(e.target.value)}
               rows={8}
               placeholder="Describe your fishing trip — location, conditions, what worked…"
-              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm bg-white text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
               required
             />
           </div>
@@ -376,7 +376,7 @@ export default function NoteUpload() {
                   value={transcription}
                   onChange={e => setTranscription(e.target.value)}
                   rows={8}
-                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm bg-white text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
                 />
                 <button
                   type="button"

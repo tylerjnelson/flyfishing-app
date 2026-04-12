@@ -45,10 +45,8 @@ const STEPS = [
     question: "What's your main goal for this trip?",
     type: 'single_select',
     options: [
-      { value: 'maximise_catch', label: 'Maximise catch' },
+      { value: 'maximize_catch', label: 'Maximize catch' },
       { value: 'explore', label: 'Explore new water' },
-      { value: 'relax', label: 'Relax / scenic' },
-      { value: 'teach', label: 'Teach beginners' },
     ],
   },
   {
@@ -144,7 +142,7 @@ export default function TripNew() {
                 type="datetime-local"
                 value={answers.departure_time || ''}
                 onChange={e => setAnswer('departure_time', e.target.value)}
-                className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                className="w-full px-4 py-3 border border-gray-300 rounded-lg bg-white text-gray-900 focus:outline-none focus:ring-2 focus:ring-blue-500"
               />
             </div>
             <div>
@@ -154,7 +152,7 @@ export default function TripNew() {
                 value={answers.return_time || ''}
                 onChange={e => setAnswer('return_time', e.target.value)}
                 min={answers.departure_time || ''}
-                className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                className="w-full px-4 py-3 border border-gray-300 rounded-lg bg-white text-gray-900 focus:outline-none focus:ring-2 focus:ring-blue-500"
               />
             </div>
           </div>

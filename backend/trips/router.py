@@ -16,8 +16,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth.middleware import get_current_user
 from db.connection import get_db
-from db.models import Note, Spot, User
-from sqlalchemy import select
+from db.models import Conversation, Message, Note, Spot, User
+from sqlalchemy import delete, select, update
 from trips.service import (
     assign_spot,
     create_trip,
@@ -248,6 +248,45 @@ async def save_debrief_endpoint(
         "trip_id": str(trip_id),
         "state": "DEBRIEFED",
     }
+
+
+@router.delete("/{trip_id}", status_code=204)
+async def delete_trip_endpoint(
+    trip_id: UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Delete a trip and all associated conversations and messages.
+    Notes linked to the trip are preserved (group knowledge) but unlinked.
+    """
+    trip = await get_trip(trip_id, user.id, db)
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip not found")
+
+    # 1. Delete messages for all conversations on this trip
+    conv_result = await db.execute(
+        select(Conversation.id).where(Conversation.trip_id == trip_id)
+    )
+    conv_ids = [r[0] for r in conv_result.all()]
+    if conv_ids:
+        await db.execute(delete(Message).where(Message.conversation_id.in_(conv_ids)))
+
+    # 2. Delete conversations
+    await db.execute(delete(Conversation).where(Conversation.trip_id == trip_id))
+
+    # 3. Unlink notes — preserve them as group knowledge
+    await db.execute(
+        update(Note).where(Note.trip_id == trip_id).values(trip_id=None)
+    )
+
+    # 4. Clear debrief_note_id to break circular FK, then delete trip
+    trip.debrief_note_id = None
+    await db.flush()
+    await db.delete(trip)
+    await db.commit()
+
+    log.info("trip_deleted", extra={"trip_id": str(trip_id), "user_id": str(user.id)})
 
 
 @router.patch("/{trip_id}/state")

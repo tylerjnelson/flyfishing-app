@@ -148,6 +148,8 @@ export default function TripThread() {
 
   const [input, setInput] = useState('')
   const [streaming, setStreaming] = useState(false)
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
+  const [deleting, setDeleting] = useState(false)
   const [streamingContent, setStreamingContent] = useState('')
 
   const [pendingFilter, setPendingFilter] = useState(null)   // {key, value}
@@ -180,10 +182,74 @@ export default function TripThread() {
       .finally(() => setLoading(false))
   }, [tripId])
 
+  // Auto-init: fire opening recommendation when thread is fresh
+  useEffect(() => {
+    if (!conversationId || messages.length > 0 || trip?.state === 'POST_TRIP') return
+    autoInit(conversationId)
+  }, [conversationId]) // eslint-disable-line react-hooks/exhaustive-deps
+
   // Scroll to bottom on new messages / streaming
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, streamingContent])
+
+  // ------------------------------------------------------------------
+  // Auto-init: silent trigger — no user bubble shown
+  // ------------------------------------------------------------------
+  async function autoInit(convId) {
+    setStreaming(true)
+    setStreamingContent('')
+    try {
+      const resp = await fetch('/api/chat', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${accessToken}`,
+        },
+        body: JSON.stringify({
+          conversation_id: convId,
+          message: "Based on my trip details, what spots do you recommend?",
+        }),
+      })
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+
+      const reader = resp.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      let accumulated = ''
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        const parts = buffer.split('\n\n')
+        buffer = parts.pop()
+        for (const part of parts) {
+          for (const line of part.split('\n')) {
+            if (!line.startsWith('data: ')) continue
+            let event
+            try { event = JSON.parse(line.slice(6)) } catch { continue }
+            if (event.type === 'token') {
+              accumulated += event.content
+              setStreamingContent(accumulated)
+            } else if (event.type === 'drive_time_unavailable') {
+              setDriveTimeUnavailable(true)
+            } else if (event.type === 'done') {
+              if (accumulated) {
+                setMessages([{ id: Date.now(), role: 'assistant', content: accumulated }])
+              }
+              setStreamingContent('')
+            }
+          }
+        }
+      }
+    } catch {
+      // Silent — empty state message remains, user can type manually
+    } finally {
+      setStreaming(false)
+      setStreamingContent('')
+    }
+  }
 
   // ------------------------------------------------------------------
   // Send message + stream response
@@ -315,6 +381,20 @@ export default function TripThread() {
   }
 
   // ------------------------------------------------------------------
+  // Delete trip
+  // ------------------------------------------------------------------
+  async function handleDelete() {
+    setDeleting(true)
+    try {
+      await api.delete(`/trips/${tripId}`)
+      navigate('/trips', { replace: true })
+    } catch {
+      setDeleting(false)
+      setShowDeleteConfirm(false)
+    }
+  }
+
+  // ------------------------------------------------------------------
   // Keyboard
   // ------------------------------------------------------------------
   function handleKeyDown(e) {
@@ -369,6 +449,12 @@ export default function TripThread() {
         >
           + Note
         </Link>
+        <button
+          onClick={() => setShowDeleteConfirm(true)}
+          className="text-xs px-3 py-1.5 border border-red-200 rounded-full text-red-500 hover:bg-red-50"
+        >
+          Delete
+        </button>
       </div>
 
       {/* Drive-time unavailable banner */}
@@ -430,6 +516,34 @@ export default function TripThread() {
         <div ref={bottomRef} />
       </div>
 
+      {/* Delete confirmation modal */}
+      {showDeleteConfirm && (
+        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 px-4">
+          <div className="bg-white rounded-xl shadow-xl p-6 max-w-sm w-full">
+            <h3 className="text-base font-semibold text-gray-900 mb-2">Delete this trip?</h3>
+            <p className="text-sm text-gray-500 mb-6">
+              The trip plan and conversation will be permanently deleted. Any notes linked to this trip will be kept.
+            </p>
+            <div className="flex gap-3">
+              <button
+                onClick={() => setShowDeleteConfirm(false)}
+                disabled={deleting}
+                className="flex-1 px-4 py-2.5 border border-gray-300 rounded-lg text-sm text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleDelete}
+                disabled={deleting}
+                className="flex-1 px-4 py-2.5 bg-red-600 text-white rounded-lg text-sm font-medium hover:bg-red-700 disabled:opacity-50"
+              >
+                {deleting ? 'Deleting…' : 'Delete trip'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Input */}
       <div
         className="bg-white border-t border-gray-200 px-4 py-3 shrink-0"
@@ -467,7 +581,7 @@ export default function TripThread() {
             }
             rows={1}
             disabled={streaming}
-            className="flex-1 px-4 py-2.5 border border-gray-300 rounded-2xl text-sm resize-none focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-50"
+            className="flex-1 px-4 py-2.5 border border-gray-300 rounded-2xl text-sm bg-white text-gray-900 placeholder-gray-400 resize-none focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-50"
             style={{ maxHeight: '120px' }}
             onInput={e => {
               e.target.style.height = 'auto'

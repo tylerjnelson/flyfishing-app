@@ -455,7 +455,7 @@ def _format_conditions_block(candidates: list[dict]) -> str:
     for c in candidates[:_SURFACE_TOP_N]:
         usgs = (c.get("conditions") or {}).get("usgs") or {}
         nws = (c.get("conditions") or {}).get("noaa_nws") or {}
-        lines.append(f"\n=== {c['spot_name']} (score: {c['session_score']:.2f}) ===")
+        lines.append(f"\n=== {c['spot_name']} ===")
 
         if c.get("is_haversine"):
             lines.append(f"Distance: ~{c.get('straight_line_miles', '?')} miles straight-line")
@@ -481,6 +481,8 @@ def _format_conditions_block(candidates: list[dict]) -> str:
 
 
 def _format_notes_block(notes: list[dict], maps: list[dict]) -> str:
+    if not notes and not maps:
+        return ""
     lines = ["=== GROUP NOTES ==="]
     for n in notes:
         nd = n.get("note_date") or "unknown date"
@@ -604,11 +606,15 @@ async def build_context(
 
     water_types: list[str] = intake.get("water_type") or []
     target_species: list[str] = intake.get("target_species") or []
+    trip_goal: str = intake.get("trip_goal") or "maximize_catch"
     max_drive_minutes = int(intake.get("max_drive_minutes") or _DEFAULT_MAX_DRIVE_MINUTES)
     departure_time = trip.departure_time or datetime.now(tz=timezone.utc)
 
-    # Departure location: session override (pivot) takes precedence over profile home
+    # Departure location: session override (pivot) takes precedence over profile home.
+    # home_location from prefs may be a raw string (not yet geocoded) — treat as label-only.
     departure_location = intake.get("departure_location") or prefs.get("home_location") or {}
+    if isinstance(departure_location, str):
+        departure_location = {"label": departure_location, "lat": None, "lon": None}
     origin_lat = departure_location.get("lat")
     origin_lon = departure_location.get("lon")
 
@@ -747,7 +753,12 @@ async def build_context(
         # --------------------------------------------------------------
         for c in candidates_raw:
             delta = _compute_volatile_delta(c["spot"], c["usgs"], c["nws"], target_species)
-            c["session_score"] = float(c["spot"].score or 0) + delta
+            base = float(c["spot"].score or 0) + delta
+            # Explore goal: boost unvisited spots (+2.0) so they sort above
+            # recently-fished water regardless of raw score.
+            if trip_goal == "explore" and c["spot"].last_visited is None:
+                base += 2.0
+            c["session_score"] = base
 
         candidates_raw.sort(key=lambda c: c["session_score"], reverse=True)
         candidates_raw = candidates_raw[:_MAX_CANDIDATES]
