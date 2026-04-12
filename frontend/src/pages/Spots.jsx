@@ -96,7 +96,7 @@ export default function Spots() {
   const mappable = spots.filter(s => s.latitude && s.longitude)
 
   return (
-    <div className="flex flex-col h-screen">
+    <div className="flex flex-col h-dvh">
       {/* Header */}
       <div className="px-4 py-3 border-b border-gray-200 bg-white">
         <div className="max-w-6xl mx-auto flex flex-wrap items-center gap-3">

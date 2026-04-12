@@ -21,9 +21,12 @@ from spots.service import (
     create_spot,
     get_spot,
     get_spot_closures,
+    list_saved_spots,
     list_spots,
     list_unresolved_spots,
+    save_spot,
     search_spots,
+    unsave_spot,
 )
 
 log = logging.getLogger(__name__)
@@ -171,3 +174,29 @@ async def get_spot_endpoint(
         raise HTTPException(status_code=404, detail="Spot not found")
     closures = await get_spot_closures(spot_id, db)
     return _spot_detail(spot, closures)
+
+
+@router.post("/{spot_id}/save", status_code=201)
+async def save_spot_endpoint(
+    spot_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Save a spot for the current user. Idempotent."""
+    try:
+        saved = await save_spot(current_user.id, spot_id, db)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Spot not found")
+    await db.commit()
+    return {"spot_id": str(spot_id), "saved_at": saved.saved_at.isoformat() if saved.saved_at else None}
+
+
+@router.delete("/{spot_id}/save", status_code=204)
+async def unsave_spot_endpoint(
+    spot_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Remove a spot from the current user's saved list."""
+    await unsave_spot(current_user.id, spot_id, db)
+    await db.commit()

@@ -47,15 +47,38 @@ export default function SpotDetail() {
   const [spot, setSpot] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  const [saved, setSaved] = useState(false)
+  const [saving, setSaving] = useState(false)
 
   useEffect(() => {
     setLoading(true)
-    api
-      .get(`/spots/${spotId}`)
-      .then(({ data }) => setSpot(data))
+    Promise.all([
+      api.get(`/spots/${spotId}`),
+      api.get('/users/me/saved-spots'),
+    ])
+      .then(([spotRes, savedRes]) => {
+        setSpot(spotRes.data)
+        const ids = (savedRes.data.saved_spots || []).map(s => s.spot_id)
+        setSaved(ids.includes(spotId))
+      })
       .catch(() => setError('Spot not found.'))
       .finally(() => setLoading(false))
   }, [spotId])
+
+  async function toggleSave() {
+    setSaving(true)
+    try {
+      if (saved) {
+        await api.delete(`/spots/${spotId}/save`)
+        setSaved(false)
+      } else {
+        await api.post(`/spots/${spotId}/save`)
+        setSaved(true)
+      }
+    } finally {
+      setSaving(false)
+    }
+  }
 
   if (loading) {
     return (
@@ -133,19 +156,32 @@ export default function SpotDetail() {
           </div>
         </div>
 
-        {/* Score */}
-        <div className="shrink-0 text-center">
-          <div
-            className="text-3xl font-bold"
-            style={{ color: scoreColor(spot.score) }}
+        {/* Score + Save */}
+        <div className="shrink-0 flex flex-col items-end gap-2">
+          <div className="text-center">
+            <div
+              className="text-3xl font-bold"
+              style={{ color: scoreColor(spot.score) }}
+            >
+              {spot.score != null ? spot.score.toFixed(1) : '—'}
+            </div>
+            <div className="text-xs text-gray-400">
+              {spot.score_updated
+                ? `Scored ${new Date(spot.score_updated).toLocaleDateString()}`
+                : 'Not scored yet'}
+            </div>
+          </div>
+          <button
+            onClick={toggleSave}
+            disabled={saving}
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
+              saved
+                ? 'bg-purple-100 text-purple-700 hover:bg-purple-200'
+                : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+            }`}
           >
-            {spot.score != null ? spot.score.toFixed(1) : '—'}
-          </div>
-          <div className="text-xs text-gray-400">
-            {spot.score_updated
-              ? `Scored ${new Date(spot.score_updated).toLocaleDateString()}`
-              : 'Not scored yet'}
-          </div>
+            {saved ? '★ Saved' : '☆ Save'}
+          </button>
         </div>
       </div>
 

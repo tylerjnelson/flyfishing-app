@@ -10,7 +10,7 @@ from uuid import UUID
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.models import EmergencyClosure, Spot
+from db.models import EmergencyClosure, SavedSpot, Spot
 
 log = logging.getLogger(__name__)
 
@@ -91,6 +91,61 @@ async def list_unresolved_spots(db: AsyncSession) -> list[Spot]:
             Spot.seed_confidence == "unvalidated",
             Spot.latitude.is_(None),
         ).order_by(Spot.name)
+    )
+    return list(result.scalars().all())
+
+
+async def save_spot(user_id: UUID, spot_id: UUID, db: AsyncSession) -> SavedSpot:
+    """
+    Save a spot for a user. Idempotent — returns the existing record if already saved.
+    Raises ValueError if the spot does not exist.
+    """
+    spot = await get_spot(spot_id, db)
+    if not spot:
+        raise ValueError("spot_not_found")
+
+    existing = await db.execute(
+        select(SavedSpot).where(
+            SavedSpot.user_id == user_id,
+            SavedSpot.spot_id == spot_id,
+        )
+    )
+    row = existing.scalar_one_or_none()
+    if row:
+        return row
+
+    saved = SavedSpot(id=uuid.uuid4(), user_id=user_id, spot_id=spot_id)
+    db.add(saved)
+    await db.flush()
+    log.info("spot_saved", extra={"user_id": str(user_id), "spot_id": str(spot_id)})
+    return saved
+
+
+async def unsave_spot(user_id: UUID, spot_id: UUID, db: AsyncSession) -> bool:
+    """
+    Remove a saved spot. Returns True if deleted, False if it was not saved.
+    """
+    existing = await db.execute(
+        select(SavedSpot).where(
+            SavedSpot.user_id == user_id,
+            SavedSpot.spot_id == spot_id,
+        )
+    )
+    row = existing.scalar_one_or_none()
+    if not row:
+        return False
+    await db.delete(row)
+    await db.flush()
+    log.info("spot_unsaved", extra={"user_id": str(user_id), "spot_id": str(spot_id)})
+    return True
+
+
+async def list_saved_spots(user_id: UUID, db: AsyncSession) -> list[SavedSpot]:
+    """Return all saved spots for a user, ordered most-recently saved first."""
+    result = await db.execute(
+        select(SavedSpot)
+        .where(SavedSpot.user_id == user_id)
+        .order_by(SavedSpot.saved_at.desc())
     )
     return list(result.scalars().all())
 
