@@ -19,6 +19,9 @@
     "react-leaflet": "^5.0.0",
     "react-router-dom": "^7.14.0",
     "tailwindcss": "^4.2.2",
+    "vite-plugin-pwa": "^1.2.0",
+    "workbox-build": "^7.4.0",
+    "workbox-window": "^7.4.0",
     "zustand": "^5.0.12"
   },
   "devDependencies": {
