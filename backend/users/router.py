@@ -1,8 +1,10 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
+import httpx
 
 from auth.middleware import get_current_user
+from config import settings
 from db.connection import get_db
 from db.models import User
 from spots.service import get_spot, list_saved_spots
@@ -14,6 +16,32 @@ router = APIRouter()
 class ProfileUpdate(BaseModel):
     display_name: str | None = None
     preferences: dict | None = None
+
+
+@router.get("/geocode")
+async def geocode_location(
+    q: str = Query(..., min_length=2),
+    current_user: User = Depends(get_current_user),
+):
+    """Geocode a free-text location string via HERE. Returns {label, lat, lon} or 404."""
+    async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
+        resp = await client.get(
+            "https://geocode.search.hereapi.com/v1/geocode",
+            params={"q": q, "in": "countryCode:USA", "apiKey": settings.here_api_key},
+        )
+        resp.raise_for_status()
+        items = resp.json().get("items", [])
+    if not items:
+        return {"result": None}
+    item = items[0]
+    pos = item.get("position", {})
+    return {
+        "result": {
+            "label": item.get("address", {}).get("label", q),
+            "lat": pos.get("lat"),
+            "lon": pos.get("lng"),
+        }
+    }
 
 
 @router.get("/me")

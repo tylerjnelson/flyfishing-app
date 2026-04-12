@@ -21,12 +21,24 @@ export default function App() {
   const [ready, setReady] = useState(false)
 
   // On mount: attempt silent refresh from httpOnly cookie.
-  // If it succeeds the user stays logged in across page refreshes.
+  // Retries up to 3 times on transient errors (network blip, server restart).
+  // Only a definitive 401 means the session is gone.
   useEffect(() => {
-    axios
-      .post('/api/auth/refresh', {}, { withCredentials: true })
-      .then(({ data }) => setAuth(data.user, data.access_token))
-      .catch(() => {})
+    async function tryRefresh() {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const { data } = await axios.post('/api/auth/refresh', {}, { withCredentials: true })
+          return data
+        } catch (err) {
+          if (err.response?.status === 401) return null
+          // Transient error — wait before retrying
+          await new Promise(r => setTimeout(r, 1000 * (attempt + 1)))
+        }
+      }
+      return null
+    }
+    tryRefresh()
+      .then(data => { if (data) setAuth(data.user, data.access_token) })
       .finally(() => setReady(true))
   }, [setAuth])
 

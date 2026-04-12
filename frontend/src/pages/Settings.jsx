@@ -2,34 +2,24 @@ import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import api from '../api/client'
 import useAuthStore from '../store/auth'
-
-const OPTION_LABELS = {
-  paved_only: 'Paved / 2WD only',
-  dirt_ok: 'Dirt road OK',
-  four_wd: '4WD / High clearance',
-  beginner: 'Beginner',
-  intermediate: 'Intermediate',
-  advanced: 'Advanced',
-  catch_and_release: 'Strict catch-and-release',
-  keep_if_legal: 'Keep if legal',
-  full_setup: 'Full setup',
-  pack_rod: 'Pack rod',
-  float_tube: 'Float tube',
-  spey: 'Spey / two-hander',
-}
+import LocationInput from '../components/LocationInput'
 
 export default function Settings() {
   const navigate = useNavigate()
   const { user, setAuth, clearAuth, accessToken } = useAuthStore()
   const [displayName, setDisplayName] = useState(user?.display_name || '')
-  const [homeLocation, setHomeLocation] = useState(user?.preferences?.home_location || '')
+  // home_location is {label, lat, lon} or null
+  const [homeLocation, setHomeLocation] = useState(
+    user?.preferences?.home_location?.lat != null ? user.preferences.home_location : null
+  )
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
 
   useEffect(() => {
     api.get('/users/me').then(({ data }) => {
       setDisplayName(data.display_name || '')
-      setHomeLocation(data.preferences?.home_location || '')
+      const loc = data.preferences?.home_location
+      setHomeLocation(loc?.lat != null ? loc : null)
       setAuth({ ...data }, accessToken)
     })
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
@@ -71,48 +61,16 @@ export default function Settings() {
             type="text"
             value={displayName}
             onChange={e => setDisplayName(e.target.value)}
-            className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+            className="w-full px-4 py-2 border border-gray-300 rounded-lg bg-white text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
           />
         </div>
 
         <div>
-          <label className="block text-sm font-medium text-gray-700 mb-1">
+          <label className="block text-sm font-medium text-gray-700 mb-2">
             Home / departure location
           </label>
-          <input
-            type="text"
-            value={homeLocation}
-            onChange={e => setHomeLocation(e.target.value)}
-            placeholder="City, State or full address"
-            className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
-          />
+          <LocationInput value={homeLocation} onChange={setHomeLocation} />
         </div>
-
-        {/* Read-only preference summary */}
-        {Object.keys(prefs).filter(k => k !== 'home_location').length > 0 && (
-          <div className="bg-gray-50 rounded-lg p-4 space-y-2">
-            <p className="text-sm font-medium text-gray-700 mb-3">Preferences</p>
-            {Object.entries(prefs)
-              .filter(([k]) => k !== 'home_location')
-              .map(([key, val]) => (
-                <div key={key} className="flex justify-between text-sm">
-                  <span className="text-gray-500 capitalize">{key.replace(/_/g, ' ')}</span>
-                  <span className="text-gray-900">
-                    {Array.isArray(val)
-                      ? val.map(v => OPTION_LABELS[v] || v).join(', ')
-                      : OPTION_LABELS[val] || val}
-                  </span>
-                </div>
-              ))}
-            <button
-              type="button"
-              onClick={() => navigate('/onboarding')}
-              className="text-sm text-blue-600 underline mt-2"
-            >
-              Edit all preferences
-            </button>
-          </div>
-        )}
 
         <div className="flex items-center gap-3">
           <button

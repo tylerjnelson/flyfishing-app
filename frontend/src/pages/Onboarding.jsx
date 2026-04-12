@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import api from '../api/client'
 import useAuthStore from '../store/auth'
+import LocationInput from '../components/LocationInput'
 
 const QUESTIONS = [
   {
@@ -18,36 +19,6 @@ const QUESTIONS = [
       { value: 'paved_only', label: 'Paved / 2WD only' },
       { value: 'dirt_ok', label: 'Dirt road OK' },
       { value: 'four_wd', label: '4WD / High clearance' },
-    ],
-  },
-  {
-    id: 'experience_level',
-    question: 'How would you describe your fly fishing experience?',
-    type: 'single_select',
-    options: [
-      { value: 'beginner', label: 'Beginner' },
-      { value: 'intermediate', label: 'Intermediate' },
-      { value: 'advanced', label: 'Advanced' },
-    ],
-  },
-  {
-    id: 'catch_intent',
-    question: 'What is your catch intent?',
-    type: 'single_select',
-    options: [
-      { value: 'catch_and_release', label: 'Strict catch-and-release' },
-      { value: 'keep_if_legal', label: 'Keep if legal' },
-    ],
-  },
-  {
-    id: 'gear_setup',
-    question: 'What gear setups do you typically fish with?',
-    type: 'multi_select',
-    options: [
-      { value: 'full_setup', label: 'Full setup' },
-      { value: 'pack_rod', label: 'Pack rod' },
-      { value: 'float_tube', label: 'Float tube' },
-      { value: 'spey', label: 'Spey / two-hander' },
     ],
   },
 ]
@@ -67,18 +38,21 @@ export default function Onboarding() {
     setAnswers(prev => ({ ...prev, [q.id]: value }))
   }
 
-  function toggleMulti(value) {
-    const current = answers[q.id] || []
-    const next = current.includes(value)
-      ? current.filter(v => v !== value)
-      : [...current, value]
-    setAnswer(next)
+  function canAdvance() {
+    if (q.type === 'location') return answers[q.id]?.lat != null
+    return !!answers[q.id]
   }
 
   async function finish() {
     setSaving(true)
     try {
-      const { data } = await api.patch('/users/me', { preferences: answers })
+      const { data } = await api.patch('/users/me', {
+        preferences: {
+          ...answers,
+          experience_level: 'advanced',
+          catch_intent: 'catch_and_release',
+        },
+      })
       setAuth({ ...user, preferences: data.preferences }, useAuthStore.getState().accessToken)
       navigate('/trips', { replace: true })
     } catch {
@@ -103,13 +77,9 @@ export default function Onboarding() {
 
         <div className="space-y-3 mb-8">
           {q.type === 'location' && (
-            <input
-              type="text"
-              value={answers[q.id] || ''}
-              onChange={e => setAnswer(e.target.value)}
-              placeholder={q.placeholder}
-              autoFocus
-              className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+            <LocationInput
+              value={answers[q.id] || null}
+              onChange={val => setAnswer(val)}
             />
           )}
 
@@ -126,23 +96,6 @@ export default function Onboarding() {
               {opt.label}
             </button>
           ))}
-
-          {q.type === 'multi_select' && q.options.map(opt => {
-            const selected = (answers[q.id] || []).includes(opt.value)
-            return (
-              <button
-                key={opt.value}
-                onClick={() => toggleMulti(opt.value)}
-                className={`w-full text-left px-4 py-3 rounded-lg border transition-colors ${
-                  selected
-                    ? 'border-blue-600 bg-blue-50 text-blue-900'
-                    : 'border-gray-200 bg-white text-gray-700 hover:border-gray-300'
-                }`}
-              >
-                {opt.label}
-              </button>
-            )
-          })}
         </div>
 
         <div className="flex gap-3">
@@ -157,7 +110,7 @@ export default function Onboarding() {
           {isLast ? (
             <button
               onClick={finish}
-              disabled={saving}
+              disabled={saving || !canAdvance()}
               className="flex-1 px-4 py-3 bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700 disabled:opacity-50 transition-colors"
             >
               {saving ? 'Saving…' : 'Finish setup'}
@@ -165,7 +118,8 @@ export default function Onboarding() {
           ) : (
             <button
               onClick={() => setStep(s => s + 1)}
-              className="flex-1 px-4 py-3 bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700 transition-colors"
+              disabled={!canAdvance()}
+              className="flex-1 px-4 py-3 bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700 disabled:opacity-50 transition-colors"
             >
               Next
             </button>
