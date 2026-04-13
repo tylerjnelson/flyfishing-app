@@ -28,6 +28,7 @@ _TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=5.0, pool=5.0)
 # The NWPS list endpoint's ?usgsId= filter is unreliable (silently ignored or
 # returns Not Found depending on ID).  Hardcoded mapping is faster and stable.
 _USGS_TO_NWRFC_LID: dict[str, str] = {
+    # --- Validated 2026-04-10 against NWPS API ---
     "12505000": "PARW1",   # Yakima River near Parker
     "12510500": "KIOW1",   # Yakima River at Kiona
     "12462500": "MONW1",   # Wenatchee River at Monitor
@@ -41,6 +42,17 @@ _USGS_TO_NWRFC_LID: dict[str, str] = {
     "12181000": "SRMW1",   # Skagit River at Marblemount
     "12194000": "CONW1",   # Skagit River near Concrete
     "12447200": "OKMW1",   # Okanogan River at Malott
+    # --- Validated 2026-04-13 against NWPS API ---
+    "12113000": "AUBW1",   # Green River (WA) near Auburn
+    "12082500": "NISW1",   # Nisqually River near National
+    "12167400": "ARLW1",   # Stillaguamish River at Arlington
+    "12148500": "TOLW1",   # Tolt River near Carnation
+    "12155300": "PILW1",   # Pilchuck River near Snohomish
+    "12494000": "NACW1",   # Naches River near Naches
+    "14113000": "PITW1",   # Klickitat River near Pitt
+    "12040500": "QUEW1",   # Queets River near Clearwater
+    # Note: Sauk (12189500), Hoh (12041200), Sol Duc (12044900) have no NWPS LID —
+    # NOAA does not issue forecasts for these rivers. USGS real-time still works.
 }
 
 

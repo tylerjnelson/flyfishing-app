@@ -229,8 +229,8 @@ class TestScoreRiver:
             populated_sources=6,
             total_sources=6,
         )
-        # Max signal weights: 3+2+2+2+2+0.5 = 11.5; no recency penalty
-        assert score == pytest.approx(11.5, rel=1e-3)
+        # Max signal weights: 3+2+2+2+0+0.5 = 9.5; species_match moved to Tier 2 volatile delta
+        assert score == pytest.approx(9.5, rel=1e-3)
 
     def test_zero_debrief_fallback_redistributes_weights(self):
         # With debriefs: debrief_rating weight=3.0
@@ -262,7 +262,8 @@ class TestScoreRiver:
 
     def test_zero_debrief_score_uses_fallback_weights(self):
         # With fallback: note_sentiment=3.0, conditions_reliability=3.0, data_coverage=1.0
-        # All signals at 0.5 (neutral): 0.5*(0+3+2+3+2+1) = 5.5 (debrief_rating=0 so excluded)
+        # species_match weight=0 (moved to Tier 2 volatile delta)
+        # All signals at 0.5 (neutral): 0.5*(0+3+2+3+0+1) = 4.5 (debrief_rating=0 so excluded)
         score = score_river(
             seed_confidence="confirmed",
             debriefs=[],
@@ -270,7 +271,7 @@ class TestScoreRiver:
             flow_trend="stable",          # 0.5
             note_positive=0, note_neutral=1, note_negative=0,   # sentiment=0.5
             conditions_reliability=0.5,   # 0.5
-            species_match="partial",      # 0.5
+            species_match="partial",      # 0.5 (weight=0, no effect)
             populated_sources=3, total_sources=6,  # coverage=0.5 × 1.0 mult
         )
         expected = (
@@ -278,7 +279,7 @@ class TestScoreRiver:
             + 0.5 * 3.0  # note_sentiment
             + 0.5 * 2.0  # flow_trend
             + 0.5 * 3.0  # conditions_reliability
-            + 0.5 * 2.0  # species_match
+            + 0.5 * 0.0  # species_match (weight=0 — handled in Tier 2 volatile delta)
             + 0.5 * 1.0  # data_coverage (confirmed=1.0 mult)
         )
         assert score == pytest.approx(expected, rel=1e-3)

@@ -36,7 +36,7 @@ _RIVER_WEIGHTS = {
     "note_sentiment": 2.0,
     "flow_trend": 2.0,
     "conditions_reliability": 2.0,
-    "species_match": 2.0,
+    "species_match": 0.0,   # moved to Tier 2 volatile delta (_species_match_delta)
     "data_coverage": 0.5,
 }
 
@@ -46,7 +46,7 @@ _RIVER_WEIGHTS_ZERO_DEBRIEF = {
     "note_sentiment": 3.0,
     "flow_trend": 2.0,
     "conditions_reliability": 3.0,
-    "species_match": 2.0,
+    "species_match": 0.0,   # moved to Tier 2 volatile delta (_species_match_delta)
     "data_coverage": 1.0,
 }
 
@@ -56,7 +56,7 @@ _LAKE_WEIGHTS = {
     "debrief_rating": 3.0,
     "note_sentiment": 2.0,
     "seasonal_access": 2.0,
-    "species_match": 2.0,
+    "species_match": 0.0,   # moved to Tier 2 volatile delta (_species_match_delta)
     "data_coverage": 0.5,
 }
 
@@ -66,7 +66,7 @@ _LAKE_WEIGHTS_ZERO_DEBRIEF = {
     "debrief_rating": 0.0,
     "note_sentiment": 3.0,
     "seasonal_access": 2.0,
-    "species_match": 2.0,
+    "species_match": 0.0,   # moved to Tier 2 volatile delta (_species_match_delta)
     "data_coverage": 1.0,
 }
 
@@ -323,7 +323,7 @@ async def compute_and_store_score(spot_id: str, db) -> float:
     """
     from datetime import datetime, timezone
     from sqlalchemy import func, select, text
-    from db.models import Note, Session, Spot, Trip
+    from db.models import ConditionsCache, Note, Session, Spot, Trip
 
     result = await db.execute(select(Spot).where(Spot.id == spot_id))
     spot = result.scalar_one_or_none()
@@ -377,6 +377,20 @@ async def compute_and_store_score(spot_id: str, db) -> float:
     if spot.last_stocked_date:
         days_since_stocked = (datetime.now(tz=timezone.utc).date() - spot.last_stocked_date).days
 
+    # SNOTEL snowpack for alpine lakes — read most recent cached entry
+    snowpack_pct_of_median = None
+    if spot.is_alpine and spot.snotel_station_id:
+        snotel_result = await db.execute(
+            select(ConditionsCache.data)
+            .where(ConditionsCache.spot_id == spot.id)
+            .where(ConditionsCache.source == "snotel")
+            .order_by(ConditionsCache.fetched_at.desc())
+            .limit(1)
+        )
+        snotel_data = snotel_result.scalar_one_or_none()
+        if snotel_data:
+            snowpack_pct_of_median = snotel_data.get("pct_of_median")
+
     if spot.type in ("river", "creek", "coastal"):
         computed = score_river(
             seed_confidence=spot.seed_confidence or "unvalidated",
@@ -401,7 +415,7 @@ async def compute_and_store_score(spot_id: str, db) -> float:
             note_neutral=sentiment_row.neu,
             note_negative=sentiment_row.neg,
             is_alpine=spot.is_alpine or False,
-            snowpack_pct_of_median=None,  # fetched from SNOTEL at session-open for Tier 2
+            snowpack_pct_of_median=snowpack_pct_of_median,
             species_match=None,
             populated_sources=populated,
             total_sources=total,
