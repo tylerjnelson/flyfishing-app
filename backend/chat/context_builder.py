@@ -27,7 +27,10 @@ from sqlalchemy import select, text
 
 from chat.response_cache import get_cached_response
 from conditions.normalizer import INTERVAL_REALTIME, compute_conditions_hash
+from conditions.noaa_nws import fetch_noaa_nws
 from conditions.routing import get_drive_time, haversine_km, haversine_miles
+from conditions.usgs import fetch_usgs_gauge
+from db.connection import AsyncSessionLocal
 from db.models import (
     ConditionsCache,
     Conversation,
@@ -227,8 +230,78 @@ def _alpine_access_ok(
 
 
 # ---------------------------------------------------------------------------
+# [1.5] Real-time conditions fetch — session open (§4.1)
+# ---------------------------------------------------------------------------
+
+async def _fetch_and_cache_realtime(spots: list[Spot]) -> None:
+    """
+    Fetch USGS gauge data and NOAA NWS forecasts for candidate spots in parallel.
+    Writes fresh rows to conditions_cache so the cond_by query in build_context()
+    picks up live data on this pipeline run.
+
+    Called once per full pipeline run (skipped when session_candidates already
+    populated and force_rerun=False — callers own that guard).
+
+    Circuit breaker behaviour: if USGS or NWS is down the fetcher returns None
+    and no row is written; cond_by falls back to the last cached entry (stale).
+    """
+    import hashlib
+    import json
+
+    usgs_spots = [(s, s.usgs_site_ids[0]) for s in spots if s.usgs_site_ids]
+    nws_spots = [s for s in spots if s.latitude is not None and s.longitude is not None]
+
+    if not usgs_spots and not nws_spots:
+        return
+
+    # Parallel fetch — circuit breakers handle individual failures gracefully
+    usgs_results = await asyncio.gather(
+        *[fetch_usgs_gauge(site_id) for _, site_id in usgs_spots]
+    )
+    nws_results = await asyncio.gather(
+        *[fetch_noaa_nws(float(s.latitude), float(s.longitude)) for s in nws_spots]
+    )
+
+    to_write: list[tuple] = []  # (spot_id, source, data_dict)
+    for (spot, _), data in zip(usgs_spots, usgs_results):
+        if data is not None:
+            to_write.append((spot.id, "usgs", data))
+    for spot, data in zip(nws_spots, nws_results):
+        if data is not None:
+            to_write.append((spot.id, "noaa_nws", data))
+
+    if not to_write:
+        return
+
+    async with AsyncSessionLocal() as session:
+        async with session.begin():
+            for spot_id, source, data in to_write:
+                data_hash = hashlib.md5(
+                    json.dumps(
+                        data, sort_keys=True, separators=(",", ":"), default=str
+                    ).encode()
+                ).hexdigest()
+                session.add(ConditionsCache(
+                    spot_id=spot_id,
+                    source=source,
+                    data=data,
+                    data_hash=data_hash,
+                    fetched_at=datetime.now(tz=timezone.utc),
+                ))
+
+    log.info(
+        "realtime_conditions_fetched",
+        extra={"usgs_count": len(usgs_spots), "nws_count": len(nws_spots),
+               "written": len(to_write)},
+    )
+
+
+# ---------------------------------------------------------------------------
 # [2] Tier 2 volatile delta helpers (§7.5)
 # ---------------------------------------------------------------------------
+
+_FUTURE_TRIP_HOURS = 24  # hours ahead before NWRFC forecast replaces live USGS CFS
+
 
 def _sum_7day_precip_estimate(daily_periods: list[dict]) -> float:
     """
@@ -245,20 +318,87 @@ def _sum_7day_precip_estimate(daily_periods: list[dict]) -> float:
     return total
 
 
+def _nwrfc_cfs_at(nwrfc_data: dict, departure_time: datetime) -> float | None:
+    """
+    Return the NWRFC forecast CFS value closest to departure_time.
+
+    NWRFC stores flow as secondary (kcfs); multiply by 1000 to get CFS.
+    Returns None if forecast list is empty or all entries lack required fields.
+    """
+    forecasts = (nwrfc_data or {}).get("forecast") or []
+    best_cfs: float | None = None
+    best_diff: float | None = None
+    for entry in forecasts:
+        valid_str = entry.get("validTime")
+        secondary = entry.get("secondary")
+        if valid_str is None or secondary is None:
+            continue
+        try:
+            # NWPS validTime may be offset-aware or naive; normalise to UTC
+            valid_dt = datetime.fromisoformat(valid_str.replace("Z", "+00:00"))
+            if valid_dt.tzinfo is None:
+                valid_dt = valid_dt.replace(tzinfo=timezone.utc)
+            diff = abs((valid_dt - departure_time).total_seconds())
+            if best_diff is None or diff < best_diff:
+                best_diff = diff
+                best_cfs = float(secondary) * 1000.0  # kcfs → CFS
+        except (ValueError, TypeError):
+            continue
+    return best_cfs
+
+
+def _species_match_delta(target_species: list[str], spot: Spot) -> float:
+    """
+    Compare session target_species against spot.species_primary.
+    Full match → +1.5, partial → +0.5, no match → -0.5.
+    Returns 0.0 if either side is empty.
+    """
+    if not target_species or not spot.species_primary:
+        return 0.0
+    target_lower = {s.lower() for s in target_species}
+    spot_lower = {s.lower() for s in spot.species_primary}
+    if target_lower & spot_lower == target_lower:
+        return 1.5   # full match — spot holds all target species
+    if target_lower & spot_lower:
+        return 0.5   # partial match — at least one target species present
+    return -0.5      # no match — spot likely holds different species
+
+
 def _compute_volatile_delta(
     spot: Spot,
     usgs_data: dict | None,
     nws_data: dict | None,
+    nwrfc_data: dict | None,
     target_species: list[str],
+    departure_time: datetime | None = None,
 ) -> float:
     """
     Compute signed volatile delta per §7.5. Added to spots.score to produce
     session_score. Never written back to the spots table.
+
+    For trips departing >24h from now, NWRFC forecast CFS replaces live USGS CFS
+    for the proximity delta (§4.2 / §4.4 FORECAST wiring). Water temp and trend
+    signals always come from live USGS (NWRFC does not provide these).
     """
     delta = 0.0
+    now = datetime.now(tz=timezone.utc)
 
-    if spot.type in ("river", "creek") and usgs_data:
-        cfs = usgs_data.get("cfs")
+    if spot.type in ("river", "creek"):
+        # Decide CFS source: NWRFC forecast for future trips, live USGS otherwise
+        cfs: float | None = None
+        if (
+            nwrfc_data
+            and departure_time is not None
+            and (departure_time - now).total_seconds() > _FUTURE_TRIP_HOURS * 3600
+        ):
+            cfs = _nwrfc_cfs_at(nwrfc_data, departure_time)
+            log.debug(
+                "volatile_delta_using_nwrfc",
+                extra={"spot": spot.name, "forecast_cfs": cfs},
+            )
+        elif usgs_data:
+            cfs = usgs_data.get("cfs")
+
         if cfs is not None and spot.min_cfs and spot.max_cfs:
             ideal = (float(spot.min_cfs) + float(spot.max_cfs)) / 2
             if ideal > 0:
@@ -269,21 +409,23 @@ def _compute_volatile_delta(
                     delta += 0.5
                 # 25–50% off → 0 delta
 
-        trend = usgs_data.get("trend")
-        if trend == "dropping":
-            delta += 0.5
-        elif trend == "rising":
-            delta -= 0.5
+        # Trend and temp always from live USGS (NWRFC has no temp / trend)
+        if usgs_data:
+            trend = usgs_data.get("trend")
+            if trend == "dropping":
+                delta += 0.5
+            elif trend == "rising":
+                delta -= 0.5
 
-        temp_f = usgs_data.get("temp_f")
-        if temp_f is not None:
-            ceiling = _species_temp_ceiling(target_species)
-            if ceiling:
-                gap = ceiling - temp_f
-                if gap <= 2:
-                    delta -= 2.5
-                elif gap <= 5:
-                    delta -= 1.0
+            temp_f = usgs_data.get("temp_f")
+            if temp_f is not None:
+                ceiling = _species_temp_ceiling(target_species)
+                if ceiling:
+                    gap = ceiling - temp_f
+                    if gap <= 2:
+                        delta -= 2.5
+                    elif gap <= 5:
+                        delta -= 1.0
 
     if nws_data:
         daily = nws_data.get("daily_forecast") or []
@@ -294,6 +436,8 @@ def _compute_volatile_delta(
             delta -= 0.5
         else:
             delta -= 1.5
+
+    delta += _species_match_delta(target_species, spot)
 
     return delta
 
@@ -453,8 +597,10 @@ async def _fetch_maps(db, spot_ids: list[str]) -> list[dict]:
 def _format_conditions_block(candidates: list[dict]) -> str:
     lines = []
     for c in candidates[:_SURFACE_TOP_N]:
-        usgs = (c.get("conditions") or {}).get("usgs") or {}
-        nws = (c.get("conditions") or {}).get("noaa_nws") or {}
+        conds = c.get("conditions") or {}
+        usgs = conds.get("usgs") or {}
+        nws = conds.get("noaa_nws") or {}
+        wta = conds.get("wta") or {}
         lines.append(f"\n=== {c['spot_name']} ===")
 
         if c.get("is_haversine"):
@@ -476,6 +622,15 @@ def _format_conditions_block(candidates: list[dict]) -> str:
         if current.get("short_forecast"):
             temp_str = f", {current['temp_f']}°F" if current.get("temp_f") else ""
             lines.append(f"Weather: {current['short_forecast']}{temp_str}")
+
+        wta_reports = wta.get("reports") or []
+        if wta_reports:
+            lines.append("Angler reports (WTA):")
+            for r in wta_reports[:3]:
+                date_str = r.get("note_date") or "unknown date"
+                confidence = r.get("confidence", "low")
+                text = (r.get("report_text") or "")[:200]
+                lines.append(f"  [{date_str}] ({confidence} confidence) {text}")
 
     return "\n".join(lines)
 
@@ -657,6 +812,10 @@ async def build_context(
 
         spot_ids = [s.id for s in spots]
 
+        # Real-time conditions fetch — USGS + NWS in parallel (§4.1)
+        # Writes fresh rows to conditions_cache before cond_by query reads them.
+        await _fetch_and_cache_realtime(spots)
+
         # Active emergency closures — text-based matching, no spot_id required
         today_date = date.today()
         closure_result = await db.execute(
@@ -734,6 +893,8 @@ async def build_context(
                     ),
                     "usgs": cond_by.get((sid, "usgs")),
                     "nws": cond_by.get((sid, "noaa_nws")),
+                    "nwrfc": cond_by.get((sid, "noaa_nwrfc")),
+                    "wta": cond_by.get((sid, "wta")),
                 })
         else:
             # No home location — include all filtered spots without drive-time gate
@@ -746,13 +907,18 @@ async def build_context(
                     "straight_line_miles": None,
                     "usgs": cond_by.get((sid, "usgs")),
                     "nws": cond_by.get((sid, "noaa_nws")),
+                    "nwrfc": cond_by.get((sid, "noaa_nwrfc")),
+                    "wta": cond_by.get((sid, "wta")),
                 })
 
         # --------------------------------------------------------------
         # [2] Tier 2 volatile delta → session_score
         # --------------------------------------------------------------
         for c in candidates_raw:
-            delta = _compute_volatile_delta(c["spot"], c["usgs"], c["nws"], target_species)
+            delta = _compute_volatile_delta(
+                c["spot"], c["usgs"], c["nws"], c.get("nwrfc"),
+                target_species, departure_time,
+            )
             base = float(c["spot"].score or 0) + delta
             # Explore goal: boost unvisited spots (+2.0) so they sort above
             # recently-fished water regardless of raw score.
@@ -776,7 +942,7 @@ async def build_context(
                 "last_visited": (
                     c["spot"].last_visited.isoformat() if c["spot"].last_visited else None
                 ),
-                "conditions": {"usgs": c["usgs"], "noaa_nws": c["nws"]},
+                "conditions": {"usgs": c["usgs"], "noaa_nws": c["nws"], "noaa_nwrfc": c.get("nwrfc"), "wta": c.get("wta")},
             }
             for c in candidates_raw
         ]
