@@ -85,6 +85,7 @@ def normalize_usgs(raw: dict, fetched_at: datetime) -> dict:
     """
     values = raw.get("value", {}).get("timeSeries", [])
     by_param: dict[str, float | None] = {}
+    cfs_records: list = []
     for ts in values:
         code = ts.get("variable", {}).get("variableCode", [{}])[0].get("value")
         records = ts.get("values", [{}])[0].get("value", [])
@@ -93,11 +94,29 @@ def normalize_usgs(raw: dict, fetched_at: datetime) -> dict:
                 by_param[code] = float(records[-1]["value"])
             except (ValueError, KeyError):
                 by_param[code] = None
+            if code == "00060":
+                cfs_records = records
 
     cfs = by_param.get("00060")
     gauge_height_ft = by_param.get("00065")
     temp_c = by_param.get("00010")
     temp_f = round(temp_c * 9 / 5 + 32, 1) if temp_c is not None else None
+
+    # Compute flow trend by comparing latest reading to ~1hr prior (4 steps back at 15-min intervals)
+    trend = None
+    if cfs is not None and len(cfs_records) >= 5:
+        try:
+            prior_cfs = float(cfs_records[-5]["value"])
+            if prior_cfs > 0:
+                pct_change = (cfs - prior_cfs) / prior_cfs
+                if pct_change >= 0.05:
+                    trend = "rising"
+                elif pct_change <= -0.05:
+                    trend = "dropping"
+                else:
+                    trend = "stable"
+        except (ValueError, KeyError, ZeroDivisionError):
+            trend = None
 
     return {
         "source": "usgs",
@@ -106,6 +125,7 @@ def normalize_usgs(raw: dict, fetched_at: datetime) -> dict:
         "gauge_height_ft": gauge_height_ft,
         "temp_f": temp_f,
         "turbidity_fnu": None,  # USGS turbidity requires separate parameterCd 63680
+        "trend": trend,
         "stale": False,
     }
 
@@ -118,14 +138,21 @@ def normalize_noaa_nws(raw: dict, fetched_at: datetime) -> dict:
       current_obs  — current observation dict (from points → observationStations)
       daily        — daily forecast periods list
       hourly       — hourly forecast periods list
+
+    NWS returns temperature in Celsius (wmoUnit:degC) and wind speed in km/h
+    (wmoUnit:km_h-1). Both are converted to imperial before storage.
     """
     obs = raw.get("current_obs", {})
+    temp_c = obs.get("temperature", {}).get("value")
+    temp_f = round(temp_c * 9 / 5 + 32, 1) if temp_c is not None else None
+    wind_kmh = obs.get("windSpeed", {}).get("value")
+    wind_mph = round(wind_kmh * 0.621371, 1) if wind_kmh is not None else None
     return {
         "source": "noaa_nws",
         "fetched_at": fetched_at.isoformat(),
         "current": {
-            "temp_f": obs.get("temperature", {}).get("value"),
-            "wind_speed_mph": obs.get("windSpeed", {}).get("value"),
+            "temp_f": temp_f,
+            "wind_speed_mph": wind_mph,
             "short_forecast": obs.get("textDescription"),
         },
         "daily_forecast": raw.get("daily", [])[:7],
@@ -202,14 +229,17 @@ def normalize_inciweb(incidents: list, fetched_at: datetime) -> dict:
     }
 
 
-def normalize_snotel(raw: dict, station_id: str, fetched_at: datetime) -> dict:
+def normalize_snotel(raw: list, station_id: str, fetched_at: datetime) -> dict:
     """
-    Normalizes NRCS SNOTEL station data.
+    Normalizes NRCS SNOTEL station data from the v1/data endpoint.
 
-    Expected raw keys: WTEQ (snow water equivalent, inches), SNWD (snow depth, inches).
+    raw is a list; raw[0]["data"] is a flat list of element records:
+      {"stationElement": {"elementCode": "WTEQ"}, "values": [{"date": ..., "value": ..., "median": ...}]}
+
+    pct_of_median is computed as value/median*100 from the WTEQ element's latest entry.
     """
-    station_data = raw.get("data", [{}])[0] if raw.get("data") else {}
-    elements = {e["stationElement"]["elementCode"]: e for e in station_data.get("stationElements", [])}
+    station_data = raw[0].get("data", []) if raw else []
+    elements = {e["stationElement"]["elementCode"]: e for e in station_data}
 
     def latest(code: str) -> float | None:
         series = elements.get(code, {}).get("values", [])
@@ -221,12 +251,25 @@ def normalize_snotel(raw: dict, station_id: str, fetched_at: datetime) -> dict:
                     pass
         return None
 
+    def latest_pct_of_median(code: str) -> float | None:
+        series = elements.get(code, {}).get("values", [])
+        for entry in reversed(series):
+            value = entry.get("value")
+            median = entry.get("median")
+            if value is not None and median is not None:
+                try:
+                    return round(float(value) / float(median) * 100, 1)
+                except (ValueError, ZeroDivisionError):
+                    pass
+        return None
+
     return {
         "source": "snotel",
         "fetched_at": fetched_at.isoformat(),
         "station_id": station_id,
         "snow_water_equivalent_in": latest("WTEQ"),
         "snow_depth_in": latest("SNWD"),
+        "pct_of_median": latest_pct_of_median("WTEQ"),
         "stale": False,
     }
 

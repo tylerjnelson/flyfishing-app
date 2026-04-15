@@ -122,18 +122,27 @@ async def _run(dry_run: bool) -> None:
     for wta_url, name_hint, spot_type in _WTA_SPOTS:
         log.info("processing_wta_url", extra={"url": wta_url, "hint": name_hint})
 
+        # Validate the URL is live and has the expected listing structure.
+        # We do this by attempting a scrape — ScraperStructureError means
+        # the page exists but the fingerprint changed; 404 raises HTTPStatusError.
+        # We set wta_trail_url regardless of whether current reports show fishing
+        # intent: the daily scheduler handles intent filtering at fetch time.
         try:
             reports = await fetch_wta_reports(wta_url)
         except Exception as exc:
             log.warning("wta_fetch_failed", extra={"url": wta_url, "error": str(exc)})
             continue
 
-        if not reports:
-            log.info("no_fishing_reports", extra={"url": wta_url})
-            no_reports += 1
+        # reports is None = circuit open; skip without setting URL
+        if reports is None:
+            log.warning("wta_circuit_open", extra={"url": wta_url})
             continue
 
-        log.info("fishing_reports_found", extra={"url": wta_url, "count": len(reports)})
+        fishing_count = len(reports)
+        if fishing_count == 0:
+            log.info("no_fishing_reports_but_url_valid", extra={"url": wta_url})
+        else:
+            log.info("fishing_reports_found", extra={"url": wta_url, "count": fishing_count})
 
         # Find existing spot by name similarity
         match = next(
@@ -143,7 +152,7 @@ async def _run(dry_run: bool) -> None:
 
         if match:
             if match.wta_trail_url == wta_url:
-                log.info("wta_url_already_set", extra={"name": match.name})
+                log.info("wta_url_already_set", extra={"spot_name": match.name})
                 continue
 
             if not dry_run:
@@ -154,7 +163,7 @@ async def _run(dry_run: bool) -> None:
                         )
                         s = result.scalar_one()
                         s.wta_trail_url = wta_url
-            log.info("updated_wta_url", extra={"name": match.name, "url": wta_url})
+            log.info("updated_wta_url", extra={"spot_name": match.name, "url": wta_url})
             updated += 1
         else:
             # Create new spot at unvalidated tier
@@ -170,7 +179,7 @@ async def _run(dry_run: bool) -> None:
                             wta_trail_url=wta_url,
                             fly_fishing_legal=True,  # default; corrected by regulations scraper
                         ))
-            log.info("created_wta_spot", extra={"name": display_name, "type": spot_type})
+            log.info("created_wta_spot", extra={"spot_name": display_name, "type": spot_type})
             created += 1
 
     log.info(

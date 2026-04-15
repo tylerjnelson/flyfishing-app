@@ -64,9 +64,13 @@ async def fetch_noaa_nwrfc(gauge_id: str) -> dict | None:
     """
     try:
         raw = await _fetch_stageflow(gauge_id)
-        return normalize_noaa_nwrfc(
+        result = normalize_noaa_nwrfc(
             raw, gauge_id=gauge_id, fetched_at=datetime.now(tz=timezone.utc)
         )
+        if not result.get("forecast"):
+            log.warning("noaa_nwrfc_empty_forecast", extra={"source": "noaa_nwrfc", "gauge_id": gauge_id})
+            return None
+        return result
     except pybreaker.CircuitBreakerError:
         log.warning("circuit_open", extra={"source": "noaa_nwrfc", "gauge_id": gauge_id})
         return None
