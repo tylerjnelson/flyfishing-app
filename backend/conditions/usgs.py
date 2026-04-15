@@ -30,7 +30,11 @@ async def fetch_usgs_gauge(site_id: str) -> dict | None:
     """
     try:
         raw = await _fetch(site_id)
-        return normalize_usgs(raw, fetched_at=datetime.now(tz=timezone.utc))
+        result = normalize_usgs(raw, fetched_at=datetime.now(tz=timezone.utc))
+        if result["cfs"] is None and result["gauge_height_ft"] is None:
+            log.warning("usgs_empty_response", extra={"source": "usgs", "site_id": site_id})
+            return None
+        return result
     except pybreaker.CircuitBreakerError:
         log.warning("circuit_open", extra={"source": "usgs", "site_id": site_id})
         return None

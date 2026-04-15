@@ -26,6 +26,7 @@ from datetime import date, datetime, timezone
 from sqlalchemy import select, text
 
 from chat.response_cache import get_cached_response
+from conditions.airnow import fetch_airnow
 from conditions.normalizer import INTERVAL_REALTIME, compute_conditions_hash
 from conditions.noaa_nws import fetch_noaa_nws
 from conditions.routing import get_drive_time, haversine_km, haversine_miles
@@ -249,9 +250,9 @@ async def _fetch_and_cache_realtime(spots: list[Spot]) -> None:
     import json
 
     usgs_spots = [(s, s.usgs_site_ids[0]) for s in spots if s.usgs_site_ids]
-    nws_spots = [s for s in spots if s.latitude is not None and s.longitude is not None]
+    geo_spots = [s for s in spots if s.latitude is not None and s.longitude is not None]
 
-    if not usgs_spots and not nws_spots:
+    if not usgs_spots and not geo_spots:
         return
 
     # Parallel fetch — circuit breakers handle individual failures gracefully
@@ -259,16 +260,22 @@ async def _fetch_and_cache_realtime(spots: list[Spot]) -> None:
         *[fetch_usgs_gauge(site_id) for _, site_id in usgs_spots]
     )
     nws_results = await asyncio.gather(
-        *[fetch_noaa_nws(float(s.latitude), float(s.longitude)) for s in nws_spots]
+        *[fetch_noaa_nws(float(s.latitude), float(s.longitude)) for s in geo_spots]
+    )
+    airnow_results = await asyncio.gather(
+        *[fetch_airnow(float(s.latitude), float(s.longitude)) for s in geo_spots]
     )
 
     to_write: list[tuple] = []  # (spot_id, source, data_dict)
     for (spot, _), data in zip(usgs_spots, usgs_results):
         if data is not None:
             to_write.append((spot.id, "usgs", data))
-    for spot, data in zip(nws_spots, nws_results):
+    for spot, data in zip(geo_spots, nws_results):
         if data is not None:
             to_write.append((spot.id, "noaa_nws", data))
+    for spot, data in zip(geo_spots, airnow_results):
+        if data is not None:
+            to_write.append((spot.id, "airnow", data))
 
     if not to_write:
         return
@@ -291,8 +298,8 @@ async def _fetch_and_cache_realtime(spots: list[Spot]) -> None:
 
     log.info(
         "realtime_conditions_fetched",
-        extra={"usgs_count": len(usgs_spots), "nws_count": len(nws_spots),
-               "written": len(to_write)},
+        extra={"usgs_count": len(usgs_spots), "nws_count": len(geo_spots),
+               "airnow_count": len(geo_spots), "written": len(to_write)},
     )
 
 
@@ -371,6 +378,7 @@ def _compute_volatile_delta(
     nwrfc_data: dict | None,
     target_species: list[str],
     departure_time: datetime | None = None,
+    airnow_data: dict | None = None,
 ) -> float:
     """
     Compute signed volatile delta per §7.5. Added to spots.score to produce
@@ -436,6 +444,18 @@ def _compute_volatile_delta(
             delta -= 0.5
         else:
             delta -= 1.5
+
+        wind_mph = (nws_data.get("current") or {}).get("wind_speed_mph")
+        if wind_mph is not None:
+            if wind_mph > 25:
+                delta -= 1.0
+            elif wind_mph > 15:
+                delta -= 0.5
+
+    if airnow_data:
+        aqi = airnow_data.get("aqi")
+        if aqi is not None and 151 <= aqi <= 200:
+            delta -= 1.0
 
     delta += _species_match_delta(target_species, spot)
 
@@ -601,6 +621,7 @@ def _format_conditions_block(candidates: list[dict]) -> str:
         usgs = conds.get("usgs") or {}
         nws = conds.get("noaa_nws") or {}
         wta = conds.get("wta") or {}
+        airnow = conds.get("airnow") or {}
         lines.append(f"\n=== {c['spot_name']} ===")
 
         if c.get("is_haversine"):
@@ -611,8 +632,10 @@ def _format_conditions_block(candidates: list[dict]) -> str:
         cfs = usgs.get("cfs")
         temp = usgs.get("temp_f")
         turb = usgs.get("turbidity_fnu")
+        trend = usgs.get("trend")
         if cfs is not None:
-            lines.append(f"Flow: {cfs:.0f} CFS")
+            trend_str = f" ({trend})" if trend and trend != "stable" else ""
+            lines.append(f"Flow: {cfs:.0f} CFS{trend_str}")
         if temp is not None:
             lines.append(f"Water temp: {temp:.1f}°F")
         if turb is not None:
@@ -622,6 +645,16 @@ def _format_conditions_block(candidates: list[dict]) -> str:
         if current.get("short_forecast"):
             temp_str = f", {current['temp_f']}°F" if current.get("temp_f") else ""
             lines.append(f"Weather: {current['short_forecast']}{temp_str}")
+        wind_mph = current.get("wind_speed_mph")
+        if wind_mph is not None and wind_mph > 10:
+            lines.append(f"Wind: {wind_mph:.0f} mph")
+
+        aqi = airnow.get("aqi")
+        if aqi is not None and aqi > 50:
+            category = airnow.get("category") or "Moderate"
+            pollutant = airnow.get("pollutant") or ""
+            pollutant_str = f", {pollutant}" if pollutant else ""
+            lines.append(f"Air quality: {category} (AQI {aqi}{pollutant_str})")
 
         wta_reports = wta.get("reports") or []
         if wta_reports:
@@ -860,6 +893,9 @@ async def build_context(
                 continue
             if spot.is_alpine and not _alpine_access_ok(spot, cond_by.get((sid, "snotel")), today):
                 continue
+            airnow = cond_by.get((sid, "airnow")) or {}
+            if (airnow.get("aqi") or 0) > 200:
+                continue
             filtered.append(spot)
 
         # Drive-time filter — parallel HERE calls
@@ -895,6 +931,7 @@ async def build_context(
                     "nws": cond_by.get((sid, "noaa_nws")),
                     "nwrfc": cond_by.get((sid, "noaa_nwrfc")),
                     "wta": cond_by.get((sid, "wta")),
+                    "airnow": cond_by.get((sid, "airnow")),
                 })
         else:
             # No home location — include all filtered spots without drive-time gate
@@ -909,6 +946,7 @@ async def build_context(
                     "nws": cond_by.get((sid, "noaa_nws")),
                     "nwrfc": cond_by.get((sid, "noaa_nwrfc")),
                     "wta": cond_by.get((sid, "wta")),
+                    "airnow": cond_by.get((sid, "airnow")),
                 })
 
         # --------------------------------------------------------------
@@ -917,7 +955,7 @@ async def build_context(
         for c in candidates_raw:
             delta = _compute_volatile_delta(
                 c["spot"], c["usgs"], c["nws"], c.get("nwrfc"),
-                target_species, departure_time,
+                target_species, departure_time, c.get("airnow"),
             )
             base = float(c["spot"].score or 0) + delta
             # Explore goal: boost unvisited spots (+2.0) so they sort above
@@ -942,7 +980,7 @@ async def build_context(
                 "last_visited": (
                     c["spot"].last_visited.isoformat() if c["spot"].last_visited else None
                 ),
-                "conditions": {"usgs": c["usgs"], "noaa_nws": c["nws"], "noaa_nwrfc": c.get("nwrfc"), "wta": c.get("wta")},
+                "conditions": {"usgs": c["usgs"], "noaa_nws": c["nws"], "noaa_nwrfc": c.get("nwrfc"), "wta": c.get("wta"), "airnow": c.get("airnow")},
             }
             for c in candidates_raw
         ]

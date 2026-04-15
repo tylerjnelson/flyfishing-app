@@ -76,6 +76,13 @@ log = logging.getLogger(__name__)
 
 app = FastAPI(title="Fly Fish WA", docs_url=None, redoc_url=None)
 
+# Holds a persistent DB connection in the worker that won the scheduler lock.
+# None in all other workers. Closed on shutdown to release the advisory lock.
+_scheduler_lock_conn = None
+
+# Advisory lock key — arbitrary stable integer unique to this app.
+_SCHEDULER_LOCK_KEY = 1_234_567_890
+
 
 # ---------------------------------------------------------------------------
 # Startup
@@ -83,18 +90,44 @@ app = FastAPI(title="Fly Fish WA", docs_url=None, redoc_url=None)
 
 @app.on_event("startup")
 async def startup() -> None:
+    global _scheduler_lock_conn
+
     # Register pillow-heif so Pillow can open HEIC/HEIF images natively
     pillow_heif.register_heif_opener()
     log.info("pillow_heif_registered")
 
-    from conditions.scheduler import start_scheduler
-    start_scheduler()
+    # Elect exactly one gunicorn worker to run the scheduler.
+    # pg_try_advisory_lock is non-blocking: the first worker that calls it wins
+    # the lock and starts the scheduler; subsequent workers get False and skip.
+    # The lock is session-scoped — releasing the connection releases the lock,
+    # so if the elected worker dies another worker can take over on restart.
+    from sqlalchemy import text
+    from db.connection import engine
+
+    _scheduler_lock_conn = await engine.connect()
+    result = await _scheduler_lock_conn.execute(
+        text("SELECT pg_try_advisory_lock(:key)"), {"key": _SCHEDULER_LOCK_KEY}
+    )
+    got_lock = result.scalar()
+
+    if got_lock:
+        from conditions.scheduler import start_scheduler
+        start_scheduler()
+        log.info("scheduler_worker_elected")
+    else:
+        log.info("scheduler_worker_skipped")
 
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
+    global _scheduler_lock_conn
+
     from conditions.scheduler import stop_scheduler
     stop_scheduler()
+
+    if _scheduler_lock_conn is not None:
+        await _scheduler_lock_conn.close()
+        _scheduler_lock_conn = None
 
 
 # ---------------------------------------------------------------------------

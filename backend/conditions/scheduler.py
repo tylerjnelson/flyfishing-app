@@ -143,6 +143,10 @@ async def job_wdfw_emergency() -> None:
         log.warning("wdfw_emergency_fetch_failed", extra={"error": str(exc)})
         return  # serve last cached rows unmodified
 
+    if not rules:
+        log.warning("wdfw_emergency_empty_rules", extra={"job": "wdfw_emergency"})
+        return  # don't wipe existing closures if we got nothing back
+
     async with AsyncSessionLocal() as session:
         async with session.begin():
             # Replace all non-expired closures with fresh data
@@ -254,10 +258,40 @@ async def job_wdfw_stocking() -> None:
                     size_description=r.get("size_description"),
                     source_record_id=r.get("source_record_id"),
                     fetched_at=datetime.now(tz=timezone.utc),
-                    # spot_id linked in Phase 3 when spots are seeded and matched
                 ))
 
-    log.info("job_done", extra={"job": "wdfw_stocking", "records_stored": len(records)})
+    # Propagate the most recent stocked_date per water body to spots.last_stocked_date.
+    # Matched by water_name (case-insensitive) — same approach used in seed_spots.py.
+    latest_by_name: dict[str, object] = {}
+    for r in records:
+        water_name = (r.get("water_name") or "").strip()
+        stocked_date = _parse_date(r.get("stocked_date"))
+        if not water_name or stocked_date is None:
+            continue
+        key = water_name.upper()
+        if key not in latest_by_name or stocked_date > latest_by_name[key]:
+            latest_by_name[key] = stocked_date
+
+    spots_updated = 0
+    if latest_by_name:
+        async with AsyncSessionLocal() as session:
+            async with session.begin():
+                for name_upper, stocked_date in latest_by_name.items():
+                    result = await session.execute(
+                        text("""
+                            UPDATE spots
+                               SET last_stocked_date = :stocked_date
+                             WHERE UPPER(name) = :name
+                               AND (last_stocked_date IS NULL OR last_stocked_date < :stocked_date)
+                        """),
+                        {"name": name_upper, "stocked_date": stocked_date},
+                    )
+                    spots_updated += result.rowcount
+
+    log.info(
+        "job_done",
+        extra={"job": "wdfw_stocking", "records_stored": len(records), "spots_updated": spots_updated},
+    )
 
 
 # ---------------------------------------------------------------------------

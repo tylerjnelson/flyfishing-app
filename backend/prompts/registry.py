@@ -200,12 +200,12 @@ or fishing as a primary or secondary activity.
 
 Return ONLY valid JSON. No preamble. No markdown fences. No explanation.
 
-{
+{{
   "fishing_intent": true | false,
   "confidence": "high" | "medium" | "low",
   "evidence": ""  // one sentence quoting or summarising the fishing signal,
                   // or 'none' if fishing_intent is false
-}
+}}
 
 fishing_intent = true when the report:
 - Explicitly mentions fishing, fly fishing, casting, catching fish, or fishing gear
