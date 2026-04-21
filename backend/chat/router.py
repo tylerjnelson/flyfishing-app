@@ -26,7 +26,7 @@ from chat.response_cache import store_response
 from chat.streaming import StreamHandler
 from config import settings
 from db.connection import get_db
-from db.models import Conversation, Message, Note, Spot, Trip, User
+from db.models import Conversation, FishingSpot, Message, Note, Trip, User, WaterBody
 from llm.client import CHAT_MODEL
 from notes.ingestion import ingest_note_task
 from trips.service import get_trip, get_trip_conversation, refresh_state
@@ -225,7 +225,7 @@ async def chat_endpoint(
                 candidates = build_result.session_candidates.get("candidates", [])
                 if candidates:
                     await store_response(
-                        db, candidates[0]["spot_id"],
+                        db, candidates[0]["fishing_spot_id"],
                         build_result.conditions_hash, full_response,
                     )
 
@@ -250,19 +250,28 @@ async def chat_endpoint(
             if not found:
                 # Spot was hard-filtered — fetch from DB and re-insert with caveat
                 alt_spot_id = handler.surface_alternate["spot_id"]
-                spot_res = await db.execute(select(Spot).where(Spot.id == alt_spot_id))
-                alt_spot = spot_res.scalar_one_or_none()
-                if alt_spot:
+                fs_wb_res = await db.execute(
+                    select(FishingSpot, WaterBody)
+                    .join(WaterBody, FishingSpot.water_body_id == WaterBody.id)
+                    .where(FishingSpot.id == alt_spot_id)
+                )
+                fs_wb_row = fs_wb_res.one_or_none()
+                if fs_wb_row:
+                    alt_fs, alt_wb = fs_wb_row
+                    spot_name = alt_fs.name or alt_wb.name
                     caveat_candidate = {
-                        "spot_id": str(alt_spot.id),
-                        "spot_name": alt_spot.name,
-                        "spot_type": alt_spot.type,
+                        "spot_id": str(alt_fs.id),
+                        "fishing_spot_id": str(alt_fs.id),
+                        "water_body_id": str(alt_wb.id),
+                        "spot_name": spot_name,
+                        "water_body_name": alt_wb.name,
+                        "spot_type": alt_wb.type,
                         "session_score": 0.0,
                         "drive_minutes": None,
                         "is_haversine": False,
                         "straight_line_miles": None,
                         "last_visited": (
-                            alt_spot.last_visited.isoformat() if alt_spot.last_visited else None
+                            alt_fs.last_visited.isoformat() if alt_fs.last_visited else None
                         ),
                         "conditions": {},
                         "surfaced_with_caveat": True,

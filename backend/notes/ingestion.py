@@ -149,7 +149,7 @@ async def _ingest_typed(note_id: UUID, db: AsyncSession) -> None:
         "processing_notes": _build_processing_notes(flags, spot_resolution_json),
     }
     if spot_id:
-        updates["spot_id"] = spot_id
+        updates["fishing_spot_id"] = spot_id
 
     await _update_note(note_id, updates, db)
     log.info("typed_note_ingested", extra={"note_id": str(note_id)})
@@ -181,7 +181,7 @@ async def _ingest_debrief(note_id: UUID, db: AsyncSession) -> None:
     # Embedding
     embedding = await embed_text(note.content)
 
-    # Spot resolution — prefer trip.spot_id if already known
+    # Spot resolution — prefer trip.fishing_spot_id if already known
     spot_id = None
     flags: list[str] = []
     spot_resolution_json = None
@@ -189,8 +189,8 @@ async def _ingest_debrief(note_id: UUID, db: AsyncSession) -> None:
     if note.trip_id:
         trip_result = await db.execute(select(Trip).where(Trip.id == note.trip_id))
         trip = trip_result.scalar_one_or_none()
-        if trip and trip.spot_id:
-            spot_id = trip.spot_id
+        if trip and trip.fishing_spot_id:
+            spot_id = trip.fishing_spot_id
             flags.append("spot_auto_linked")
 
     if not spot_id:
@@ -229,13 +229,18 @@ async def _ingest_debrief(note_id: UUID, db: AsyncSession) -> None:
         "processing_notes": _build_processing_notes(flags, spot_resolution_json),
     }
     if spot_id:
-        updates["spot_id"] = spot_id
+        updates["fishing_spot_id"] = spot_id
 
     await _update_note(note_id, updates, db)
 
-    # Trigger immediate re-score for confirmed spot (§13.6)
+    # Trigger immediate re-score for the water body of the confirmed spot (§13.6)
     if spot_id:
-        await compute_and_store_score(str(spot_id), db)
+        from sqlalchemy import select as _select
+        from db.models import FishingSpot
+        fs_result = await db.execute(_select(FishingSpot).where(FishingSpot.id == spot_id))
+        fs = fs_result.scalar_one_or_none()
+        if fs:
+            await compute_and_store_score(str(fs.water_body_id), db)
 
     log.info("debrief_note_ingested", extra={"note_id": str(note_id)})
 

@@ -15,7 +15,7 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.models import Conversation, Message, Spot, Trip, User
+from db.models import Conversation, Message, Trip, User
 from intake.service import merge_intake
 
 log = logging.getLogger(__name__)
@@ -235,8 +235,8 @@ async def set_trip_state(
 # Spot assignment (called by chat router after first recommendation accepted)
 # ---------------------------------------------------------------------------
 
-async def assign_spot(trip: Trip, spot_id: UUID, db: AsyncSession) -> Trip:
-    """Link a recommended spot to the trip."""
-    trip.spot_id = spot_id
+async def assign_spot(trip: Trip, fishing_spot_id: UUID, db: AsyncSession) -> Trip:
+    """Link a recommended fishing spot to the trip."""
+    trip.fishing_spot_id = fishing_spot_id
     await db.commit()
     return trip

@@ -2,15 +2,17 @@
 Context builder unit tests — Phase 5 Chunk 5.
 
 Tests cover the pure helper functions extracted from build_context():
-  - _has_active_closure       → emergency closure filter
-  - _passes_conditions_filter → CFS/temp/turbidity hard filter
-  - _alpine_access_ok         → snowpack + elevation gate
-  - _apply_variety_rotation   → 60-day fresh-spot rule
-  - _wildfire_near_spot       → 25 km proximity gate
+  - _has_active_closure     → emergency closure filter
+  - _cfs_out_of_range       → CFS hard filter (only hard conditions filter)
+  - _apply_variety_rotation → 60-day fresh-spot rule
+  - _wildfire_near_spot     → 25 km proximity gate (used as soft penalty)
 
 Integration tests requiring a DB are avoided here; the router-level
 integration test below exercises the FILTER_UPDATE confirm-filter flow.
 These tests are pure / synchronous — no DB, no Ollama, no async.
+
+Note: Temperature, turbidity, alpine access, and AQI are now soft penalties
+in _compute_volatile_delta rather than hard filters.
 """
 
 from datetime import date, timedelta
@@ -21,9 +23,8 @@ import pytest
 
 from chat.context_builder import (
     _apply_variety_rotation,
-    _alpine_access_ok,
+    _cfs_out_of_range,
     _has_active_closure,
-    _passes_conditions_filter,
     _wildfire_near_spot,
 )
 
@@ -107,101 +108,52 @@ class TestHasActiveClosure:
 
 
 # ---------------------------------------------------------------------------
-# _passes_conditions_filter
+# _cfs_out_of_range
 # ---------------------------------------------------------------------------
 
-class TestPassesConditionsFilter:
-    def test_river_within_cfs_range_passes(self):
+class TestCfsOutOfRange:
+    """
+    _cfs_out_of_range returns True when CFS is outside min/max (hard filter).
+    Temperature, turbidity, and other signals are now soft penalties.
+    """
+
+    def test_river_within_cfs_range_not_blocked(self):
         spot = make_spot(type="river", min_cfs=50, max_cfs=500)
-        assert _passes_conditions_filter(spot, {"cfs": 200}, ["trout"]) is True
+        assert _cfs_out_of_range(spot, {"cfs": 200}) is False
 
     def test_river_below_min_cfs_blocked(self):
         spot = make_spot(type="river", min_cfs=100, max_cfs=500)
-        assert _passes_conditions_filter(spot, {"cfs": 40}, ["trout"]) is False
+        assert _cfs_out_of_range(spot, {"cfs": 40}) is True
 
     def test_river_above_max_cfs_blocked(self):
         spot = make_spot(type="river", min_cfs=50, max_cfs=300)
-        assert _passes_conditions_filter(spot, {"cfs": 600}, ["trout"]) is False
+        assert _cfs_out_of_range(spot, {"cfs": 600}) is True
 
-    def test_temp_above_species_ceiling_blocked(self):
+    def test_high_temp_not_a_hard_filter(self):
+        # Temp above species ceiling is now a soft penalty, not a hard filter
         spot = make_spot(type="river", min_cfs=None, max_cfs=None, min_temp_f=None)
-        # Trout ceiling is 61°F
-        assert _passes_conditions_filter(spot, {"temp_f": 65.0}, ["trout"]) is False
+        assert _cfs_out_of_range(spot, {"temp_f": 65.0}) is False
 
-    def test_temp_below_ceiling_passes(self):
+    def test_high_turbidity_not_a_hard_filter(self):
+        # Turbidity is now a soft penalty
         spot = make_spot(type="river", min_cfs=None, max_cfs=None, min_temp_f=None)
-        assert _passes_conditions_filter(spot, {"temp_f": 55.0}, ["trout"]) is True
+        assert _cfs_out_of_range(spot, {"turbidity_fnu": 150.0}) is False
 
-    def test_high_turbidity_blocked(self):
-        spot = make_spot(type="river", min_cfs=None, max_cfs=None, min_temp_f=None)
-        assert _passes_conditions_filter(spot, {"turbidity_fnu": 150.0}, ["trout"]) is False
-
-    def test_turbidity_at_100_passes(self):
-        spot = make_spot(type="river", min_cfs=None, max_cfs=None, min_temp_f=None)
-        assert _passes_conditions_filter(spot, {"turbidity_fnu": 100.0}, ["trout"]) is True
-
-    def test_lake_skips_cfs_filter(self):
+    def test_lake_never_cfs_blocked(self):
         spot = make_spot(type="lake")
-        # Lake ignores CFS conditions
-        assert _passes_conditions_filter(spot, {"cfs": 0}, ["trout"]) is True
+        assert _cfs_out_of_range(spot, {"cfs": 0}) is False
 
-    def test_no_realtime_data_passes(self):
+    def test_no_realtime_data_not_blocked(self):
         spot = make_spot(type="river")
-        assert _passes_conditions_filter(spot, None, ["trout"]) is True
+        assert _cfs_out_of_range(spot, None) is False
 
-    def test_has_realtime_false_passes_without_data(self):
+    def test_has_realtime_false_not_blocked(self):
         spot = make_spot(type="river", has_realtime_conditions=False)
-        # Not a hard gate when the spot doesn't have realtime data enabled
-        assert _passes_conditions_filter(spot, None, ["trout"]) is True
+        assert _cfs_out_of_range(spot, None) is False
 
-
-# ---------------------------------------------------------------------------
-# _alpine_access_ok
-# ---------------------------------------------------------------------------
-
-class TestAlpineAccessOk:
-    def test_non_alpine_always_passes(self):
-        spot = make_spot(is_alpine=False, elevation_ft=7000)
-        assert _alpine_access_ok(spot, None, date(2025, 3, 1)) is True
-
-    def test_heavy_snotel_blocks(self):
-        spot = make_spot(is_alpine=True, elevation_ft=5500)
-        snotel = {"snow_water_equivalent_in": 35.0}
-        assert _alpine_access_ok(spot, snotel, date(2025, 6, 15)) is False
-
-    def test_light_snotel_passes(self):
-        spot = make_spot(is_alpine=True, elevation_ft=5500)
-        snotel = {"snow_water_equivalent_in": 10.0}
-        assert _alpine_access_ok(spot, snotel, date(2025, 7, 1)) is True
-
-    def test_elevation_6000_before_july_blocked(self):
-        spot = make_spot(is_alpine=True, elevation_ft=6000)
-        assert _alpine_access_ok(spot, None, date(2025, 6, 30)) is False
-
-    def test_elevation_6000_in_july_passes(self):
-        spot = make_spot(is_alpine=True, elevation_ft=6000)
-        assert _alpine_access_ok(spot, None, date(2025, 7, 1)) is True
-
-    def test_elevation_5000_before_june_blocked(self):
-        spot = make_spot(is_alpine=True, elevation_ft=5000)
-        assert _alpine_access_ok(spot, None, date(2025, 5, 31)) is False
-
-    def test_elevation_5000_in_june_passes(self):
-        spot = make_spot(is_alpine=True, elevation_ft=5000)
-        assert _alpine_access_ok(spot, None, date(2025, 6, 1)) is True
-
-    def test_elevation_4000_before_may_blocked(self):
-        spot = make_spot(is_alpine=True, elevation_ft=4000)
-        assert _alpine_access_ok(spot, None, date(2025, 4, 30)) is False
-
-    def test_elevation_4000_in_may_passes(self):
-        spot = make_spot(is_alpine=True, elevation_ft=4000)
-        assert _alpine_access_ok(spot, None, date(2025, 5, 1)) is True
-
-    def test_low_alpine_passes_anytime(self):
-        # Below 4000 ft — no elevation gate applied
-        spot = make_spot(is_alpine=True, elevation_ft=3500)
-        assert _alpine_access_ok(spot, None, date(2025, 1, 15)) is True
+    def test_cfs_none_in_data_not_blocked(self):
+        spot = make_spot(type="river", min_cfs=100, max_cfs=500)
+        assert _cfs_out_of_range(spot, {"cfs": None}) is False
 
 
 # ---------------------------------------------------------------------------

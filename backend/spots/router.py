@@ -38,41 +38,39 @@ router = APIRouter()
 # Response serialisers
 # ---------------------------------------------------------------------------
 
-def _spot_summary(spot) -> dict:
+def _spot_summary(wb) -> dict:
     return {
-        "id": str(spot.id),
-        "name": spot.name,
-        "type": spot.type,
-        "latitude": float(spot.latitude) if spot.latitude is not None else None,
-        "longitude": float(spot.longitude) if spot.longitude is not None else None,
-        "county": spot.county,
-        "score": float(spot.score) if spot.score is not None else 0.0,
-        "fly_fishing_legal": spot.fly_fishing_legal,
-        "seed_confidence": spot.seed_confidence,
-        "has_realtime_conditions": spot.has_realtime_conditions,
-        "last_visited": spot.last_visited.isoformat() if spot.last_visited else None,
+        "id": str(wb.id),
+        "name": wb.name,
+        "type": wb.type,
+        "latitude": float(wb.latitude) if wb.latitude is not None else None,
+        "longitude": float(wb.longitude) if wb.longitude is not None else None,
+        "county": wb.county,
+        "score": float(wb.score) if wb.score is not None else 0.0,
+        "fly_fishing_legal": wb.fly_fishing_legal,
+        "seed_confidence": wb.seed_confidence,
+        "has_realtime_conditions": wb.has_realtime_conditions,
+        "last_stocked_date": wb.last_stocked_date.isoformat() if wb.last_stocked_date else None,
     }
 
 
-def _spot_detail(spot, closures: list) -> dict:
-    base = _spot_summary(spot)
+def _spot_detail(wb, closures: list) -> dict:
+    base = _spot_summary(wb)
     base.update({
-        "aliases": spot.aliases or [],
-        "elevation_ft": spot.elevation_ft,
-        "is_alpine": spot.is_alpine,
-        "is_public": spot.is_public,
-        "permit_required": spot.permit_required,
-        "permit_url": spot.permit_url,
-        "species_primary": spot.species_primary or [],
-        "min_cfs": spot.min_cfs,
-        "max_cfs": spot.max_cfs,
-        "min_temp_f": float(spot.min_temp_f) if spot.min_temp_f is not None else None,
-        "max_temp_f": float(spot.max_temp_f) if spot.max_temp_f is not None else None,
-        "fishing_regs": spot.fishing_regs,
-        "last_stocked_date": spot.last_stocked_date.isoformat() if spot.last_stocked_date else None,
-        "last_stocked_species": spot.last_stocked_species or [],
-        "wta_trail_url": spot.wta_trail_url,
-        "score_updated": spot.score_updated.isoformat() if spot.score_updated else None,
+        "aliases": wb.aliases or [],
+        "elevation_ft": wb.elevation_ft,
+        "is_alpine": wb.is_alpine,
+        "permit_required": wb.permit_required,
+        "permit_url": wb.permit_url,
+        "species_primary": wb.species_primary or [],
+        "min_cfs": wb.min_cfs,
+        "max_cfs": wb.max_cfs,
+        "min_temp_f": float(wb.min_temp_f) if wb.min_temp_f is not None else None,
+        "max_temp_f": float(wb.max_temp_f) if wb.max_temp_f is not None else None,
+        "fishing_regs": wb.fishing_regs,
+        "last_stocked_species": wb.last_stocked_species or [],
+        "wta_trail_url": wb.wta_trail_url,
+        "score_updated": wb.score_updated.isoformat() if wb.score_updated else None,
         "emergency_closures": [
             {
                 "rule_text": c.rule_text,
