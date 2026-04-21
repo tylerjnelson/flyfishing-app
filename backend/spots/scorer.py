@@ -315,74 +315,89 @@ def score_lake(
 # DB-level entry point — called by scheduler and post-debrief re-score
 # ---------------------------------------------------------------------------
 
-async def compute_and_store_score(spot_id: str, db) -> float:
+async def compute_and_store_score(water_body_id: str, db) -> float:
     """
-    Fetch spot + related data from DB, compute Tier 1 score, write back.
+    Fetch water body + related data from DB, compute Tier 1 score, write back.
 
+    Aggregates notes and debriefs from all fishing_spots on this water body.
     Returns the computed score.
     """
     from datetime import datetime, timezone
-    from sqlalchemy import func, select, text
-    from db.models import ConditionsCache, Note, Session, Spot, Trip
+    from sqlalchemy import func, select
+    from db.models import ConditionsCache, FishingSpot, Note, Trip, WaterBody
 
-    result = await db.execute(select(Spot).where(Spot.id == spot_id))
-    spot = result.scalar_one_or_none()
-    if not spot:
-        log.warning("score_spot_not_found", extra={"spot_id": spot_id})
+    result = await db.execute(select(WaterBody).where(WaterBody.id == water_body_id))
+    water_body = result.scalar_one_or_none()
+    if not water_body:
+        log.warning("score_water_body_not_found", extra={"water_body_id": water_body_id})
         return 0.0
 
-    # Note sentiment counts
-    note_result = await db.execute(
-        select(
-            func.count().filter(Note.outcome == "positive").label("pos"),
-            func.count().filter(Note.outcome == "neutral").label("neu"),
-            func.count().filter(Note.outcome == "negative").label("neg"),
-        ).where(Note.spot_id == spot.id)
+    # All fishing_spot IDs for this water body
+    fs_result = await db.execute(
+        select(FishingSpot.id).where(FishingSpot.water_body_id == water_body_id)
     )
+    fishing_spot_ids = [row[0] for row in fs_result.all()]
+
+    # Note sentiment counts across all fishing spots
+    if fishing_spot_ids:
+        note_result = await db.execute(
+            select(
+                func.count().filter(Note.outcome == "positive").label("pos"),
+                func.count().filter(Note.outcome == "neutral").label("neu"),
+                func.count().filter(Note.outcome == "negative").label("neg"),
+            ).where(Note.fishing_spot_id.in_(fishing_spot_ids))
+        )
+    else:
+        note_result = await db.execute(
+            select(
+                func.count().label("pos"),
+                func.count().label("neu"),
+                func.count().label("neg"),
+            ).where(False)
+        )
     sentiment_row = note_result.one()
 
-    # Debriefs (trips with a debrief_note_id → they have a filed debrief)
-    debrief_result = await db.execute(
-        select(Trip.session_intake, Trip.conditions_snapshot)
-        .where(Trip.spot_id == spot.id)
-        .where(Trip.debrief_note_id.is_not(None))
-    )
-    debrief_rows = debrief_result.all()
-
+    # Debriefs from all trips to any fishing spot on this water body
     debriefs = []
-    for row in debrief_rows:
-        intake = row.session_intake or {}
-        snapshot = row.conditions_snapshot or {}
-        rating = intake.get("overall_rating")
-        if rating is not None:
-            debriefs.append({
-                "rating": float(rating),
-                "snap_cfs": snapshot.get("cfs"),
-            })
+    if fishing_spot_ids:
+        debrief_result = await db.execute(
+            select(Trip.session_intake, Trip.conditions_snapshot)
+            .where(Trip.fishing_spot_id.in_(fishing_spot_ids))
+            .where(Trip.debrief_note_id.is_not(None))
+        )
+        for row in debrief_result.all():
+            intake = row.session_intake or {}
+            snapshot = row.conditions_snapshot or {}
+            rating = intake.get("overall_rating")
+            if rating is not None:
+                debriefs.append({
+                    "rating": float(rating),
+                    "snap_cfs": snapshot.get("cfs"),
+                })
 
-    # Data source coverage — count non-null source columns
+    # Data source coverage — count non-null source columns on water_body
     source_fields = [
-        spot.usgs_site_ids,
-        spot.noaa_station_id,
-        spot.snotel_station_id,
-        spot.wdfw_water_id,
-        spot.wta_trail_url,
-        spot.fishing_regs,
+        water_body.usgs_site_ids,
+        water_body.noaa_station_id,
+        water_body.snotel_station_id,
+        water_body.wdfw_water_id,
+        water_body.wta_trail_url,
+        water_body.fishing_regs,
     ]
     populated = sum(1 for f in source_fields if f is not None)
     total = len(source_fields)
 
     # Stocking recency for lakes
     days_since_stocked = None
-    if spot.last_stocked_date:
-        days_since_stocked = (datetime.now(tz=timezone.utc).date() - spot.last_stocked_date).days
+    if water_body.last_stocked_date:
+        days_since_stocked = (datetime.now(tz=timezone.utc).date() - water_body.last_stocked_date).days
 
-    # SNOTEL snowpack for alpine lakes — read most recent cached entry
+    # SNOTEL snowpack for alpine water bodies — read most recent cached entry
     snowpack_pct_of_median = None
-    if spot.is_alpine and spot.snotel_station_id:
+    if water_body.is_alpine and water_body.snotel_station_id:
         snotel_result = await db.execute(
             select(ConditionsCache.data)
-            .where(ConditionsCache.spot_id == spot.id)
+            .where(ConditionsCache.water_body_id == water_body.id)
             .where(ConditionsCache.source == "snotel")
             .order_by(ConditionsCache.fetched_at.desc())
             .limit(1)
@@ -391,11 +406,20 @@ async def compute_and_store_score(spot_id: str, db) -> float:
         if snotel_data:
             snowpack_pct_of_median = snotel_data.get("pct_of_median")
 
-    if spot.type in ("river", "creek", "coastal"):
+    # last_visited is the most recent across all fishing_spots on this water body
+    last_visited = None
+    if fishing_spot_ids:
+        lv_result = await db.execute(
+            select(func.max(FishingSpot.last_visited))
+            .where(FishingSpot.water_body_id == water_body_id)
+        )
+        last_visited = lv_result.scalar_one_or_none()
+
+    if water_body.type in ("river", "creek", "coastal"):
         computed = score_river(
-            seed_confidence=spot.seed_confidence or "unvalidated",
+            seed_confidence=water_body.seed_confidence or "unvalidated",
             debriefs=debriefs,
-            current_cfs=None,     # nightly job does not apply real-time CFS
+            current_cfs=None,
             flow_trend=None,
             note_positive=sentiment_row.pos,
             note_neutral=sentiment_row.neu,
@@ -404,27 +428,27 @@ async def compute_and_store_score(spot_id: str, db) -> float:
             species_match=None,
             populated_sources=populated,
             total_sources=total,
-            last_visited=spot.last_visited,
+            last_visited=last_visited,
         )
     else:
         computed = score_lake(
-            seed_confidence=spot.seed_confidence or "unvalidated",
+            seed_confidence=water_body.seed_confidence or "unvalidated",
             debriefs=debriefs,
             days_since_stocked=days_since_stocked,
             note_positive=sentiment_row.pos,
             note_neutral=sentiment_row.neu,
             note_negative=sentiment_row.neg,
-            is_alpine=spot.is_alpine or False,
+            is_alpine=water_body.is_alpine or False,
             snowpack_pct_of_median=snowpack_pct_of_median,
             species_match=None,
             populated_sources=populated,
             total_sources=total,
-            last_visited=spot.last_visited,
+            last_visited=last_visited,
         )
 
-    spot.score = computed
-    spot.score_updated = datetime.now(tz=timezone.utc)
+    water_body.score = computed
+    water_body.score_updated = datetime.now(tz=timezone.utc)
     await db.commit()
 
-    log.info("score_updated", extra={"spot_id": spot_id, "score": computed})
+    log.info("score_updated", extra={"water_body_id": water_body_id, "score": computed})
     return computed

@@ -53,7 +53,10 @@ async def list_notes(
 ) -> list[Note]:
     q = select(Note).where(Note.author_id == author_id)
     if spot_id:
-        q = q.where(Note.spot_id == spot_id)
+        # Accept fishing_spot_id (new) or fall back to legacy spot_id
+        q = q.where(
+            (Note.fishing_spot_id == spot_id) | (Note.spot_id == spot_id)
+        )
     if source_type:
         q = q.where(Note.source_type == source_type)
     q = q.order_by(desc(Note.created_at)).limit(limit).offset(offset)
@@ -97,16 +100,16 @@ async def confirm_spot(
     note_id: UUID, spot_id: UUID, db: AsyncSession
 ) -> Note | None:
     """
-    Set spot_id on the note and clear awaiting_spot_confirmation flag.
+    Set fishing_spot_id on the note and clear awaiting_spot_confirmation flag.
+    spot_id is expected to be a fishing_spot_id (returned by the resolver candidates).
     """
     result = await db.execute(select(Note).where(Note.id == note_id))
     note = result.scalar_one_or_none()
     if not note:
         return None
 
-    note.spot_id = spot_id
+    note.fishing_spot_id = spot_id
     note.processing_notes = _remove_flag(note.processing_notes, "awaiting_spot_confirmation")
-    # Remove the spot resolution JSON blob (second line of processing_notes if present)
     if note.processing_notes and "\n" in note.processing_notes:
         note.processing_notes = note.processing_notes.split("\n", 1)[0]
     db.add(note)

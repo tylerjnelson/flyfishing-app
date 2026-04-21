@@ -92,7 +92,7 @@ class TestSpotSummary:
         d = _spot_summary(spot)
         for key in ("id", "name", "type", "latitude", "longitude", "county",
                     "score", "fly_fishing_legal", "seed_confidence",
-                    "has_realtime_conditions", "last_visited"):
+                    "has_realtime_conditions", "last_stocked_date"):
             assert key in d, f"missing key: {key}"
 
     def test_id_is_string(self):
@@ -103,13 +103,13 @@ class TestSpotSummary:
         spot = _make_spot(score=None)
         assert _spot_summary(spot)["score"] == 0.0
 
-    def test_last_visited_iso_format(self):
-        spot = _make_spot(last_visited=date(2026, 3, 15))
-        assert _spot_summary(spot)["last_visited"] == "2026-03-15"
+    def test_last_stocked_date_iso_format(self):
+        spot = _make_spot(last_stocked_date=date(2026, 3, 15))
+        assert _spot_summary(spot)["last_stocked_date"] == "2026-03-15"
 
-    def test_last_visited_none(self):
-        spot = _make_spot(last_visited=None)
-        assert _spot_summary(spot)["last_visited"] is None
+    def test_last_stocked_date_none(self):
+        spot = _make_spot(last_stocked_date=None)
+        assert _spot_summary(spot)["last_stocked_date"] is None
 
 
 # ---------------------------------------------------------------------------

@@ -1,18 +1,18 @@
 """
 Spot entity resolution for ingested notes (§6.8 Step D).
 
+Searches water_bodies by name. Auto-link and candidates return fishing_spot_id
+(the default fishing_spot for the matched water_body).
+
 Pipeline:
   D1. Extract location string from OCR text (Llama 3.1 8B — §18.6)
   D2. Embed the location string via nomic-embed-text
-  D3. Run semantic (pgvector) + fuzzy (pg_trgm) lookups against spots table
+  D3. Run semantic (pgvector) + fuzzy (pg_trgm) lookups against water_bodies
   D4. Merge: combined_score = 0.6 * sem_score + 0.4 * trgm_score, take top 3
   D5. Branch on top combined_score:
-        >= 0.85  → auto-link (set spot_id, show pre-filled card)
+        >= 0.85  → auto-link (set fishing_spot_id, show pre-filled card)
         0.50–0.84 → return top 3 for user selection (blocking)
         < 0.50   → return "create new spot" signal
-
-Confidence bands are also returned so the router / frontend can decide
-what UI to show the user.
 """
 
 import logging
@@ -27,7 +27,6 @@ from rag.embedder import embed_text
 
 log = logging.getLogger(__name__)
 
-# Band thresholds (§6.8 D5)
 _AUTO_LINK_THRESHOLD = 0.85
 _CANDIDATE_THRESHOLD = 0.50
 
@@ -35,24 +34,26 @@ _LOCATION_DEFAULT = {"location_string": "", "confidence": "none"}
 
 
 async def extract_location(note_text: str) -> dict:
-    """
-    Call Llama 3.1 8B to extract the fishing location from note text.
-    Returns {"location_string": str, "confidence": str}.
-    """
+    """Call Llama 3.1 8B to extract the fishing location from note text."""
     prompt = LOCATION_EXTRACTION_PROMPT.format(note_text=note_text)
     result = await call_json_llm(prompt, CHAT_MODEL, _LOCATION_DEFAULT)
     return result
 
 
 async def _semantic_lookup(embedding: list[float], db: AsyncSession) -> list[dict]:
-    """Top-10 semantic matches by name_embedding cosine similarity."""
+    """Top-10 semantic matches by name_embedding cosine similarity against water_bodies."""
     rows = await db.execute(
         text(
             """
-            SELECT id::text, name, county, seed_confidence,
-                   1 - (name_embedding <=> CAST(:emb AS vector)) AS sem_score
-            FROM spots
-            ORDER BY name_embedding <=> CAST(:emb AS vector)
+            SELECT wb.id::text AS water_body_id,
+                   wb.name,
+                   wb.county,
+                   wb.seed_confidence,
+                   fs.id::text AS fishing_spot_id,
+                   1 - (wb.name_embedding <=> CAST(:emb AS vector)) AS sem_score
+            FROM water_bodies wb
+            LEFT JOIN fishing_spots fs ON fs.water_body_id = wb.id
+            ORDER BY wb.name_embedding <=> CAST(:emb AS vector)
             LIMIT 10
             """
         ),
@@ -60,7 +61,8 @@ async def _semantic_lookup(embedding: list[float], db: AsyncSession) -> list[dic
     )
     return [
         {
-            "spot_id": r.id,
+            "spot_id": r.fishing_spot_id or r.water_body_id,
+            "water_body_id": r.water_body_id,
             "name": r.name,
             "county": r.county,
             "seed_confidence": r.seed_confidence,
@@ -71,20 +73,25 @@ async def _semantic_lookup(embedding: list[float], db: AsyncSession) -> list[dic
 
 
 async def _fuzzy_lookup(location_string: str, db: AsyncSession) -> list[dict]:
-    """Top-10 fuzzy matches using pg_trgm similarity against name and aliases."""
+    """Top-10 fuzzy matches using pg_trgm similarity against water_bodies name and aliases."""
     rows = await db.execute(
         text(
             """
-            SELECT id::text, name, county, seed_confidence,
+            SELECT wb.id::text AS water_body_id,
+                   wb.name,
+                   wb.county,
+                   wb.seed_confidence,
+                   fs.id::text AS fishing_spot_id,
                    GREATEST(
-                     similarity(name, :loc),
+                     similarity(wb.name, :loc),
                      COALESCE(MAX(similarity(alias_val, :loc)), 0)
                    ) AS trgm_score
-            FROM spots
-            LEFT JOIN LATERAL unnest(aliases) AS alias_val ON true
-            WHERE name % :loc
-               OR EXISTS (SELECT 1 FROM unnest(aliases) a WHERE a % :loc)
-            GROUP BY id, name, county, seed_confidence
+            FROM water_bodies wb
+            LEFT JOIN fishing_spots fs ON fs.water_body_id = wb.id
+            LEFT JOIN LATERAL unnest(wb.aliases) AS alias_val ON true
+            WHERE wb.name % :loc
+               OR EXISTS (SELECT 1 FROM unnest(wb.aliases) a WHERE a % :loc)
+            GROUP BY wb.id, wb.name, wb.county, wb.seed_confidence, fs.id
             ORDER BY trgm_score DESC
             LIMIT 10
             """
@@ -93,7 +100,8 @@ async def _fuzzy_lookup(location_string: str, db: AsyncSession) -> list[dict]:
     )
     return [
         {
-            "spot_id": r.id,
+            "spot_id": r.fishing_spot_id or r.water_body_id,
+            "water_body_id": r.water_body_id,
             "name": r.name,
             "county": r.county,
             "seed_confidence": r.seed_confidence,
@@ -105,19 +113,19 @@ async def _fuzzy_lookup(location_string: str, db: AsyncSession) -> list[dict]:
 
 def _merge_results(semantic: list[dict], fuzzy: list[dict]) -> list[dict]:
     """
-    Merge semantic and fuzzy results by spot_id.
+    Merge semantic and fuzzy results by water_body_id.
     combined_score = 0.6 * sem_score + 0.4 * trgm_score
     Returns top 3 sorted by combined_score descending.
     """
     by_id: dict[str, dict] = {}
     for row in semantic:
-        by_id[row["spot_id"]] = {**row, "trgm_score": 0.0}
+        by_id[row["water_body_id"]] = {**row, "trgm_score": 0.0}
     for row in fuzzy:
-        sid = row["spot_id"]
-        if sid in by_id:
-            by_id[sid]["trgm_score"] = row["trgm_score"]
+        wid = row["water_body_id"]
+        if wid in by_id:
+            by_id[wid]["trgm_score"] = row["trgm_score"]
         else:
-            by_id[sid] = {**row, "sem_score": 0.0}
+            by_id[wid] = {**row, "sem_score": 0.0}
 
     for entry in by_id.values():
         entry["combined_score"] = (
@@ -130,19 +138,14 @@ def _merge_results(semantic: list[dict], fuzzy: list[dict]) -> list[dict]:
 
 async def resolve_spot(note_text: str, db: AsyncSession) -> dict:
     """
-    Full entity resolution pipeline.  Returns a dict with:
+    Full entity resolution pipeline. Returns a dict with:
       {
         "band": "auto" | "medium" | "low",
         "location_string": str,
-        "location_confidence": str,  # from LLM
-        "candidates": [...],         # top 3 merged results (empty for band="low")
-        "auto_spot_id": str | None,  # set only when band="auto"
+        "location_confidence": str,
+        "candidates": [...],         # top 3 merged results (spot_id = fishing_spot_id)
+        "auto_spot_id": str | None,  # fishing_spot_id when band="auto"
       }
-
-    Callers should:
-      - band="auto"   → set notes.spot_id = auto_spot_id immediately (non-blocking UI)
-      - band="medium" → show candidates to user for selection (blocking UI)
-      - band="low"    → show "Create new spot" flow (blocking UI)
     """
     loc = await extract_location(note_text)
     location_string = loc.get("location_string", "")
@@ -200,43 +203,54 @@ async def apply_correction(
     db: AsyncSession,
 ) -> None:
     """
-    D6: On user correction, append the original location_string to the
-    correct spot's aliases[] and re-generate name_embedding for that spot.
-
-    This improves future resolution accuracy organically.
+    D6: On user correction, append the location_string to the correct water_body's
+    aliases[] and re-generate name_embedding.
+    correct_spot_id may be a fishing_spot_id; we look up the water_body via the join.
     """
     if not location_string:
         return
 
+    # Resolve to water_body_id — correct_spot_id may be fishing_spot_id or water_body_id
+    wb_id_row = await db.execute(
+        text("""
+            SELECT id::text FROM water_bodies WHERE id = :id
+            UNION
+            SELECT water_body_id::text FROM fishing_spots WHERE id = :id
+            LIMIT 1
+        """),
+        {"id": correct_spot_id},
+    )
+    wb_id_result = wb_id_row.one_or_none()
+    if not wb_id_result:
+        return
+    water_body_id = wb_id_result[0]
+
     await db.execute(
         text(
             """
-            UPDATE spots
+            UPDATE water_bodies
             SET aliases = array_append(
                     COALESCE(aliases, ARRAY[]::text[]),
                     :loc
                 )
-            WHERE id = :spot_id
+            WHERE id = :wb_id
               AND NOT (:loc = ANY(COALESCE(aliases, ARRAY[]::text[])))
             """
         ),
-        {"loc": location_string, "spot_id": correct_spot_id},
+        {"loc": location_string, "wb_id": water_body_id},
     )
 
-    # Re-generate name_embedding for the corrected spot (updated name + new alias).
-    # Import inline to avoid circular imports.
     from sqlalchemy import select
+    from db.models import WaterBody
 
-    from db.models import Spot
-
-    result = await db.execute(select(Spot).where(Spot.id == correct_spot_id))
-    spot = result.scalar_one_or_none()
-    if spot:
-        new_embedding = await embed_text(spot.name)
-        spot.name_embedding = new_embedding
-        db.add(spot)
+    result = await db.execute(select(WaterBody).where(WaterBody.id == water_body_id))
+    wb = result.scalar_one_or_none()
+    if wb:
+        new_embedding = await embed_text(wb.name)
+        wb.name_embedding = new_embedding
+        db.add(wb)
 
     log.info(
         "alias_appended",
-        extra={"spot_id": correct_spot_id, "location_string": location_string},
+        extra={"water_body_id": water_body_id, "location_string": location_string},
     )

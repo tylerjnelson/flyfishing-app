@@ -40,7 +40,7 @@ from conditions.wdfw_regulations import fetch_and_update_regulations
 from conditions.wdfw_stocking import fetch_wdfw_stocking
 from conditions.wta_scraper import fetch_wta_reports
 from db.connection import AsyncSessionLocal
-from db.models import ConditionsCache, EmergencyClosure, Spot, StockingEvent
+from db.models import ConditionsCache, EmergencyClosure, StockingEvent, WaterBody
 from exceptions import ScraperStructureError
 
 log = logging.getLogger(__name__)
@@ -55,8 +55,6 @@ scheduler: AsyncIOScheduler | None = None
 # ---------------------------------------------------------------------------
 
 def create_scheduler() -> AsyncIOScheduler:
-    # APScheduler job store needs a sync SQLAlchemy URL (psycopg2 driver,
-    # installed as a dependency of apscheduler[postgresql]).
     sync_url = settings.database_url.replace("postgresql+asyncpg://", "postgresql://")
     jobstores = {"default": SQLAlchemyJobStore(url=sync_url, tablename="apscheduler_jobs")}
     return AsyncIOScheduler(jobstores=jobstores, timezone="America/Los_Angeles")
@@ -101,7 +99,7 @@ def start_scheduler() -> None:
     scheduler.add_job(job_snotel, trigger=_daily, id="snotel", replace_existing=True)
     # Nightly scorer runs at 3:30 AM — after stocking and WTA jobs have written new data
     scheduler.add_job(
-        job_score_all_spots,
+        job_score_all_water_bodies,
         trigger=CronTrigger(hour=3, minute=30, timezone="America/Los_Angeles"),
         id="score_all_spots",
         replace_existing=True,
@@ -138,18 +136,17 @@ async def job_wdfw_emergency() -> None:
             "scraper_structure_failure",
             extra={"source": exc.source, "url": exc.url, "detail": exc.detail},
         )
-        return  # serve last cached rows unmodified
+        return
     except Exception as exc:
         log.warning("wdfw_emergency_fetch_failed", extra={"error": str(exc)})
-        return  # serve last cached rows unmodified
+        return
 
     if not rules:
         log.warning("wdfw_emergency_empty_rules", extra={"job": "wdfw_emergency"})
-        return  # don't wipe existing closures if we got nothing back
+        return
 
     async with AsyncSessionLocal() as session:
         async with session.begin():
-            # Replace all non-expired closures with fresh data
             await session.execute(
                 text("DELETE FROM emergency_closures WHERE expires IS NULL OR expires >= CURRENT_DATE")
             )
@@ -179,7 +176,7 @@ async def job_inciweb() -> None:
     async with AsyncSessionLocal() as session:
         async with session.begin():
             await _write_conditions_cache(
-                session, spot_id=None, source="inciweb", data=data
+                session, water_body_id=None, source="inciweb", data=data
             )
 
     log.info("job_done", extra={
@@ -202,7 +199,7 @@ async def job_nps_alerts() -> None:
     async with AsyncSessionLocal() as session:
         async with session.begin():
             await _write_conditions_cache(
-                session, spot_id=None, source="nps_alerts", data=data
+                session, water_body_id=None, source="nps_alerts", data=data
             )
 
     total = sum(p["alert_count"] for p in data.get("parks", {}).values())
@@ -210,27 +207,27 @@ async def job_nps_alerts() -> None:
 
 
 # ---------------------------------------------------------------------------
-# NOAA NWRFC river forecasts — 2-hour, per spot
+# NOAA NWRFC river forecasts — 2-hour, per water body
 # ---------------------------------------------------------------------------
 
 async def job_noaa_nwrfc() -> None:
     log.info("job_start", extra={"job": "noaa_nwrfc"})
-    spots = await _spots_with_usgs_ids()
+    water_bodies = await _water_bodies_with_usgs_ids()
     wrote = 0
 
-    for spot in spots:
-        for usgs_id in (spot.usgs_site_ids or []):
+    for wb in water_bodies:
+        for usgs_id in (wb.usgs_site_ids or []):
             gauge_id = resolve_gauge_id(usgs_id)
             if not gauge_id:
                 continue
             data = await fetch_noaa_nwrfc(gauge_id)
             if data is None:
-                log.warning("job_stale_fallback", extra={"job": "noaa_nwrfc", "spot_id": str(spot.id)})
+                log.warning("job_stale_fallback", extra={"job": "noaa_nwrfc", "water_body_id": str(wb.id)})
                 continue
             async with AsyncSessionLocal() as session:
                 async with session.begin():
                     await _write_conditions_cache(
-                        session, spot_id=spot.id, source="noaa_nwrfc", data=data
+                        session, water_body_id=wb.id, source="noaa_nwrfc", data=data
                     )
             wrote += 1
 
@@ -248,10 +245,20 @@ async def job_wdfw_stocking() -> None:
         log.warning("job_stale_fallback", extra={"job": "wdfw_stocking"})
         return
 
+    # Build name→water_body_id map for linking stocking events
+    name_to_wb_id: dict[str, object] = {}
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(select(WaterBody.id, WaterBody.name))
+        for row in result.all():
+            name_to_wb_id[row.name.upper()] = row.id
+
     async with AsyncSessionLocal() as session:
         async with session.begin():
             for r in records:
+                water_name = (r.get("water_name") or "").strip().upper()
+                wb_id = name_to_wb_id.get(water_name)
                 session.add(StockingEvent(
+                    water_body_id=wb_id,
                     stocked_date=_parse_date(r.get("stocked_date")),
                     species=r.get("species"),
                     count=r.get("count"),
@@ -260,8 +267,7 @@ async def job_wdfw_stocking() -> None:
                     fetched_at=datetime.now(tz=timezone.utc),
                 ))
 
-    # Propagate the most recent stocked_date per water body to spots.last_stocked_date.
-    # Matched by water_name (case-insensitive) — same approach used in seed_spots.py.
+    # Propagate most-recent stocked_date per water body
     latest_by_name: dict[str, object] = {}
     for r in records:
         water_name = (r.get("water_name") or "").strip()
@@ -272,40 +278,40 @@ async def job_wdfw_stocking() -> None:
         if key not in latest_by_name or stocked_date > latest_by_name[key]:
             latest_by_name[key] = stocked_date
 
-    spots_updated = 0
+    water_bodies_updated = 0
     if latest_by_name:
         async with AsyncSessionLocal() as session:
             async with session.begin():
                 for name_upper, stocked_date in latest_by_name.items():
                     result = await session.execute(
                         text("""
-                            UPDATE spots
+                            UPDATE water_bodies
                                SET last_stocked_date = :stocked_date
                              WHERE UPPER(name) = :name
                                AND (last_stocked_date IS NULL OR last_stocked_date < :stocked_date)
                         """),
                         {"name": name_upper, "stocked_date": stocked_date},
                     )
-                    spots_updated += result.rowcount
+                    water_bodies_updated += result.rowcount
 
     log.info(
         "job_done",
-        extra={"job": "wdfw_stocking", "records_stored": len(records), "spots_updated": spots_updated},
+        extra={"job": "wdfw_stocking", "records_stored": len(records), "water_bodies_updated": water_bodies_updated},
     )
 
 
 # ---------------------------------------------------------------------------
-# WTA trail reports — daily 3 AM, per spot
+# WTA trail reports — daily 3 AM, per water body
 # ---------------------------------------------------------------------------
 
 async def job_wta() -> None:
     log.info("job_start", extra={"job": "wta"})
-    spots = await _spots_with_wta_url()
+    water_bodies = await _water_bodies_with_wta_url()
     wrote = 0
 
-    for spot in spots:
+    for wb in water_bodies:
         try:
-            reports = await fetch_wta_reports(spot.wta_trail_url)
+            reports = await fetch_wta_reports(wb.wta_trail_url)
         except ScraperStructureError as exc:
             log.critical(
                 "scraper_structure_failure",
@@ -313,7 +319,7 @@ async def job_wta() -> None:
             )
             continue
         if reports is None:
-            log.warning("job_stale_fallback", extra={"job": "wta", "spot_id": str(spot.id)})
+            log.warning("job_stale_fallback", extra={"job": "wta", "water_body_id": str(wb.id)})
             continue
 
         if not reports:
@@ -323,7 +329,7 @@ async def job_wta() -> None:
             async with session.begin():
                 await _write_conditions_cache(
                     session,
-                    spot_id=spot.id,
+                    water_body_id=wb.id,
                     source="wta",
                     data={"reports": reports, "fetched_at": datetime.now(tz=timezone.utc).isoformat()},
                 )
@@ -333,24 +339,24 @@ async def job_wta() -> None:
 
 
 # ---------------------------------------------------------------------------
-# SNOTEL snowpack — daily 3 AM, per spot
+# SNOTEL snowpack — daily 3 AM, per water body
 # ---------------------------------------------------------------------------
 
 async def job_snotel() -> None:
     log.info("job_start", extra={"job": "snotel"})
-    spots = await _spots_with_snotel()
+    water_bodies = await _water_bodies_with_snotel()
     wrote = 0
 
-    for spot in spots:
-        data = await fetch_snotel(spot.snotel_station_id)
+    for wb in water_bodies:
+        data = await fetch_snotel(wb.snotel_station_id)
         if data is None:
-            log.warning("job_stale_fallback", extra={"job": "snotel", "spot_id": str(spot.id)})
-            await _mark_stale(spot.id, source="snotel")
+            log.warning("job_stale_fallback", extra={"job": "snotel", "water_body_id": str(wb.id)})
+            await _mark_stale(wb.id, source="snotel")
             continue
         async with AsyncSessionLocal() as session:
             async with session.begin():
                 await _write_conditions_cache(
-                    session, spot_id=spot.id, source="snotel", data=data
+                    session, water_body_id=wb.id, source="snotel", data=data
                 )
         wrote += 1
 
@@ -358,32 +364,32 @@ async def job_snotel() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Nightly Tier 1 scorer — 3:30 AM Pacific, all spots
+# Nightly Tier 1 scorer — 3:30 AM Pacific, all water bodies
 # ---------------------------------------------------------------------------
 
-async def job_score_all_spots() -> None:
-    log.info("job_start", extra={"job": "score_all_spots"})
+async def job_score_all_water_bodies() -> None:
+    log.info("job_start", extra={"job": "score_all_water_bodies"})
     from spots.scorer import compute_and_store_score
 
     async with AsyncSessionLocal() as session:
-        result = await session.execute(select(Spot))
-        spot_ids = [str(s.id) for s in result.scalars().all()]
+        result = await session.execute(select(WaterBody))
+        water_body_ids = [str(wb.id) for wb in result.scalars().all()]
 
     scored = 0
     failed = 0
-    for spot_id in spot_ids:
+    for wb_id in water_body_ids:
         try:
             async with AsyncSessionLocal() as session:
-                await compute_and_store_score(spot_id, session)
+                await compute_and_store_score(wb_id, session)
             scored += 1
         except Exception as exc:
             log.warning(
-                "score_spot_failed",
-                extra={"spot_id": spot_id, "error": str(exc)},
+                "score_water_body_failed",
+                extra={"water_body_id": wb_id, "error": str(exc)},
             )
             failed += 1
 
-    log.info("job_done", extra={"job": "score_all_spots", "scored": scored, "failed": failed})
+    log.info("job_done", extra={"job": "score_all_water_bodies", "scored": scored, "failed": failed})
 
 
 # ---------------------------------------------------------------------------
@@ -405,13 +411,13 @@ async def job_wdfw_regulations() -> None:
 # DB helpers
 # ---------------------------------------------------------------------------
 
-async def _write_conditions_cache(session, spot_id, source: str, data: dict) -> None:
-    """Insert a new conditions_cache row. spot_id may be None for global sources."""
+async def _write_conditions_cache(session, water_body_id, source: str, data: dict) -> None:
+    """Insert a new conditions_cache row. water_body_id may be None for global sources."""
     data_hash = hashlib.md5(
         json.dumps(data, sort_keys=True, separators=(",", ":"), default=str).encode()
     ).hexdigest()
     session.add(ConditionsCache(
-        spot_id=spot_id,
+        water_body_id=water_body_id,
         source=source,
         data=data,
         data_hash=data_hash,
@@ -419,13 +425,13 @@ async def _write_conditions_cache(session, spot_id, source: str, data: dict) -> 
     ))
 
 
-async def _mark_stale(spot_id, source: str) -> None:
-    """Set stale=True on the most recent conditions_cache entry for a spot+source."""
+async def _mark_stale(water_body_id, source: str) -> None:
+    """Set stale=True on the most recent conditions_cache entry for a water_body+source."""
     async with AsyncSessionLocal() as session:
         async with session.begin():
             result = await session.execute(
                 select(ConditionsCache)
-                .where(ConditionsCache.spot_id == spot_id)
+                .where(ConditionsCache.water_body_id == water_body_id)
                 .where(ConditionsCache.source == source)
                 .order_by(ConditionsCache.fetched_at.desc())
                 .limit(1)
@@ -435,28 +441,32 @@ async def _mark_stale(spot_id, source: str) -> None:
                 row.data = {**row.data, "stale": True}
 
 
-async def _spots_with_usgs_ids() -> list[Spot]:
+async def _water_bodies_with_usgs_ids() -> list[WaterBody]:
     async with AsyncSessionLocal() as session:
         result = await session.execute(
-            select(Spot).where(Spot.usgs_site_ids.is_not(None))
+            select(WaterBody).where(WaterBody.usgs_site_ids.is_not(None))
         )
         return list(result.scalars().all())
 
 
-async def _spots_with_wta_url() -> list[Spot]:
+async def _water_bodies_with_wta_url() -> list[WaterBody]:
     async with AsyncSessionLocal() as session:
         result = await session.execute(
-            select(Spot).where(Spot.wta_trail_url.is_not(None))
+            select(WaterBody).where(WaterBody.wta_trail_url.is_not(None))
         )
         return list(result.scalars().all())
 
 
-async def _spots_with_snotel() -> list[Spot]:
+async def _water_bodies_with_snotel() -> list[WaterBody]:
     async with AsyncSessionLocal() as session:
         result = await session.execute(
-            select(Spot).where(Spot.snotel_station_id.is_not(None))
+            select(WaterBody).where(WaterBody.snotel_station_id.is_not(None))
         )
         return list(result.scalars().all())
+
+
+# Backward-compat alias used by tests
+job_score_all_spots = job_score_all_water_bodies
 
 
 def _parse_date(value: str | None):

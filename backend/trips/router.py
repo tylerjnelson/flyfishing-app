@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth.middleware import get_current_user
 from db.connection import get_db
-from db.models import Conversation, Message, Note, Spot, User
+from db.models import Conversation, FishingSpot, Message, Note, User, WaterBody
 from sqlalchemy import delete, select, update
 from trips.service import (
     assign_spot,
@@ -45,7 +45,8 @@ def _trip_summary(trip) -> dict:
         "departure_time": trip.departure_time.isoformat() if trip.departure_time else None,
         "return_time": trip.return_time.isoformat() if trip.return_time else None,
         "state": trip.state,
-        "spot_id": str(trip.spot_id) if trip.spot_id else None,
+        "spot_id": str(trip.fishing_spot_id) if trip.fishing_spot_id else None,
+        "fishing_spot_id": str(trip.fishing_spot_id) if trip.fishing_spot_id else None,
         "session_intake": trip.session_intake or {},
     }
 
@@ -150,12 +151,18 @@ async def get_trip_endpoint(
             session_candidates = raw_candidates.get("candidates")
             drive_time_unavailable = raw_candidates.get("drive_time_unavailable", False)
 
-    # Fetch spot name if linked
+    # Fetch spot display name if linked
     spot_name = None
-    if trip.spot_id:
-        spot_result = await db.execute(select(Spot).where(Spot.id == trip.spot_id))
-        spot = spot_result.scalar_one_or_none()
-        spot_name = spot.name if spot else None
+    if trip.fishing_spot_id:
+        fs_wb_result = await db.execute(
+            select(FishingSpot, WaterBody)
+            .join(WaterBody, FishingSpot.water_body_id == WaterBody.id)
+            .where(FishingSpot.id == trip.fishing_spot_id)
+        )
+        row = fs_wb_result.one_or_none()
+        if row:
+            fs, wb = row
+            spot_name = wb.name if not fs.name else f"{wb.name} — {fs.name}"
 
     return {
         "trip": {

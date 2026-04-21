@@ -1,5 +1,8 @@
 """
 Spot query service — list, detail, search, and creation.
+
+list_spots / get_spot / search_spots operate on water_bodies (the display
+and scoring entity). save/unsave operate on fishing_spots.
 """
 
 import logging
@@ -10,7 +13,7 @@ from uuid import UUID
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.models import EmergencyClosure, SavedSpot, Spot
+from db.models import EmergencyClosure, FishingSpot, SavedSpot, Spot, WaterBody
 
 log = logging.getLogger(__name__)
 
@@ -22,28 +25,28 @@ async def list_spots(
     fly_only: bool = False,
     limit: int = 50,
     offset: int = 0,
-) -> list[Spot]:
-    """Return spots sorted by score desc, with optional type and legality filters."""
-    q = select(Spot)
+) -> list[WaterBody]:
+    """Return water bodies sorted by score desc, with optional type and legality filters."""
+    q = select(WaterBody)
     if type_filter:
-        q = q.where(Spot.type == type_filter)
+        q = q.where(WaterBody.type == type_filter)
     if fly_only:
-        q = q.where(Spot.fly_fishing_legal.is_(True))
-    q = q.order_by(Spot.score.desc()).limit(limit).offset(offset)
+        q = q.where(WaterBody.fly_fishing_legal.is_(True))
+    q = q.order_by(WaterBody.score.desc()).limit(limit).offset(offset)
     result = await db.execute(q)
     return list(result.scalars().all())
 
 
-async def get_spot(spot_id: UUID, db: AsyncSession) -> Spot | None:
-    result = await db.execute(select(Spot).where(Spot.id == spot_id))
+async def get_spot(spot_id: UUID, db: AsyncSession) -> WaterBody | None:
+    result = await db.execute(select(WaterBody).where(WaterBody.id == spot_id))
     return result.scalar_one_or_none()
 
 
 async def get_spot_closures(spot_id: UUID, db: AsyncSession) -> list[EmergencyClosure]:
-    """Return active (non-expired) closures for a spot."""
+    """Return active (non-expired) closures for a water body."""
     result = await db.execute(
         select(EmergencyClosure)
-        .where(EmergencyClosure.spot_id == spot_id)
+        .where(EmergencyClosure.water_body_id == spot_id)
         .where(
             EmergencyClosure.expires.is_(None)
             | (EmergencyClosure.expires >= date.today())
@@ -56,10 +59,7 @@ async def get_spot_closures(spot_id: UUID, db: AsyncSession) -> list[EmergencyCl
 async def create_spot(name: str, spot_type: str, db: AsyncSession) -> Spot:
     """
     Create a minimal spot from user input (debrief or manual entry).
-
-    Latitude/longitude are left null — null coordinates signal that this spot
-    needs geocoding. Listed by GET /api/spots/unresolved until resolved.
-    seed_confidence='unvalidated', source='notes'.
+    Still creates in the legacy spots table; resolves to water_body in Phase 6.
     """
     from rag.embedder import embed_text
 
@@ -81,11 +81,7 @@ async def create_spot(name: str, spot_type: str, db: AsyncSession) -> Spot:
 
 
 async def list_unresolved_spots(db: AsyncSession) -> list[Spot]:
-    """
-    Return spots with seed_confidence='unvalidated' and null coordinates.
-    These were created from debrief or user input and need geocoding before
-    they can appear in recommendations.
-    """
+    """Return legacy spots with unvalidated confidence and null coordinates."""
     result = await db.execute(
         select(Spot).where(
             Spot.seed_confidence == "unvalidated",
@@ -95,40 +91,39 @@ async def list_unresolved_spots(db: AsyncSession) -> list[Spot]:
     return list(result.scalars().all())
 
 
-async def save_spot(user_id: UUID, spot_id: UUID, db: AsyncSession) -> SavedSpot:
+async def save_spot(user_id: UUID, fishing_spot_id: UUID, db: AsyncSession) -> SavedSpot:
     """
-    Save a spot for a user. Idempotent — returns the existing record if already saved.
-    Raises ValueError if the spot does not exist.
+    Save a fishing spot for a user. Idempotent.
+    Raises ValueError if the fishing spot does not exist.
     """
-    spot = await get_spot(spot_id, db)
-    if not spot:
+    fs_result = await db.execute(select(FishingSpot).where(FishingSpot.id == fishing_spot_id))
+    fs = fs_result.scalar_one_or_none()
+    if not fs:
         raise ValueError("spot_not_found")
 
     existing = await db.execute(
         select(SavedSpot).where(
             SavedSpot.user_id == user_id,
-            SavedSpot.spot_id == spot_id,
+            SavedSpot.fishing_spot_id == fishing_spot_id,
         )
     )
     row = existing.scalar_one_or_none()
     if row:
         return row
 
-    saved = SavedSpot(id=uuid.uuid4(), user_id=user_id, spot_id=spot_id)
+    saved = SavedSpot(id=uuid.uuid4(), user_id=user_id, fishing_spot_id=fishing_spot_id)
     db.add(saved)
     await db.flush()
-    log.info("spot_saved", extra={"user_id": str(user_id), "spot_id": str(spot_id)})
+    log.info("spot_saved", extra={"user_id": str(user_id), "fishing_spot_id": str(fishing_spot_id)})
     return saved
 
 
-async def unsave_spot(user_id: UUID, spot_id: UUID, db: AsyncSession) -> bool:
-    """
-    Remove a saved spot. Returns True if deleted, False if it was not saved.
-    """
+async def unsave_spot(user_id: UUID, fishing_spot_id: UUID, db: AsyncSession) -> bool:
+    """Remove a saved spot. Returns True if deleted, False if it was not saved."""
     existing = await db.execute(
         select(SavedSpot).where(
             SavedSpot.user_id == user_id,
-            SavedSpot.spot_id == spot_id,
+            SavedSpot.fishing_spot_id == fishing_spot_id,
         )
     )
     row = existing.scalar_one_or_none()
@@ -136,7 +131,7 @@ async def unsave_spot(user_id: UUID, spot_id: UUID, db: AsyncSession) -> bool:
         return False
     await db.delete(row)
     await db.flush()
-    log.info("spot_unsaved", extra={"user_id": str(user_id), "spot_id": str(spot_id)})
+    log.info("spot_unsaved", extra={"user_id": str(user_id), "fishing_spot_id": str(fishing_spot_id)})
     return True
 
 
@@ -150,19 +145,18 @@ async def list_saved_spots(user_id: UUID, db: AsyncSession) -> list[SavedSpot]:
     return list(result.scalars().all())
 
 
-async def search_spots(query: str, db: AsyncSession, *, limit: int = 10) -> list[Spot]:
+async def search_spots(query: str, db: AsyncSession, *, limit: int = 10) -> list[WaterBody]:
     """
-    Fuzzy name search via pg_trgm similarity.
+    Fuzzy name search via pg_trgm similarity against water_bodies.
     Falls back to ilike prefix match if no trgm hits above 0.1 threshold.
     """
     clean = query.strip()
     if not clean:
         return []
 
-    # pg_trgm similarity — index active from Phase 1 migration
     trgm_result = await db.execute(
         text(
-            "SELECT id FROM spots "
+            "SELECT id FROM water_bodies "
             "WHERE similarity(name, :q) > 0.1 "
             "ORDER BY similarity(name, :q) DESC "
             "LIMIT :limit"
@@ -172,13 +166,11 @@ async def search_spots(query: str, db: AsyncSession, *, limit: int = 10) -> list
     ids = [row[0] for row in trgm_result.all()]
 
     if ids:
-        result = await db.execute(select(Spot).where(Spot.id.in_(ids)))
-        spots_by_id = {str(s.id): s for s in result.scalars().all()}
-        # Preserve trgm relevance order
-        return [spots_by_id[str(i)] for i in ids if str(i) in spots_by_id]
+        result = await db.execute(select(WaterBody).where(WaterBody.id.in_(ids)))
+        wbs_by_id = {str(wb.id): wb for wb in result.scalars().all()}
+        return [wbs_by_id[str(i)] for i in ids if str(i) in wbs_by_id]
 
-    # Fallback: prefix ilike for short queries or low-similarity cases
     result = await db.execute(
-        select(Spot).where(Spot.name.ilike(f"{clean}%")).limit(limit)
+        select(WaterBody).where(WaterBody.name.ilike(f"{clean}%")).limit(limit)
     )
     return list(result.scalars().all())

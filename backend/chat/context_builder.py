@@ -36,11 +36,12 @@ from db.models import (
     ConditionsCache,
     Conversation,
     EmergencyClosure,
+    FishingSpot,
     Message,
     Note,
-    Spot,
     Trip,
     User,
+    WaterBody,
 )
 from prompts.registry import DEBRIEF_CONVERSATION_PROMPT, RECOMMENDATION_SYSTEM_PROMPT
 from rag.embedder import embed_text
@@ -87,41 +88,32 @@ class BuildResult:
 # [1] Hard filter helpers
 # ---------------------------------------------------------------------------
 
-def _matches_water_type(spot: Spot, water_types: list[str]) -> bool:
+def _matches_water_type(water_body: WaterBody, water_types: list[str]) -> bool:
     if not water_types or "any" in water_types:
         return True
-    return spot.type in water_types
+    return water_body.type in water_types
 
 
 _CLOSURE_KEYWORDS: frozenset[str] = frozenset(
     {"close", "closed", "closure", "closes", "prohibited", "emergency"}
 )
 
-# Generic geographic type words stripped before name matching to avoid
-# false positives where two spots share "River", "Creek", "Lake" etc.
 _GEO_TYPE_WORDS: frozenset[str] = frozenset({
     "river", "creek", "lake", "pond", "reservoir", "stream",
     "tributary", "bay", "channel", "fork", "run",
 })
 
 
-def _has_active_closure(spot_name: str, active_closures: list) -> bool:
+def _has_active_closure(water_body_name: str, active_closures: list) -> bool:
     """
-    Return True if any active closure's rule_text references this spot by name
+    Return True if any active closure's rule_text references this water body by name
     and contains at least one closure keyword.
-
-    Generic geographic words ("River", "Creek", "Lake", …) are excluded from
-    the name match to prevent false positives between different spots that share
-    the same type suffix.  All remaining name words must appear in the rule text.
-
-    'active_closures' contains only date-filtered rows (effective <= today <= expires).
     """
-    if not active_closures or not spot_name:
+    if not active_closures or not water_body_name:
         return False
-    all_name_words = frozenset(spot_name.lower().split())
+    all_name_words = frozenset(water_body_name.lower().split())
     content_words = all_name_words - _GEO_TYPE_WORDS
     if not content_words:
-        # Spot name is entirely generic type words — fall back to full name match
         content_words = all_name_words
     for cl in active_closures:
         text_lower = (cl.rule_text or "").lower()
@@ -162,134 +154,88 @@ def _species_temp_ceiling(target_species: list[str]) -> float | None:
     return min(ceilings) if ceilings else None
 
 
-def _passes_conditions_filter(
-    spot: Spot,
+def _cfs_out_of_range(
+    water_body: WaterBody,
     usgs_data: dict | None,
-    target_species: list[str],
 ) -> bool:
     """
-    Hard conditions filter for rivers and creeks.
-    Lakes are not CFS-filtered; alpine lakes handled separately via _alpine_access_ok.
-    Returns True if spot should remain in candidates.
+    True when live CFS is outside min/max and realtime conditions are available.
+    This is the only hard conditions filter for rivers/creeks; temperature,
+    turbidity, and other signals are soft penalties in _compute_volatile_delta.
     """
-    if spot.type not in ("river", "creek"):
-        return True
-    if not spot.has_realtime_conditions or usgs_data is None:
-        return True  # no data → give benefit of the doubt
-
+    if water_body.type not in ("river", "creek"):
+        return False
+    if not water_body.has_realtime_conditions or usgs_data is None:
+        return False
     cfs = usgs_data.get("cfs")
-    temp_f = usgs_data.get("temp_f")
-    turbidity = usgs_data.get("turbidity_fnu")
-
-    if cfs is not None:
-        if spot.min_cfs and cfs < float(spot.min_cfs):
-            return False
-        if spot.max_cfs and cfs > float(spot.max_cfs):
-            return False
-
-    if temp_f is not None:
-        ceiling = _species_temp_ceiling(target_species)
-        if ceiling and temp_f > ceiling:
-            return False
-        if spot.min_temp_f and temp_f < float(spot.min_temp_f):
-            return False
-
-    if turbidity is not None and turbidity > 100:
+    if cfs is None:
         return False
-
-    return True
-
-
-def _alpine_access_ok(
-    spot: Spot,
-    snotel_data: dict | None,
-    today: date,
-) -> bool:
-    """
-    Estimate alpine lake seasonal access. Returns False only when ice-on is
-    highly likely. Uncertain cases are included (LLM context will flag them).
-    """
-    if not spot.is_alpine:
+    if water_body.min_cfs and cfs < float(water_body.min_cfs):
         return True
-
-    if snotel_data:
-        swe = snotel_data.get("snow_water_equivalent_in")
-        if swe is not None and swe > 30:
-            return False  # heavy snowpack — ice-on very likely
-
-    # Elevation + date heuristic when SNOTEL unavailable
-    elev = spot.elevation_ft or 0
-    month = today.month
-    if elev >= 6000 and month < 7:
-        return False
-    if elev >= 5000 and month < 6:
-        return False
-    if elev >= 4000 and month < 5:
-        return False
-
-    return True
+    if water_body.max_cfs and cfs > float(water_body.max_cfs):
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
 # [1.5] Real-time conditions fetch — session open (§4.1)
 # ---------------------------------------------------------------------------
 
-async def _fetch_and_cache_realtime(spots: list[Spot]) -> None:
+async def _fetch_and_cache_realtime(fishing_spots: list, water_bodies: list[WaterBody]) -> None:
     """
-    Fetch USGS gauge data and NOAA NWS forecasts for candidate spots in parallel.
-    Writes fresh rows to conditions_cache so the cond_by query in build_context()
-    picks up live data on this pipeline run.
-
-    Called once per full pipeline run (skipped when session_candidates already
-    populated and force_rerun=False — callers own that guard).
-
-    Circuit breaker behaviour: if USGS or NWS is down the fetcher returns None
-    and no row is written; cond_by falls back to the last cached entry (stale).
+    Fetch USGS, NOAA NWS, and AirNow data for candidate spots in parallel.
+    Writes fresh rows to conditions_cache keyed by water_body_id.
     """
     import hashlib
     import json
 
-    usgs_spots = [(s, s.usgs_site_ids[0]) for s in spots if s.usgs_site_ids]
-    geo_spots = [s for s in spots if s.latitude is not None and s.longitude is not None]
+    wb_by_id = {str(wb.id): wb for wb in water_bodies}
 
-    if not usgs_spots and not geo_spots:
+    usgs_pairs = [
+        (fs, wb_by_id[str(fs.water_body_id)])
+        for fs in fishing_spots
+        if fs.water_body_id and str(fs.water_body_id) in wb_by_id
+        and wb_by_id[str(fs.water_body_id)].usgs_site_ids
+    ]
+    geo_spots = [fs for fs in fishing_spots if fs.latitude is not None and fs.longitude is not None]
+
+    if not usgs_pairs and not geo_spots:
         return
 
-    # Parallel fetch — circuit breakers handle individual failures gracefully
     usgs_results = await asyncio.gather(
-        *[fetch_usgs_gauge(site_id) for _, site_id in usgs_spots]
+        *[fetch_usgs_gauge(wb.usgs_site_ids[0]) for _, wb in usgs_pairs]
     )
     nws_results = await asyncio.gather(
-        *[fetch_noaa_nws(float(s.latitude), float(s.longitude)) for s in geo_spots]
+        *[fetch_noaa_nws(float(fs.latitude), float(fs.longitude)) for fs in geo_spots]
     )
     airnow_results = await asyncio.gather(
-        *[fetch_airnow(float(s.latitude), float(s.longitude)) for s in geo_spots]
+        *[fetch_airnow(float(fs.latitude), float(fs.longitude)) for fs in geo_spots]
     )
 
-    to_write: list[tuple] = []  # (spot_id, source, data_dict)
-    for (spot, _), data in zip(usgs_spots, usgs_results):
+    to_write: list[tuple] = []  # (water_body_id, source, data_dict)
+    for (fs, wb), data in zip(usgs_pairs, usgs_results):
         if data is not None:
-            to_write.append((spot.id, "usgs", data))
-    for spot, data in zip(geo_spots, nws_results):
+            to_write.append((wb.id, "usgs", data))
+    for fs, data in zip(geo_spots, nws_results):
         if data is not None:
-            to_write.append((spot.id, "noaa_nws", data))
-    for spot, data in zip(geo_spots, airnow_results):
+            to_write.append((fs.water_body_id, "noaa_nws", data))
+    for fs, data in zip(geo_spots, airnow_results):
         if data is not None:
-            to_write.append((spot.id, "airnow", data))
+            to_write.append((fs.water_body_id, "airnow", data))
 
     if not to_write:
         return
 
     async with AsyncSessionLocal() as session:
         async with session.begin():
-            for spot_id, source, data in to_write:
+            for water_body_id, source, data in to_write:
                 data_hash = hashlib.md5(
                     json.dumps(
                         data, sort_keys=True, separators=(",", ":"), default=str
                     ).encode()
                 ).hexdigest()
                 session.add(ConditionsCache(
-                    spot_id=spot_id,
+                    water_body_id=water_body_id,
                     source=source,
                     data=data,
                     data_hash=data_hash,
@@ -298,7 +244,7 @@ async def _fetch_and_cache_realtime(spots: list[Spot]) -> None:
 
     log.info(
         "realtime_conditions_fetched",
-        extra={"usgs_count": len(usgs_spots), "nws_count": len(geo_spots),
+        extra={"usgs_count": len(usgs_pairs), "nws_count": len(geo_spots),
                "airnow_count": len(geo_spots), "written": len(to_write)},
     )
 
@@ -307,14 +253,10 @@ async def _fetch_and_cache_realtime(spots: list[Spot]) -> None:
 # [2] Tier 2 volatile delta helpers (§7.5)
 # ---------------------------------------------------------------------------
 
-_FUTURE_TRIP_HOURS = 24  # hours ahead before NWRFC forecast replaces live USGS CFS
+_FUTURE_TRIP_HOURS = 24
 
 
 def _sum_7day_precip_estimate(daily_periods: list[dict]) -> float:
-    """
-    Sum precipitation across up to 14 half-day NWS periods (~7 days).
-    Uses probabilityOfPrecipitation as a proxy for intensity.
-    """
     total = 0.0
     for period in daily_periods[:14]:
         pop = (period.get("probabilityOfPrecipitation") or {}).get("value") or 0
@@ -326,12 +268,6 @@ def _sum_7day_precip_estimate(daily_periods: list[dict]) -> float:
 
 
 def _nwrfc_cfs_at(nwrfc_data: dict, departure_time: datetime) -> float | None:
-    """
-    Return the NWRFC forecast CFS value closest to departure_time.
-
-    NWRFC stores flow as secondary (kcfs); multiply by 1000 to get CFS.
-    Returns None if forecast list is empty or all entries lack required fields.
-    """
     forecasts = (nwrfc_data or {}).get("forecast") or []
     best_cfs: float | None = None
     best_diff: float | None = None
@@ -341,58 +277,88 @@ def _nwrfc_cfs_at(nwrfc_data: dict, departure_time: datetime) -> float | None:
         if valid_str is None or secondary is None:
             continue
         try:
-            # NWPS validTime may be offset-aware or naive; normalise to UTC
             valid_dt = datetime.fromisoformat(valid_str.replace("Z", "+00:00"))
             if valid_dt.tzinfo is None:
                 valid_dt = valid_dt.replace(tzinfo=timezone.utc)
             diff = abs((valid_dt - departure_time).total_seconds())
             if best_diff is None or diff < best_diff:
                 best_diff = diff
-                best_cfs = float(secondary) * 1000.0  # kcfs → CFS
+                best_cfs = float(secondary) * 1000.0
         except (ValueError, TypeError):
             continue
     return best_cfs
 
 
-def _species_match_delta(target_species: list[str], spot: Spot) -> float:
+def _species_match_delta(target_species: list[str], water_body: WaterBody) -> float:
     """
-    Compare session target_species against spot.species_primary.
+    Compare session target_species against water_body.species_primary.
     Full match → +1.5, partial → +0.5, no match → -0.5.
     Returns 0.0 if either side is empty.
     """
-    if not target_species or not spot.species_primary:
+    if not target_species or not water_body.species_primary:
         return 0.0
     target_lower = {s.lower() for s in target_species}
-    spot_lower = {s.lower() for s in spot.species_primary}
+    spot_lower = {s.lower() for s in water_body.species_primary}
     if target_lower & spot_lower == target_lower:
-        return 1.5   # full match — spot holds all target species
+        return 1.5
     if target_lower & spot_lower:
-        return 0.5   # partial match — at least one target species present
-    return -0.5      # no match — spot likely holds different species
+        return 0.5
+    return -0.5
 
 
 def _compute_volatile_delta(
-    spot: Spot,
+    water_body: WaterBody,
     usgs_data: dict | None,
     nws_data: dict | None,
     nwrfc_data: dict | None,
     target_species: list[str],
     departure_time: datetime | None = None,
     airnow_data: dict | None = None,
-) -> float:
+    snotel_data: dict | None = None,
+    active_fires: list[dict] | None = None,
+    spot_lat: float | None = None,
+    spot_lon: float | None = None,
+) -> tuple[float, list[str]]:
     """
-    Compute signed volatile delta per §7.5. Added to spots.score to produce
-    session_score. Never written back to the spots table.
+    Compute signed volatile delta per §7.5. Returns (delta, warnings).
+    delta is added to water_body.score to produce session_score (never written back).
+    warnings are surfaced in the conditions block for the LLM.
 
-    For trips departing >24h from now, NWRFC forecast CFS replaces live USGS CFS
-    for the proximity delta (§4.2 / §4.4 FORECAST wiring). Water temp and trend
-    signals always come from live USGS (NWRFC does not provide these).
+    Hard filters (closures, CFS out-of-range) are handled separately.
+    Everything else — wildfire, alpine access, AQI, turbidity, temp — is a
+    scored penalty here so the LLM can communicate the issue to the angler.
     """
     delta = 0.0
+    warnings: list[str] = []
     now = datetime.now(tz=timezone.utc)
+    today = now.date()
 
-    if spot.type in ("river", "creek"):
-        # Decide CFS source: NWRFC forecast for future trips, live USGS otherwise
+    # Wildfire proximity penalty
+    if active_fires and spot_lat is not None and spot_lon is not None:
+        if _wildfire_near_spot(spot_lat, spot_lon, active_fires):
+            delta -= 2.5
+            warnings.append("Active wildfire within 25km — smoke and access risk")
+
+    # Alpine access penalties
+    if water_body.is_alpine:
+        if snotel_data:
+            swe = snotel_data.get("snow_water_equivalent_in")
+            if swe is not None and swe > 30:
+                delta -= 2.5
+                warnings.append(f"Heavy snowpack ({swe:.1f}\" SWE) — access uncertain")
+
+        elev = water_body.elevation_ft or 0
+        month = today.month
+        blocked = (
+            (elev >= 6000 and month < 7)
+            or (elev >= 5000 and month < 6)
+            or (elev >= 4000 and month < 5)
+        )
+        if blocked:
+            delta -= 2.0
+            warnings.append(f"Early season at elevation ({elev:,} ft) — access uncertain")
+
+    if water_body.type in ("river", "creek"):
         cfs: float | None = None
         if (
             nwrfc_data
@@ -400,24 +366,18 @@ def _compute_volatile_delta(
             and (departure_time - now).total_seconds() > _FUTURE_TRIP_HOURS * 3600
         ):
             cfs = _nwrfc_cfs_at(nwrfc_data, departure_time)
-            log.debug(
-                "volatile_delta_using_nwrfc",
-                extra={"spot": spot.name, "forecast_cfs": cfs},
-            )
         elif usgs_data:
             cfs = usgs_data.get("cfs")
 
-        if cfs is not None and spot.min_cfs and spot.max_cfs:
-            ideal = (float(spot.min_cfs) + float(spot.max_cfs)) / 2
+        if cfs is not None and water_body.min_cfs and water_body.max_cfs:
+            ideal = (float(water_body.min_cfs) + float(water_body.max_cfs)) / 2
             if ideal > 0:
                 pct_off = abs(cfs - ideal) / ideal
                 if pct_off <= 0.10:
                     delta += 1.0
                 elif pct_off <= 0.25:
                     delta += 0.5
-                # 25–50% off → 0 delta
 
-        # Trend and temp always from live USGS (NWRFC has no temp / trend)
         if usgs_data:
             trend = usgs_data.get("trend")
             if trend == "dropping":
@@ -427,13 +387,26 @@ def _compute_volatile_delta(
 
             temp_f = usgs_data.get("temp_f")
             if temp_f is not None:
+                # Penalty for above-ceiling and near-ceiling temps
                 ceiling = _species_temp_ceiling(target_species)
                 if ceiling:
                     gap = ceiling - temp_f
                     if gap <= 2:
                         delta -= 2.5
+                        if gap <= 0:
+                            warnings.append(f"Water temp above safe fishing threshold ({temp_f:.1f}°F)")
                     elif gap <= 5:
                         delta -= 1.0
+
+                # Penalty for temp below minimum active feeding threshold
+                if water_body.min_temp_f and temp_f < float(water_body.min_temp_f):
+                    delta -= 1.0
+                    warnings.append(f"Water temp below active feeding threshold ({temp_f:.1f}°F)")
+
+            turbidity = usgs_data.get("turbidity_fnu")
+            if turbidity is not None and turbidity > 100:
+                delta -= 1.5
+                warnings.append(f"High turbidity: {turbidity:.0f} FNU")
 
     if nws_data:
         daily = nws_data.get("daily_forecast") or []
@@ -454,12 +427,17 @@ def _compute_volatile_delta(
 
     if airnow_data:
         aqi = airnow_data.get("aqi")
-        if aqi is not None and 151 <= aqi <= 200:
-            delta -= 1.0
+        if aqi is not None:
+            if aqi > 200:
+                delta -= 3.0
+                category = airnow_data.get("category") or "Hazardous"
+                warnings.append(f"Air quality: {category} (AQI {aqi})")
+            elif aqi >= 151:
+                delta -= 1.0
 
-    delta += _species_match_delta(target_species, spot)
+    delta += _species_match_delta(target_species, water_body)
 
-    return delta
+    return delta, warnings
 
 
 # ---------------------------------------------------------------------------
@@ -469,9 +447,7 @@ def _compute_volatile_delta(
 def _apply_variety_rotation(candidates: list[dict]) -> list[dict]:
     """
     Ensure at least one spot with last_visited null or > 60 days ago appears
-    in the top 5. If none of the current top 5 qualifies, inject the
-    highest-scoring qualifying spot from the pool at position 5, displacing
-    the lowest-ranked top-5 candidate.
+    in the top 5.
     """
     today = date.today()
 
@@ -510,10 +486,7 @@ async def _hybrid_rag(
     target_species: list[str],
     current_cfs: float | None,
 ) -> list[dict]:
-    """
-    RRF hybrid search: pgvector cosine + tsvector FTS → top-10, re-ranked.
-    Returns a list of note dicts for the context notes block.
-    """
+    """RRF hybrid search: pgvector cosine + tsvector FTS → top-10, re-ranked."""
     try:
         embedding = await embed_text(query)
     except Exception as exc:
@@ -544,7 +517,7 @@ async def _hybrid_rag(
             LIMIT 20
         )
         SELECT n.id, n.content, n.source_type, n.note_date,
-               n.species, n.outcome, n.approx_cfs, n.spot_id,
+               n.species, n.outcome, n.approx_cfs, n.fishing_spot_id,
                (1.0 / (60 + COALESCE(v.rank, 21)) +
                 1.0 / (60 + COALESCE(k.rank, 21))) AS rrf_score
         FROM notes n
@@ -565,7 +538,6 @@ async def _hybrid_rag(
         log.warning("rrf_query_failed", extra={"reason": str(exc)})
         return []
 
-    # Re-rank by recency (same season), species match, CFS similarity, outcome (§6.6)
     today = date.today()
     scored = []
     for r in rows:
@@ -575,7 +547,7 @@ async def _hybrid_rag(
         if note_date:
             season_delta = abs((note_date.month - today.month + 6) % 12 - 6)
             if season_delta <= 1:
-                boost += 0.30   # same season in prior years
+                boost += 0.30
 
         note_species = r["species"] or []
         if any(sp in " ".join(note_species).lower() for sp in target_species):
@@ -597,14 +569,14 @@ async def _hybrid_rag(
 # [6] Map surfacing (§6.7)
 # ---------------------------------------------------------------------------
 
-async def _fetch_maps(db, spot_ids: list[str]) -> list[dict]:
-    """Retrieve all map notes for the given spot IDs (no cap per §6.7)."""
-    if not spot_ids:
+async def _fetch_maps(db, fishing_spot_ids: list[str]) -> list[dict]:
+    """Retrieve all map notes for the given fishing_spot IDs."""
+    if not fishing_spot_ids:
         return []
     result = await db.execute(
-        select(Note.id, Note.spot_id, Note.image_path, Note.note_date)
+        select(Note.id, Note.fishing_spot_id, Note.image_path, Note.note_date)
         .where(Note.source_type == "map")
-        .where(Note.spot_id.in_(spot_ids))
+        .where(Note.fishing_spot_id.in_(fishing_spot_ids))
         .where(Note.image_path.is_not(None))
     )
     return [dict(r._mapping) for r in result.all()]
@@ -622,7 +594,12 @@ def _format_conditions_block(candidates: list[dict]) -> str:
         nws = conds.get("noaa_nws") or {}
         wta = conds.get("wta") or {}
         airnow = conds.get("airnow") or {}
-        lines.append(f"\n=== {c['spot_name']} ===")
+
+        # Display water_body_name; append spot name when spot has its own name
+        heading = c["water_body_name"]
+        if c.get("spot_name"):
+            heading = f"{c['water_body_name']} — {c['spot_name']}"
+        lines.append(f"\n=== {heading} ===")
 
         if c.get("is_haversine"):
             lines.append(f"Distance: ~{c.get('straight_line_miles', '?')} miles straight-line")
@@ -664,6 +641,10 @@ def _format_conditions_block(candidates: list[dict]) -> str:
                 confidence = r.get("confidence", "low")
                 text = (r.get("report_text") or "")[:200]
                 lines.append(f"  [{date_str}] ({confidence} confidence) {text}")
+
+        # Surface penalty warnings so the LLM can advise the angler
+        for w in (c.get("warnings") or []):
+            lines.append(f"Advisory: {w}")
 
     return "\n".join(lines)
 
@@ -708,23 +689,23 @@ async def _build_debrief_context(
     query: str,
     db,
 ) -> BuildResult:
-    """
-    Minimal context for debrief conversations.
-
-    Skips all spot filtering, scoring, and RAG retrieval. Injects trip context
-    (planned spot name + dates) alongside DEBRIEF_CONVERSATION_PROMPT.
-    """
-    # Planned spot context
+    """Minimal context for debrief conversations."""
     trip_context_lines: list[str] = []
-    if trip.spot_id:
-        spot_result = await db.execute(select(Spot).where(Spot.id == trip.spot_id))
-        spot = spot_result.scalar_one_or_none()
-        if spot:
-            trip_context_lines.append(f"PLANNED SPOT: {spot.name}")
+    if trip.fishing_spot_id:
+        fs_result = await db.execute(
+            select(FishingSpot, WaterBody)
+            .join(WaterBody, FishingSpot.water_body_id == WaterBody.id)
+            .where(FishingSpot.id == trip.fishing_spot_id)
+        )
+        row = fs_result.one_or_none()
+        if row:
+            fs, wb = row
+            display = wb.name if not fs.name else f"{wb.name} — {fs.name}"
+            trip_context_lines.append(f"PLANNED SPOT: {display}")
     elif conversation.session_candidates:
         candidates = (conversation.session_candidates or {}).get("candidates", [])
         if candidates:
-            trip_context_lines.append(f"PLANNED SPOT: {candidates[0].get('spot_name', 'unknown')}")
+            trip_context_lines.append(f"PLANNED SPOT: {candidates[0].get('water_body_name', 'unknown')}")
 
     if trip.trip_date:
         trip_context_lines.append(f"TRIP DATE: {trip.trip_date}")
@@ -733,7 +714,6 @@ async def _build_debrief_context(
 
     trip_context = "\n".join(trip_context_lines)
 
-    # Conversation history
     msg_result = await db.execute(
         select(Message.role, Message.content)
         .where(Message.conversation_id == conversation.id)
@@ -779,13 +759,7 @@ async def build_context(
     force_rerun=True is passed by POST /chat/confirm-filter when the user
     confirms a FILTER_UPDATE — triggers a full pipeline re-run and replaces
     session_candidates.
-
-    When trip.state == POST_TRIP, the full recommendation pipeline is skipped
-    and a debrief conversation context is returned instead.
     """
-    # ------------------------------------------------------------------
-    # POST_TRIP — debrief conversation path (§13.6)
-    # ------------------------------------------------------------------
     if trip.state == "POST_TRIP":
         return await _build_debrief_context(user, trip, conversation, query, db)
 
@@ -798,8 +772,6 @@ async def build_context(
     max_drive_minutes = int(intake.get("max_drive_minutes") or _DEFAULT_MAX_DRIVE_MINUTES)
     departure_time = trip.departure_time or datetime.now(tz=timezone.utc)
 
-    # Departure location: session override (pivot) takes precedence over profile home.
-    # home_location from prefs may be a raw string (not yet geocoded) — treat as label-only.
     departure_location = intake.get("departure_location") or prefs.get("home_location") or {}
     if isinstance(departure_location, str):
         departure_location = {"label": departure_location, "lat": None, "lon": None}
@@ -821,35 +793,38 @@ async def build_context(
         # --------------------------------------------------------------
         # [1] Hard pre-LLM filters
         # --------------------------------------------------------------
-        spot_result = await db.execute(
-            select(Spot).where(
-                Spot.latitude.is_not(None),
-                Spot.longitude.is_not(None),
-                Spot.fly_fishing_legal.is_(True),
-            )
+        # JOIN fishing_spots → water_bodies; only spots with coords
+        fs_wb_result = await db.execute(
+            select(FishingSpot, WaterBody)
+            .join(WaterBody, FishingSpot.water_body_id == WaterBody.id)
+            .where(WaterBody.fly_fishing_legal.is_(True))
         )
-        all_spots: list[Spot] = spot_result.scalars().all()
+        all_pairs: list[tuple] = fs_wb_result.all()  # [(FishingSpot, WaterBody)]
 
         # Water type filter
-        spots = [s for s in all_spots if _matches_water_type(s, water_types)]
+        pairs = [
+            (fs, wb) for fs, wb in all_pairs
+            if _matches_water_type(wb, water_types)
+        ]
 
         # Rough geo pre-filter before calling HERE
         if origin_lat and origin_lon:
-            spots = [
-                s for s in spots
+            pairs = [
+                (fs, wb) for fs, wb in pairs
                 if haversine_km(
-                    float(s.latitude), float(s.longitude),
+                    float(fs.latitude), float(fs.longitude),
                     origin_lat, origin_lon,
                 ) <= _PREFILTER_KM
             ]
 
-        spot_ids = [s.id for s in spots]
+        fishing_spots = [fs for fs, _ in pairs]
+        water_bodies = [wb for _, wb in pairs]
+        water_body_ids = [wb.id for wb in water_bodies]
 
-        # Real-time conditions fetch — USGS + NWS in parallel (§4.1)
-        # Writes fresh rows to conditions_cache before cond_by query reads them.
-        await _fetch_and_cache_realtime(spots)
+        # Real-time conditions fetch
+        await _fetch_and_cache_realtime(fishing_spots, water_bodies)
 
-        # Active emergency closures — text-based matching, no spot_id required
+        # Active emergency closures
         today_date = date.today()
         closure_result = await db.execute(
             select(EmergencyClosure).where(
@@ -859,108 +834,109 @@ async def build_context(
         )
         active_closures: list = closure_result.scalars().all()
 
-        # InciWeb active WA fires (global — spot_id IS NULL in conditions_cache)
+        # InciWeb active WA fires
         inciweb_result = await db.execute(
             select(ConditionsCache.data)
             .where(ConditionsCache.source == "inciweb")
-            .where(ConditionsCache.spot_id.is_(None))
+            .where(ConditionsCache.water_body_id.is_(None))
             .order_by(ConditionsCache.fetched_at.desc())
             .limit(1)
         )
         inciweb_row = inciweb_result.scalar_one_or_none()
         active_fires: list[dict] = (inciweb_row or {}).get("active_wa_fires", [])
 
-        # Conditions cache for all candidate spots
+        # Conditions cache keyed by (water_body_id, source)
         cond_result = await db.execute(
-            select(ConditionsCache).where(ConditionsCache.spot_id.in_(spot_ids))
+            select(ConditionsCache).where(ConditionsCache.water_body_id.in_(water_body_ids))
         )
         cond_by: dict[tuple, dict] = {}
         for c in cond_result.scalars().all():
-            cond_by[(str(c.spot_id), c.source)] = c.data
+            cond_by[(str(c.water_body_id), c.source)] = c.data
 
-        # Apply hard filters
-        today = date.today()
-        filtered: list[Spot] = []
-        for spot in spots:
-            sid = str(spot.id)
-            if spot.permit_required:
+        # Apply hard filters — only permit, closure, and out-of-range CFS
+        # (wildfire, alpine, AQI, turbidity, temp are now soft penalties)
+        filtered_pairs: list[tuple] = []
+        for fs, wb in pairs:
+            wb_id = str(wb.id)
+            if wb.permit_required:
                 continue
-            if _has_active_closure(spot.name, active_closures):
+            if _has_active_closure(wb.name, active_closures):
                 continue
-            if _wildfire_near_spot(float(spot.latitude), float(spot.longitude), active_fires):
+            if _cfs_out_of_range(wb, cond_by.get((wb_id, "usgs"))):
                 continue
-            if not _passes_conditions_filter(spot, cond_by.get((sid, "usgs")), target_species):
-                continue
-            if spot.is_alpine and not _alpine_access_ok(spot, cond_by.get((sid, "snotel")), today):
-                continue
-            airnow = cond_by.get((sid, "airnow")) or {}
-            if (airnow.get("aqi") or 0) > 200:
-                continue
-            filtered.append(spot)
+            filtered_pairs.append((fs, wb))
 
         # Drive-time filter — parallel HERE calls
         drive_time_unavailable = False
         candidates_raw: list[dict] = []
 
-        if origin_lat and origin_lon and filtered:
+        if origin_lat and origin_lon and filtered_pairs:
             tasks = [
                 get_drive_time(
                     origin_lat, origin_lon,
-                    float(s.latitude), float(s.longitude),
+                    float(fs.latitude), float(fs.longitude),
                     departure_time,
                 )
-                for s in filtered
+                for fs, _ in filtered_pairs
             ]
             drive_results = await asyncio.gather(*tasks)
 
-            for spot, (drive_min, is_fallback) in zip(filtered, drive_results):
+            for (fs, wb), (drive_min, is_fallback) in zip(filtered_pairs, drive_results):
                 if is_fallback:
                     drive_time_unavailable = True
                 if drive_min > max_drive_minutes:
                     continue
-                sid = str(spot.id)
+                wb_id = str(wb.id)
                 candidates_raw.append({
-                    "spot": spot,
+                    "fishing_spot": fs,
+                    "water_body": wb,
                     "drive_minutes": drive_min,
                     "is_haversine": is_fallback,
                     "straight_line_miles": (
-                        haversine_miles(origin_lat, origin_lon, float(spot.latitude), float(spot.longitude))
+                        haversine_miles(origin_lat, origin_lon, float(fs.latitude), float(fs.longitude))
                         if is_fallback else None
                     ),
-                    "usgs": cond_by.get((sid, "usgs")),
-                    "nws": cond_by.get((sid, "noaa_nws")),
-                    "nwrfc": cond_by.get((sid, "noaa_nwrfc")),
-                    "wta": cond_by.get((sid, "wta")),
-                    "airnow": cond_by.get((sid, "airnow")),
+                    "usgs": cond_by.get((wb_id, "usgs")),
+                    "nws": cond_by.get((wb_id, "noaa_nws")),
+                    "nwrfc": cond_by.get((wb_id, "noaa_nwrfc")),
+                    "wta": cond_by.get((wb_id, "wta")),
+                    "airnow": cond_by.get((wb_id, "airnow")),
+                    "snotel": cond_by.get((wb_id, "snotel")),
                 })
         else:
-            # No home location — include all filtered spots without drive-time gate
-            for spot in filtered:
-                sid = str(spot.id)
+            for fs, wb in filtered_pairs:
+                wb_id = str(wb.id)
                 candidates_raw.append({
-                    "spot": spot,
+                    "fishing_spot": fs,
+                    "water_body": wb,
                     "drive_minutes": None,
                     "is_haversine": False,
                     "straight_line_miles": None,
-                    "usgs": cond_by.get((sid, "usgs")),
-                    "nws": cond_by.get((sid, "noaa_nws")),
-                    "nwrfc": cond_by.get((sid, "noaa_nwrfc")),
-                    "wta": cond_by.get((sid, "wta")),
-                    "airnow": cond_by.get((sid, "airnow")),
+                    "usgs": cond_by.get((wb_id, "usgs")),
+                    "nws": cond_by.get((wb_id, "noaa_nws")),
+                    "nwrfc": cond_by.get((wb_id, "noaa_nwrfc")),
+                    "wta": cond_by.get((wb_id, "wta")),
+                    "airnow": cond_by.get((wb_id, "airnow")),
+                    "snotel": cond_by.get((wb_id, "snotel")),
                 })
 
         # --------------------------------------------------------------
         # [2] Tier 2 volatile delta → session_score
         # --------------------------------------------------------------
         for c in candidates_raw:
-            delta = _compute_volatile_delta(
-                c["spot"], c["usgs"], c["nws"], c.get("nwrfc"),
+            wb = c["water_body"]
+            fs = c["fishing_spot"]
+            delta, warnings = _compute_volatile_delta(
+                wb, c["usgs"], c["nws"], c.get("nwrfc"),
                 target_species, departure_time, c.get("airnow"),
+                snotel_data=c.get("snotel"),
+                active_fires=active_fires,
+                spot_lat=float(fs.latitude) if fs.latitude is not None else None,
+                spot_lon=float(fs.longitude) if fs.longitude is not None else None,
             )
-            base = float(c["spot"].score or 0) + delta
-            # Explore goal: boost unvisited spots (+2.0) so they sort above
-            # recently-fished water regardless of raw score.
-            if trip_goal == "explore" and c["spot"].last_visited is None:
+            c["warnings"] = warnings
+            base = float(wb.score or 0) + delta
+            if trip_goal == "explore" and fs.last_visited is None:
                 base += 2.0
             c["session_score"] = base
 
@@ -970,20 +946,37 @@ async def build_context(
         # Serialise to JSONB-safe dicts
         candidates = [
             {
-                "spot_id": str(c["spot"].id),
-                "spot_name": c["spot"].name,
-                "spot_type": c["spot"].type,
+                "spot_id": str(c["fishing_spot"].id),      # backward compat for frontend
+                "fishing_spot_id": str(c["fishing_spot"].id),
+                "water_body_id": str(c["water_body"].id),
+                "spot_name": c["fishing_spot"].name,        # None for single-spot waters
+                "water_body_name": c["water_body"].name,
+                "spot_type": c["water_body"].type,
                 "session_score": round(c["session_score"], 4),
                 "drive_minutes": c["drive_minutes"],
                 "is_haversine": c["is_haversine"],
                 "straight_line_miles": c["straight_line_miles"],
                 "last_visited": (
-                    c["spot"].last_visited.isoformat() if c["spot"].last_visited else None
+                    c["fishing_spot"].last_visited.isoformat()
+                    if c["fishing_spot"].last_visited else None
                 ),
-                "conditions": {"usgs": c["usgs"], "noaa_nws": c["nws"], "noaa_nwrfc": c.get("nwrfc"), "wta": c.get("wta"), "airnow": c.get("airnow")},
+                "warnings": c.get("warnings") or [],
+                "conditions": {
+                    "usgs": c["usgs"],
+                    "noaa_nws": c["nws"],
+                    "noaa_nwrfc": c.get("nwrfc"),
+                    "wta": c.get("wta"),
+                    "airnow": c.get("airnow"),
+                    "snotel": c.get("snotel"),
+                },
             }
             for c in candidates_raw
         ]
+
+        # Backfill spot_name with water_body_name for display when spot has no own name
+        for c in candidates:
+            if not c["spot_name"]:
+                c["spot_name"] = c["water_body_name"]
 
         # --------------------------------------------------------------
         # [3] Variety rotation — 60-day rule (§7.6)
@@ -1007,7 +1000,7 @@ async def build_context(
                 fetched_at=datetime.now(tz=timezone.utc),
                 interval_minutes=INTERVAL_REALTIME,
             )
-            cached_response = await get_cached_response(db, top["spot_id"], conditions_hash)
+            cached_response = await get_cached_response(db, top["fishing_spot_id"], conditions_hash)
 
     serialised_candidates = {
         "candidates": candidates,
@@ -1033,15 +1026,16 @@ async def build_context(
     # ------------------------------------------------------------------
     # [6] Map surfacing
     # ------------------------------------------------------------------
-    top_spot_ids = [c["spot_id"] for c in candidates[:_SURFACE_TOP_N]]
-    maps = await _fetch_maps(db, top_spot_ids)
+    top_fishing_spot_ids = [c["fishing_spot_id"] for c in candidates[:_SURFACE_TOP_N]]
+    maps = await _fetch_maps(db, top_fishing_spot_ids)
 
     # ------------------------------------------------------------------
     # [7] Context assembly
     # ------------------------------------------------------------------
     history_result = await db.execute(
-        select(Trip.trip_date, Spot.name)
-        .join(Spot, Trip.spot_id == Spot.id)
+        select(Trip.trip_date, WaterBody.name)
+        .join(FishingSpot, Trip.fishing_spot_id == FishingSpot.id)
+        .join(WaterBody, FishingSpot.water_body_id == WaterBody.id)
         .where(Trip.user_id == user.id)
         .where(Trip.state == "DEBRIEFED")
         .order_by(Trip.trip_date.desc())
@@ -1066,7 +1060,7 @@ async def build_context(
     map_refs = ""
     if maps:
         map_refs = "\n=== MAPS ===\n" + "\n".join(
-            f"MAP_ID:{m['id']}:SPOT:{m['spot_id']}" for m in maps
+            f"MAP_ID:{m['id']}:SPOT:{m['fishing_spot_id']}" for m in maps
         )
 
     system_content = "\n\n".join(filter(None, [
