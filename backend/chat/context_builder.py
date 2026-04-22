@@ -6,7 +6,7 @@ chat message. Returns a BuildResult containing the assembled Ollama messages
 and session metadata.
 
 Pipeline (§6.3):
-  [1] Hard pre-LLM filters — drive time, closures, conditions, permits
+  [1] Hard pre-LLM filters — drive time, closures, out-of-range CFS
   [2] Tier 2 volatile delta overlay → session_score per candidate (§7.5)
   [3] Variety rotation — 60-day rule (§7.6)
   [4] Response cache check
@@ -853,13 +853,12 @@ async def build_context(
         for c in cond_result.scalars().all():
             cond_by[(str(c.water_body_id), c.source)] = c.data
 
-        # Apply hard filters — only permit, closure, and out-of-range CFS
-        # (wildfire, alpine, AQI, turbidity, temp are now soft penalties)
+        # Apply hard filters — only closure and out-of-range CFS
+        # permit_required is NOT a hard filter; it surfaces as an LLM advisory
+        # (wildfire, alpine, AQI, turbidity, temp are also soft penalties)
         filtered_pairs: list[tuple] = []
         for fs, wb in pairs:
             wb_id = str(wb.id)
-            if wb.permit_required:
-                continue
             if _has_active_closure(wb.name, active_closures):
                 continue
             if _cfs_out_of_range(wb, cond_by.get((wb_id, "usgs"))):
@@ -934,6 +933,12 @@ async def build_context(
                 spot_lat=float(fs.latitude) if fs.latitude is not None else None,
                 spot_lon=float(fs.longitude) if fs.longitude is not None else None,
             )
+            if fs.permit_required:
+                permit_detail = fs.permit_notes or (fs.permit_url or "")
+                advisory = "Permit required"
+                if permit_detail:
+                    advisory = f"Permit required — {permit_detail}"
+                warnings = [advisory] + warnings
             c["warnings"] = warnings
             base = float(wb.score or 0) + delta
             if trip_goal == "explore" and fs.last_visited is None:
