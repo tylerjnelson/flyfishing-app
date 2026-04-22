@@ -155,6 +155,7 @@ class FishingSpot(Base):
     is_public = Column(Boolean, default=True)
     permit_required = Column(Boolean, default=False)
     permit_url = Column(Text)
+    permit_notes = Column(Text)
     last_visited = Column(Date)
     name_embedding = Column(Vector(768))
     source = Column(Text)
