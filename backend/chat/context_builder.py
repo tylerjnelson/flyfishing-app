@@ -290,6 +290,9 @@ def _nwrfc_cfs_at(nwrfc_data: dict, departure_time: datetime) -> float | None:
                 best_cfs = float(secondary) * 1000.0
         except (ValueError, TypeError):
             continue
+    # Reject if nearest forecast entry is >6h from departure — data is too stale to use
+    if best_diff is not None and best_diff > 6 * 3600:
+        return None
     return best_cfs
 
 
@@ -849,12 +852,25 @@ async def build_context(
         inciweb_row = inciweb_result.scalar_one_or_none()
         active_fires: list[dict] = (inciweb_row or {}).get("active_wa_fires", [])
 
-        # Conditions cache keyed by (water_body_id, source)
+        # Conditions cache — one row per (water_body_id, source), freshest wins.
+        # DISTINCT ON with ORDER BY fetched_at DESC guarantees correct row regardless
+        # of how many historical rows remain in the table.
         cond_result = await db.execute(
-            select(ConditionsCache).where(ConditionsCache.water_body_id.in_(water_body_ids))
+            select(
+                ConditionsCache.water_body_id,
+                ConditionsCache.source,
+                ConditionsCache.data,
+            )
+            .where(ConditionsCache.water_body_id.in_(water_body_ids))
+            .order_by(
+                ConditionsCache.water_body_id,
+                ConditionsCache.source,
+                ConditionsCache.fetched_at.desc(),
+            )
+            .distinct(ConditionsCache.water_body_id, ConditionsCache.source)
         )
         cond_by: dict[tuple, dict] = {}
-        for c in cond_result.scalars().all():
+        for c in cond_result.all():
             cond_by[(str(c.water_body_id), c.source)] = c.data
 
         # Apply hard filters — only closure and out-of-range CFS
