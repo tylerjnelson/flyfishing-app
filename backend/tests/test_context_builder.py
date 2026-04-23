@@ -59,6 +59,7 @@ def make_closure(effective=None, expires=None, rule_text="Emergency closure — 
     cl.effective = effective
     cl.expires = expires
     cl.rule_text = rule_text
+    cl.water_body_id = None  # MagicMock auto-creates truthy attrs; statewide/unmatched rows have NULL FK
     return cl
 
 

@@ -145,13 +145,35 @@ async def job_wdfw_emergency() -> None:
         log.warning("wdfw_emergency_empty_rules", extra={"job": "wdfw_emergency"})
         return
 
+    # Build name→water_body_id lookup (names + aliases) for FK resolution
+    name_to_wb_id: dict[str, object] = {}
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(select(WaterBody.id, WaterBody.name, WaterBody.aliases))
+        for row in result.all():
+            name_to_wb_id[row.name.upper()] = row.id
+            if row.aliases:
+                for alias in row.aliases:
+                    name_to_wb_id[alias.upper()] = row.id
+
+    def _resolve_water_body_id(rule_text: str) -> object:
+        rule_upper = rule_text.upper()
+        for name_upper, wb_id in name_to_wb_id.items():
+            if name_upper in rule_upper:
+                return wb_id
+        return None
+
     async with AsyncSessionLocal() as session:
         async with session.begin():
             await session.execute(
                 text("DELETE FROM emergency_closures WHERE expires IS NULL OR expires >= CURRENT_DATE")
             )
+            matched = 0
             for rule in rules:
+                wb_id = _resolve_water_body_id(rule["rule_text"])
+                if wb_id:
+                    matched += 1
                 session.add(EmergencyClosure(
+                    water_body_id=wb_id,
                     rule_text=rule["rule_text"],
                     effective=_parse_date(rule.get("effective")),
                     expires=_parse_date(rule.get("expires")),
@@ -159,7 +181,10 @@ async def job_wdfw_emergency() -> None:
                     fetched_at=datetime.now(tz=timezone.utc),
                 ))
 
-    log.info("job_done", extra={"job": "wdfw_emergency", "rules_stored": len(rules)})
+    log.info(
+        "job_done",
+        extra={"job": "wdfw_emergency", "rules_stored": len(rules), "water_body_matched": matched},
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -104,10 +104,11 @@ _GEO_TYPE_WORDS: frozenset[str] = frozenset({
 })
 
 
-def _has_active_closure(water_body_name: str, active_closures: list) -> bool:
+def _has_active_closure(water_body_name: str, active_closures: list, water_body_id=None) -> bool:
     """
-    Return True if any active closure's rule_text references this water body by name
-    and contains at least one closure keyword.
+    Return True if any active closure applies to this water body.
+    Prefers FK match when water_body_id is provided; falls back to rule_text
+    name scan for closure rows where water_body_id is NULL (statewide rules).
     """
     if not active_closures or not water_body_name:
         return False
@@ -116,10 +117,13 @@ def _has_active_closure(water_body_name: str, active_closures: list) -> bool:
     if not content_words:
         content_words = all_name_words
     for cl in active_closures:
-        text_lower = (cl.rule_text or "").lower()
-        text_words = frozenset(text_lower.split())
-        if content_words <= text_words and _CLOSURE_KEYWORDS & text_words:
+        if water_body_id and cl.water_body_id == water_body_id:
             return True
+        if cl.water_body_id is None:
+            text_lower = (cl.rule_text or "").lower()
+            text_words = frozenset(text_lower.split())
+            if content_words <= text_words and _CLOSURE_KEYWORDS & text_words:
+                return True
     return False
 
 
@@ -859,7 +863,7 @@ async def build_context(
         filtered_pairs: list[tuple] = []
         for fs, wb in pairs:
             wb_id = str(wb.id)
-            if _has_active_closure(wb.name, active_closures):
+            if _has_active_closure(wb.name, active_closures, water_body_id=wb.id):
                 continue
             if _cfs_out_of_range(wb, cond_by.get((wb_id, "usgs"))):
                 continue

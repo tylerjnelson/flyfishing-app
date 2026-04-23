@@ -168,50 +168,10 @@ class FishingSpot(Base):
     saved_spots = relationship("SavedSpot", back_populates="fishing_spot")
 
 
-class Spot(Base):
-    __tablename__ = "spots"
-
-    id = Column(Uuid(), primary_key=True, default=uuid.uuid4)
-    name = Column(Text, nullable=False)
-    aliases = Column(ARRAY(Text))
-    type = Column(String, nullable=False)  # river | lake | creek | coastal
-    latitude = Column(Numeric(9, 6))
-    longitude = Column(Numeric(9, 6))
-    elevation_ft = Column(Integer)
-    is_alpine = Column(Boolean, default=False)
-    county = Column(Text)
-    is_public = Column(Boolean, default=True)
-    permit_required = Column(Boolean, default=False)
-    permit_url = Column(Text)
-    source = Column(Text)  # wdfw_stocking | wdfw_access | wta | notes | debrief | user
-    seed_confidence = Column(String, default="unvalidated")
-    usgs_site_ids = Column(ARRAY(Text))
-    noaa_station_id = Column(Text)
-    snotel_station_id = Column(Text)
-    wdfw_water_id = Column(Text)
-    wta_trail_url = Column(Text)
-    has_realtime_conditions = Column(Boolean, default=False)
-    species_primary = Column(ARRAY(Text))
-    min_cfs = Column(Integer)
-    max_cfs = Column(Integer)
-    min_temp_f = Column(Numeric, default=40)
-    max_temp_f = Column(Numeric)
-    fishing_regs = Column(JSONB)
-    fly_fishing_legal = Column(Boolean, default=True)
-    name_embedding = Column(Vector(768))
-    last_stocked_date = Column(Date)
-    last_stocked_species = Column(ARRAY(Text))
-    score = Column(Numeric, default=0)
-    score_updated = Column(DateTime(timezone=True))
-    last_visited = Column(Date)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-
-
 class Note(Base):
     __tablename__ = "notes"
 
     id = Column(Uuid(), primary_key=True, default=uuid.uuid4)
-    spot_id = Column(Uuid(), ForeignKey("spots.id"))
     fishing_spot_id = Column(Uuid(), ForeignKey("fishing_spots.id"), nullable=True)
     note_date = Column(Date)
     title = Column(Text)
@@ -238,7 +198,6 @@ class Note(Base):
     # 'low_quality_scan' when contrast < 30 or min_dimension < 200px; null otherwise
     updated_at = Column(DateTime(timezone=True))
 
-    spot = relationship("Spot")
     fishing_spot = relationship("FishingSpot", back_populates="notes")
     author = relationship("User", back_populates="notes")
     trip = relationship("Trip", back_populates="notes", foreign_keys=[trip_id])
@@ -250,7 +209,6 @@ class Trip(Base):
 
     id = Column(Uuid(), primary_key=True, default=uuid.uuid4)
     user_id = Column(Uuid(), ForeignKey("users.id"))
-    spot_id = Column(Uuid(), ForeignKey("spots.id"))
     fishing_spot_id = Column(Uuid(), ForeignKey("fishing_spots.id"))
     trip_date = Column(Date)
     departure_time = Column(DateTime(timezone=True))
@@ -263,7 +221,6 @@ class Trip(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     user = relationship("User", back_populates="trips")
-    spot = relationship("Spot")
     fishing_spot = relationship("FishingSpot", back_populates="trips")
     notes = relationship("Note", back_populates="trip", foreign_keys="Note.trip_id")
     debrief_note = relationship("Note", foreign_keys=[debrief_note_id])
@@ -305,7 +262,6 @@ class ConditionsCache(Base):
     __tablename__ = "conditions_cache"
 
     id = Column(Uuid(), primary_key=True, default=uuid.uuid4)
-    spot_id = Column(Uuid(), ForeignKey("spots.id"))
     water_body_id = Column(Uuid(), ForeignKey("water_bodies.id"))
     source = Column(Text, nullable=False)
     fetched_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -320,7 +276,6 @@ class ResponseCache(Base):
     __tablename__ = "response_cache"
 
     id = Column(Uuid(), primary_key=True, default=uuid.uuid4)
-    spot_id = Column(Uuid(), ForeignKey("spots.id"))
     fishing_spot_id = Column(Uuid(), ForeignKey("fishing_spots.id"))
     conditions_hash = Column(Text, nullable=False)
     response_text = Column(Text, nullable=False)
@@ -333,7 +288,6 @@ class StockingEvent(Base):
     __tablename__ = "stocking_events"
 
     id = Column(Uuid(), primary_key=True, default=uuid.uuid4)
-    spot_id = Column(Uuid(), ForeignKey("spots.id"))
     water_body_id = Column(Uuid(), ForeignKey("water_bodies.id"))
     stocked_date = Column(Date)
     species = Column(Text)
@@ -349,7 +303,6 @@ class EmergencyClosure(Base):
     __tablename__ = "emergency_closures"
 
     id = Column(Uuid(), primary_key=True, default=uuid.uuid4)
-    spot_id = Column(Uuid(), ForeignKey("spots.id"))
     water_body_id = Column(Uuid(), ForeignKey("water_bodies.id"))
     rule_text = Column(Text, nullable=False)
     effective = Column(Date)
@@ -365,7 +318,6 @@ class SavedSpot(Base):
 
     id = Column(Uuid(), primary_key=True, default=uuid.uuid4)
     user_id = Column(Uuid(), ForeignKey("users.id"))
-    spot_id = Column(Uuid(), ForeignKey("spots.id"))
     fishing_spot_id = Column(Uuid(), ForeignKey("fishing_spots.id"))
     personal_notes = Column(Text)
     saved_at = Column(DateTime(timezone=True), server_default=func.now())
