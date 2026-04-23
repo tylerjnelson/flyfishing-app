@@ -13,7 +13,7 @@ from uuid import UUID
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.models import EmergencyClosure, FishingSpot, SavedSpot, Spot, WaterBody
+from db.models import EmergencyClosure, FishingSpot, SavedSpot, WaterBody
 
 log = logging.getLogger(__name__)
 
@@ -56,37 +56,34 @@ async def get_spot_closures(spot_id: UUID, db: AsyncSession) -> list[EmergencyCl
     return list(result.scalars().all())
 
 
-async def create_spot(name: str, spot_type: str, db: AsyncSession) -> Spot:
-    """
-    Create a minimal spot from user input (debrief or manual entry).
-    Still creates in the legacy spots table; resolves to water_body in Phase 6.
-    """
+async def create_spot(name: str, spot_type: str, db: AsyncSession) -> WaterBody:
+    """Create a minimal water body from user input (debrief or manual entry)."""
     from rag.embedder import embed_text
 
-    spot = Spot(
+    wb = WaterBody(
         id=uuid.uuid4(),
         name=name,
         type=spot_type,
-        source="notes",
+        source="user",
         seed_confidence="unvalidated",
     )
-    db.add(spot)
+    db.add(wb)
     await db.flush()
 
     embedding = await embed_text(name)
-    spot.name_embedding = embedding
+    wb.name_embedding = embedding
     await db.flush()
-    log.info("spot_created_from_note", extra={"spot_id": str(spot.id), "name": name})
-    return spot
+    log.info("water_body_created_from_note", extra={"water_body_id": str(wb.id), "name": name})
+    return wb
 
 
-async def list_unresolved_spots(db: AsyncSession) -> list[Spot]:
-    """Return legacy spots with unvalidated confidence and null coordinates."""
+async def list_unresolved_spots(db: AsyncSession) -> list[WaterBody]:
+    """Return water bodies with unvalidated confidence and null coordinates."""
     result = await db.execute(
-        select(Spot).where(
-            Spot.seed_confidence == "unvalidated",
-            Spot.latitude.is_(None),
-        ).order_by(Spot.name)
+        select(WaterBody).where(
+            WaterBody.seed_confidence == "unvalidated",
+            WaterBody.latitude.is_(None),
+        ).order_by(WaterBody.name)
     )
     return list(result.scalars().all())
 

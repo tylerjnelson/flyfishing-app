@@ -330,9 +330,9 @@ async def _apply_regulations_to_db(regs: dict[str, dict], db) -> int:
       - Upgrades WTA spots from unvalidated → probable (§7.1)
     """
     from sqlalchemy import select
-    from db.models import Spot
+    from db.models import WaterBody
 
-    result = await db.execute(select(Spot))
+    result = await db.execute(select(WaterBody))
     spots = result.scalars().all()
 
     # Build normalised lookup index once

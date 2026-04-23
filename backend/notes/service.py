@@ -53,10 +53,7 @@ async def list_notes(
 ) -> list[Note]:
     q = select(Note).where(Note.author_id == author_id)
     if spot_id:
-        # Accept fishing_spot_id (new) or fall back to legacy spot_id
-        q = q.where(
-            (Note.fishing_spot_id == spot_id) | (Note.spot_id == spot_id)
-        )
+        q = q.where(Note.fishing_spot_id == spot_id)
     if source_type:
         q = q.where(Note.source_type == source_type)
     q = q.order_by(desc(Note.created_at)).limit(limit).offset(offset)

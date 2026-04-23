@@ -58,7 +58,7 @@ def _note_summary(note) -> dict:
         "outcome": note.outcome,
         "species": note.species or [],
         "flies": note.flies or [],
-        "spot_id": str(note.fishing_spot_id or note.spot_id) if (note.fishing_spot_id or note.spot_id) else None,
+        "spot_id": str(note.fishing_spot_id) if note.fishing_spot_id else None,
         "fishing_spot_id": str(note.fishing_spot_id) if note.fishing_spot_id else None,
         "parent_note_id": str(note.parent_note_id) if note.parent_note_id else None,
         "has_image": note.image_path is not None,
