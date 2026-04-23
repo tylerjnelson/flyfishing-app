@@ -49,6 +49,7 @@ async def _fetch_all(year: int) -> list:
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         while True:
             params = {
+                "$select": "*,:id",
                 "$limit": _PAGE_SIZE,
                 "$offset": offset,
                 "$where": f"release_year = '{year}'",

@@ -299,7 +299,7 @@ def normalize_wdfw_stocking(records: list, fetched_at: datetime) -> list[dict]:
             "species": r.get("species"),
             "count": _safe_int(r.get("number_released")),
             "size_description": r.get("lifestage"),
-            "source_record_id": r.get("geo_code") or r.get(":id"),
+            "source_record_id": r.get(":id"),
         })
     return normalized
 

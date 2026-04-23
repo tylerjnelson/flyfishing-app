@@ -195,15 +195,17 @@ class TestNormalizeInciweb:
 
 class TestNormalizeWdfwStocking:
     def test_basic_record(self):
-        # Uses dataset 6fex-3r7d field names (release_location, number_released, geo_code)
+        # Uses dataset 6fex-3r7d field names; :id is the Socrata row identifier
+        # (requested via $select=*,:id — geo_code is a location code, not a unique row ID)
         raw = [{"release_location": "Lake X", "county": "King",
                 "release_start_date": "2026-03-01T00:00:00.000", "species": "Rainbow Trout",
-                "number_released": "500", "lifestage": "Legals", "geo_code": "L1234"}]
+                "number_released": "500", "lifestage": "Legals", "geo_code": "L1234",
+                ":id": "row-abc123"}]
         result = normalize_wdfw_stocking(raw, datetime.now(tz=timezone.utc))
         assert len(result) == 1
         assert result[0]["water_name"] == "Lake X"
         assert result[0]["count"] == 500
-        assert result[0]["source_record_id"] == "L1234"
+        assert result[0]["source_record_id"] == "row-abc123"
 
     def test_missing_count_returns_none(self):
         raw = [{"release_location": "Lake Y", "release_start_date": "2026-03-01T00:00:00.000",

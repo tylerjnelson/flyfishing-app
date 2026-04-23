@@ -1,5 +1,6 @@
-# Fingerprint: h3 a[href*="trip_report"] in @@related_tripreport_listing — validated 2026-04-06
-# NOTE: validate selector against https://www.wta.org/go-hiking/hikes/{slug}/@@related_tripreport_listing
+# Fingerprint: h3 a[href*="trip_report"] in @@related_tripreport_listing — validated 2026-04-23
+# Body text: article p on each individual report detail page — validated 2026-04-23
+# NOTE: validate selectors against https://www.wta.org/go-hiking/hikes/{slug}/@@related_tripreport_listing
 #       and update the date above if structure changes.
 """
 WTA trail report scraper — daily 3AM Pacific via APScheduler.
@@ -8,12 +9,11 @@ For each spot with a wta_trail_url, fetches recent trip reports and runs
 them through the WTA fishing-intent classifier (§18.7).  Reports with no
 fishing signal are discarded entirely — no location extraction attempted.
 
-Trip reports are fetched from the @@related_tripreport_listing sub-URL
-(WTA loads reports via AJAX on the main page; the listing URL returns
-pre-rendered HTML directly).
+The @@related_tripreport_listing URL returns heading links only (no body text).
+Body text is fetched from each individual report detail page (article p selector).
 
 Wrapped with the wta_breaker circuit breaker.
-Raises ScraperStructureError if the page structure has changed.
+Raises ScraperStructureError if the listing page structure has changed.
 """
 
 import logging
@@ -32,9 +32,9 @@ from prompts.registry import WTA_FISHING_INTENT_PROMPT
 log = logging.getLogger(__name__)
 
 _TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=5.0, pool=5.0)
-_REPORT_LIMIT = 10  # max recent reports to process per trail per run
+_REPORT_LIMIT = 5  # max recent reports per trail (listing page shows 5 per page)
 
-# Fingerprint: trip report headings link to URLs containing /trip_report (matches trip_report- slugs)
+# Fingerprint: trip report headings link to URLs containing /trip_report
 _FINGERPRINT_SELECTOR = 'h3 a[href*="trip_report"]'
 
 # Date pattern embedded in report headings: "Trail Name — Mar. 26, 2026"
@@ -84,40 +84,43 @@ async def _scrape_reports(url: str) -> list[dict]:
     async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True) as client:
         resp = await client.get(listing_url)
         resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+        if not soup.select_one(_FINGERPRINT_SELECTOR):
+            raise ScraperStructureError(
+                source="wta",
+                url=listing_url,
+                detail="Expected 'h3 a[href*=trip_report]' not found — WTA listing structure may have changed",
+            )
 
-    if not soup.select_one(_FINGERPRINT_SELECTOR):
-        raise ScraperStructureError(
-            source="wta",
-            url=listing_url,
-            detail="Expected 'h3 a[href*=trip_report]' not found — WTA listing structure may have changed",
-        )
+        # Extract report links and dates from the listing page
+        link_items = []
+        for a in soup.select(_FINGERPRINT_SELECTOR)[:_REPORT_LIMIT]:
+            href = a.get("href", "")
+            if not href:
+                continue
+            date_str = None
+            m = _DATE_RE.search(a.get_text(separator=" ", strip=True))
+            if m:
+                date_str = m.group(1)
+            link_items.append({"href": href, "date": date_str})
 
-    reports = []
-    headings = soup.select("h3")[:_REPORT_LIMIT]
-
-    for h3 in headings:
-        # Extract date from heading text: "Trail Name — Mar. 26, 2026"
-        heading_text = h3.get_text(separator=" ", strip=True)
-        date_str = None
-        m = _DATE_RE.search(heading_text)
-        if m:
-            date_str = m.group(1)
-
-        # Collect all text from siblings until the next h3
-        parts = [heading_text]
-        for sibling in h3.next_siblings:
-            if getattr(sibling, "name", None) == "h3":
-                break
-            if hasattr(sibling, "get_text"):
-                text = sibling.get_text(separator=" ", strip=True)
-                if text:
-                    parts.append(text)
-
-        full_text = " ".join(parts)
-        if full_text:
-            reports.append({"text": full_text, "date": date_str})
+        # Fetch each report detail page for body text (article p)
+        reports = []
+        for item in link_items:
+            try:
+                r = await client.get(item["href"])
+                r.raise_for_status()
+                detail = BeautifulSoup(r.text, "html.parser")
+                body_text = " ".join(
+                    p.get_text(separator=" ", strip=True)
+                    for p in detail.select("article p")
+                ).strip()
+                if body_text:
+                    reports.append({"text": body_text, "date": item["date"]})
+            except Exception as exc:
+                log.debug("wta_detail_fetch_failed", extra={"href": item["href"], "error": str(exc)})
+                continue
 
     return reports
 

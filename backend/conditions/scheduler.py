@@ -22,13 +22,15 @@ by the chat context builder — they are NOT scheduled here.
 import hashlib
 import json
 import logging
-from datetime import datetime, timezone
+
 
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
-from sqlalchemy import select, text
+from datetime import datetime, timedelta, timezone
+from sqlalchemy import delete, select, text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from config import settings
 from conditions.noaa_nwrfc import fetch_noaa_nwrfc, resolve_gauge_id
@@ -282,7 +284,7 @@ async def job_wdfw_stocking() -> None:
             for r in records:
                 water_name = (r.get("water_name") or "").strip().upper()
                 wb_id = name_to_wb_id.get(water_name)
-                session.add(StockingEvent(
+                stmt = pg_insert(StockingEvent).values(
                     water_body_id=wb_id,
                     stocked_date=_parse_date(r.get("stocked_date")),
                     species=r.get("species"),
@@ -290,7 +292,8 @@ async def job_wdfw_stocking() -> None:
                     size_description=r.get("size_description"),
                     source_record_id=r.get("source_record_id"),
                     fetched_at=datetime.now(tz=timezone.utc),
-                ))
+                ).on_conflict_do_nothing(index_elements=["source_record_id"])
+                await session.execute(stmt)
 
     # Propagate most-recent stocked_date per water body
     latest_by_name: dict[str, object] = {}
@@ -436,8 +439,35 @@ async def job_wdfw_regulations() -> None:
 # DB helpers
 # ---------------------------------------------------------------------------
 
+# How long to retain rows per source before pruning on write.
+# We only ever read the freshest row; history is kept briefly for debugging.
+_CACHE_TTL_HOURS: dict[str, int] = {
+    "inciweb":    6,
+    "nps_alerts": 6,
+    "noaa_nws":   6,
+    "usgs":       6,
+    "airnow":     6,
+    "noaa_nwrfc": 48,
+    "snotel":     48,
+    "wta":        48,
+}
+
+
 async def _write_conditions_cache(session, water_body_id, source: str, data: dict) -> None:
-    """Insert a new conditions_cache row. water_body_id may be None for global sources."""
+    """Insert a new conditions_cache row and prune rows older than the source TTL.
+
+    water_body_id may be None for global sources (inciweb, nps_alerts).
+    """
+    ttl_hours = _CACHE_TTL_HOURS.get(source)
+    if ttl_hours:
+        cutoff = datetime.now(tz=timezone.utc) - timedelta(hours=ttl_hours)
+        await session.execute(
+            delete(ConditionsCache)
+            .where(ConditionsCache.water_body_id == water_body_id)
+            .where(ConditionsCache.source == source)
+            .where(ConditionsCache.fetched_at < cutoff)
+        )
+
     data_hash = hashlib.md5(
         json.dumps(data, sort_keys=True, separators=(",", ":"), default=str).encode()
     ).hexdigest()
