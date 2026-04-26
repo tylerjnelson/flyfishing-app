@@ -63,6 +63,21 @@ _PREFILTER_KM = 250           # rough Haversine pre-filter before HERE calls
 # Wildfire proximity threshold
 _WILDFIRE_PROXIMITY_KM = 25.0
 
+# NPS park center coordinates and proximity threshold for alert matching
+_NPS_PARK_CENTERS: dict[str, tuple[float, float]] = {
+    "noca": (48.77, -121.20),   # North Cascades National Park
+    "olym": (47.80, -123.60),   # Olympic National Park
+}
+_NPS_PROXIMITY_KM = 80.0
+
+# NPS alert score penalties by category
+_NPS_ALERT_PENALTIES: dict[str, float] = {
+    "closure": 2.0,
+    "park closure": 2.0,
+    "danger": 1.5,
+    "caution": 1.0,
+}
+
 # Candidate pool size
 _MAX_CANDIDATES = 25
 _SURFACE_TOP_N = 5            # spots passed to LLM in initial context
@@ -142,6 +157,29 @@ def _wildfire_near_spot(
         if haversine_km(spot_lat, spot_lon, flat, flon) <= _WILDFIRE_PROXIMITY_KM:
             return True
     return False
+
+
+def _nps_alerts_for_spot(
+    spot_lat: float,
+    spot_lon: float,
+    nps_data: dict,
+) -> list[tuple[str, str]]:
+    """
+    Return (title, category) for active NPS alerts at parks within
+    _NPS_PROXIMITY_KM of the spot. Information-category alerts are excluded.
+    """
+    parks = nps_data.get("parks") or {}
+    result = []
+    for park_code, (park_lat, park_lon) in _NPS_PARK_CENTERS.items():
+        if haversine_km(spot_lat, spot_lon, park_lat, park_lon) > _NPS_PROXIMITY_KM:
+            continue
+        park_info = parks.get(park_code) or {}
+        for alert in (park_info.get("alerts") or []):
+            category = (alert.get("category") or "").strip()
+            if category.lower() == "information":
+                continue
+            result.append((alert.get("title") or "Park advisory", category))
+    return result
 
 
 _SPECIES_CEILINGS: dict[str, float] = {
@@ -323,6 +361,8 @@ def _compute_volatile_delta(
     airnow_data: dict | None = None,
     snotel_data: dict | None = None,
     active_fires: list[dict] | None = None,
+    nps_data: dict | None = None,
+    wta_data: dict | None = None,
     spot_lat: float | None = None,
     spot_lon: float | None = None,
 ) -> tuple[float, list[str]]:
@@ -345,6 +385,14 @@ def _compute_volatile_delta(
         if _wildfire_near_spot(spot_lat, spot_lon, active_fires):
             delta -= 2.5
             warnings.append("Active wildfire within 25km — smoke and access risk")
+
+    # NPS park alert penalties
+    if nps_data and spot_lat is not None and spot_lon is not None:
+        for title, category in _nps_alerts_for_spot(spot_lat, spot_lon, nps_data):
+            penalty = _NPS_ALERT_PENALTIES.get(category.lower(), 0.0)
+            delta -= penalty
+            cat_str = f" ({category})" if category else ""
+            warnings.append(f"NPS advisory{cat_str}: {title}")
 
     # Alpine access penalties
     if water_body.is_alpine:
@@ -441,6 +489,22 @@ def _compute_volatile_delta(
                 warnings.append(f"Air quality: {category} (AQI {aqi})")
             elif aqi >= 151:
                 delta -= 1.0
+
+    # WTA trail condition penalties — road and snow are access-blocking
+    wta_tc = (wta_data or {}).get("trail_conditions")
+    if wta_tc:
+        total = wta_tc.get("total_reports") or 1
+        road = wta_tc.get("road", 0)
+        snow = wta_tc.get("snow", 0)
+        bugs = wta_tc.get("bugs", 0)
+        if road > 0:
+            delta -= 1.5 if road / total >= 0.4 else 0.5
+            warnings.append(f"WTA: road conditions flagged in {road}/{total} recent reports")
+        if snow > 0:
+            delta -= 1.0
+            warnings.append(f"WTA: snow conditions in {snow}/{total} recent reports")
+        if bugs > 0:
+            warnings.append(f"WTA: bugs reported ({bugs}/{total} recent reports)")
 
     delta += _species_match_delta(target_species, water_body)
 
@@ -639,6 +703,21 @@ def _format_conditions_block(candidates: list[dict]) -> str:
             pollutant = airnow.get("pollutant") or ""
             pollutant_str = f", {pollutant}" if pollutant else ""
             lines.append(f"Air quality: {category} (AQI {aqi}{pollutant_str})")
+
+        wta_tc = wta.get("trail_conditions")
+        if wta_tc:
+            total = wta_tc.get("total_reports") or 1
+            tc_parts = []
+            if wta_tc.get("road"):
+                tc_parts.append(f"road ({wta_tc['road']}/{total})")
+            if wta_tc.get("snow"):
+                tc_parts.append(f"snow ({wta_tc['snow']}/{total})")
+            if wta_tc.get("bugs"):
+                tc_parts.append(f"bugs ({wta_tc['bugs']}/{total})")
+            if wta_tc.get("trail"):
+                tc_parts.append(f"trail obstacles ({wta_tc['trail']}/{total})")
+            if tc_parts:
+                lines.append(f"Trail conditions (WTA, {total} recent reports): {', '.join(tc_parts)}")
 
         wta_reports = wta.get("reports") or []
         if wta_reports:
@@ -852,6 +931,16 @@ async def build_context(
         inciweb_row = inciweb_result.scalar_one_or_none()
         active_fires: list[dict] = (inciweb_row or {}).get("active_wa_fires", [])
 
+        # NPS park alerts (NOCA, OLYM)
+        nps_result = await db.execute(
+            select(ConditionsCache.data)
+            .where(ConditionsCache.source == "nps_alerts")
+            .where(ConditionsCache.water_body_id.is_(None))
+            .order_by(ConditionsCache.fetched_at.desc())
+            .limit(1)
+        )
+        nps_data: dict | None = nps_result.scalar_one_or_none()
+
         # Conditions cache — one row per (water_body_id, source), freshest wins.
         # DISTINCT ON with ORDER BY fetched_at DESC guarantees correct row regardless
         # of how many historical rows remain in the table.
@@ -950,6 +1039,8 @@ async def build_context(
                 target_species, departure_time, c.get("airnow"),
                 snotel_data=c.get("snotel"),
                 active_fires=active_fires,
+                nps_data=nps_data,
+                wta_data=c.get("wta"),
                 spot_lat=float(fs.latitude) if fs.latitude is not None else None,
                 spot_lon=float(fs.longitude) if fs.longitude is not None else None,
             )

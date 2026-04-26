@@ -339,18 +339,24 @@ async def job_wta() -> None:
 
     for wb in water_bodies:
         try:
-            reports = await fetch_wta_reports(wb.wta_trail_url)
+            result = await fetch_wta_reports(wb.wta_trail_url)
         except ScraperStructureError as exc:
             log.critical(
                 "scraper_structure_failure",
                 extra={"source": exc.source, "url": exc.url, "detail": exc.detail},
             )
             continue
-        if reports is None:
+        if result is None:
             log.warning("job_stale_fallback", extra={"job": "wta", "water_body_id": str(wb.id)})
             continue
 
-        if not reports:
+        fishing_reports = result["fishing_reports"]
+        trail_conditions = result["trail_conditions"]
+
+        has_trail_issues = any(
+            trail_conditions.get(k, 0) > 0 for k in ("road", "snow", "bugs", "trail")
+        )
+        if not fishing_reports and not has_trail_issues:
             continue
 
         async with AsyncSessionLocal() as session:
@@ -359,9 +365,13 @@ async def job_wta() -> None:
                     session,
                     water_body_id=wb.id,
                     source="wta",
-                    data={"reports": reports, "fetched_at": datetime.now(tz=timezone.utc).isoformat()},
+                    data={
+                        "reports": fishing_reports,
+                        "trail_conditions": trail_conditions,
+                        "fetched_at": datetime.now(tz=timezone.utc).isoformat(),
+                    },
                 )
-        wrote += len(reports)
+        wrote += len(fishing_reports)
 
     log.info("job_done", extra={"job": "wta", "fishing_reports_stored": wrote})
 
