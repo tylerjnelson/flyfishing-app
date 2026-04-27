@@ -660,18 +660,25 @@ async def _fetch_maps(db, fishing_spot_ids: list[str]) -> list[dict]:
 # [7] Context formatting helpers
 # ---------------------------------------------------------------------------
 
-def _format_conditions_block(candidates: list[dict]) -> str:
+def _format_conditions_block(candidates: list[dict], departure_time: datetime | None = None) -> str:
+    now = datetime.now(tz=timezone.utc)
+    is_future_trip = (
+        departure_time is not None
+        and (departure_time - now).total_seconds() > _FUTURE_TRIP_HOURS * 3600
+    )
     lines = []
     for c in candidates[:_SURFACE_TOP_N]:
         conds = c.get("conditions") or {}
         usgs = conds.get("usgs") or {}
         nws = conds.get("noaa_nws") or {}
+        nwrfc = conds.get("noaa_nwrfc") or {}
         wta = conds.get("wta") or {}
         airnow = conds.get("airnow") or {}
 
-        # Display water_body_name; append spot name when spot has its own name
+        # Display water_body_name; append spot name only when it differs
+        # (spot_name is backfilled with water_body_name for spots with no own name)
         heading = c["water_body_name"]
-        if c.get("spot_name"):
+        if c.get("spot_name") and c["spot_name"] != c["water_body_name"]:
             heading = f"{c['water_body_name']} — {c['spot_name']}"
         lines.append(f"\n=== {heading} ===")
 
@@ -687,6 +694,10 @@ def _format_conditions_block(candidates: list[dict]) -> str:
         if cfs is not None:
             trend_str = f" ({trend})" if trend and trend != "stable" else ""
             lines.append(f"Flow: {cfs:.0f} CFS{trend_str}")
+        if is_future_trip and nwrfc and c.get("spot_type") in ("river", "creek"):
+            forecast_cfs = _nwrfc_cfs_at(nwrfc, departure_time)
+            if forecast_cfs is not None:
+                lines.append(f"Forecast flow at departure: {forecast_cfs:.0f} CFS")
         if temp is not None:
             lines.append(f"Water temp: {temp:.1f}°F")
         if turb is not None:
@@ -1171,7 +1182,7 @@ async def build_context(
     )
     prior_messages = [{"role": r.role, "content": r.content} for r in msg_result.all()]
 
-    conditions_block = _truncate(_format_conditions_block(candidates), _BUDGET_CONDITIONS)
+    conditions_block = _truncate(_format_conditions_block(candidates, departure_time=departure_time), _BUDGET_CONDITIONS)
     notes_block = _truncate(_format_notes_block(notes, maps), _BUDGET_NOTES)
     history_block = _truncate(_format_history_block(past_trips), _BUDGET_HISTORY)
 
