@@ -384,8 +384,13 @@ async def job_snotel() -> None:
     water_bodies = await _water_bodies_with_snotel()
     wrote = 0
 
+    # Cache per station triplet — multiple water bodies can share one station.
+    station_cache: dict[str, dict | None] = {}
     for wb in water_bodies:
-        data = await fetch_snotel(wb.snotel_station_id)
+        triplet = wb.snotel_station_id
+        if triplet not in station_cache:
+            station_cache[triplet] = await fetch_snotel(triplet)
+        data = station_cache[triplet]
         if data is None:
             log.warning("job_stale_fallback", extra={"job": "snotel", "water_body_id": str(wb.id)})
             await _mark_stale(wb.id, source="snotel")
