@@ -31,8 +31,6 @@ from bs4 import BeautifulSoup
 
 from conditions.circuit_breaker import wta_breaker
 from exceptions import ScraperStructureError
-from llm.client import CHAT_MODEL, call_json_llm
-from prompts.registry import WTA_FISHING_INTENT_PROMPT
 
 log = logging.getLogger(__name__)
 
@@ -45,7 +43,49 @@ _FINGERPRINT_SELECTOR = 'h3 a[href*="trip_report"]'
 # Date pattern embedded in report headings: "Trail Name — Mar. 26, 2026"
 _DATE_RE = re.compile(r"—\s+(\w+\.?\s+\d+,\s+\d{4})")
 
-_WTA_FISHING_INTENT_DEFAULT = {"fishing_intent": False}
+# ---------------------------------------------------------------------------
+# Keyword-based fishing-intent classifier
+# ---------------------------------------------------------------------------
+
+# Checked first — any match short-circuits to False
+_NEG_RE = re.compile(
+    r"\bno\s+fishing\b|\bfishing\s+(?:is\s+)?(?:prohibited|closed|not\s+allowed)\b"
+    r"|\bfishing\s+prohibited\b|\bfishing\s+closure\b",
+    re.IGNORECASE,
+)
+
+# Any match → True immediately
+_STRONG_RE = re.compile(
+    r"\bfishing\b|\bfly\s+rod\b|\bfly\s+reel\b|\bangling\b"
+    r"|\bhooked\s+(?:a|the|into)\b|\blanded\s+(?:a|the)\b"
+    r"|\bfish\s+on\b|\bdry\s+fly\b|\bwet\s+fly\b"
+    r"|\bstreamer\b|\bnymph\b|\blure\b|\bspinner\b|\bfly\s+hatch\b",
+    re.IGNORECASE,
+)
+
+# Species word + action verb within ±60 chars → True
+_SPECIES_RE = re.compile(
+    r"\b(?:trout|salmon|steelhead|rainbow|cutthroat|kokanee|bass|"
+    r"dolly\s+varden|bull\s+trout|brook\s+trout)\b",
+    re.IGNORECASE,
+)
+_ACTION_RE = re.compile(
+    r"\b(?:caught|hooked|landed|targeted|fished|casting)\b",
+    re.IGNORECASE,
+)
+
+
+def _has_fishing_intent(text: str) -> bool:
+    if _NEG_RE.search(text):
+        return False
+    if _STRONG_RE.search(text):
+        return True
+    for m in _SPECIES_RE.finditer(text):
+        window_start = max(0, m.start() - 60)
+        window_end = min(len(text), m.end() + 60)
+        if _ACTION_RE.search(text[window_start:window_end]):
+            return True
+    return False
 
 
 def _extract_trail_conditions(soup: BeautifulSoup, total_reports: int) -> dict:
@@ -94,15 +134,11 @@ async def fetch_wta_reports(wta_trail_url: str) -> dict | None:
 
     fishing_reports = []
     for report in raw_reports:
-        result = await _classify(report["text"])
-        if not result.get("fishing_intent", False):
+        if not _has_fishing_intent(report["text"]):
             continue
         fishing_reports.append({
             "report_text": report["text"],
             "note_date": report.get("date"),
-            "fishing_intent": True,
-            "confidence": result.get("confidence", "low"),
-            "evidence": result.get("evidence", ""),
             "source_url": wta_trail_url,
             "fetched_at": datetime.now(tz=timezone.utc).isoformat(),
         })
@@ -168,10 +204,3 @@ async def _scrape_reports(url: str) -> tuple[list[dict], dict]:
     return reports, trail_conditions
 
 
-async def _classify(report_text: str) -> dict:
-    prompt = WTA_FISHING_INTENT_PROMPT.format(report_text=report_text)
-    return await call_json_llm(
-        prompt=prompt,
-        model=CHAT_MODEL,
-        default=_WTA_FISHING_INTENT_DEFAULT,
-    )
