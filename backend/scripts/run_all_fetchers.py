@@ -5,14 +5,20 @@ Runs every job that APScheduler would run nightly/bi-hourly.
 Skips job_wdfw_regulations (annual; run only in December).
 
 Usage (from backend/):
-  sudo env $(grep -v '^#' /etc/flyfish/app.env | grep -v '^$' | xargs) \\
-       /opt/flyfish/venv/bin/python scripts/run_all_fetchers.py
+  sudo /opt/flyfish/venv/bin/python scripts/run_all_fetchers.py
 """
 
 import asyncio
 import logging
 import sys
 import time
+
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from dotenv import load_dotenv
+load_dotenv("/etc/flyfish/app.env")
 
 # ---------------------------------------------------------------------------
 # Logging — print INFO+ to stdout so results are visible

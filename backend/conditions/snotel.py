@@ -37,9 +37,12 @@ async def fetch_snotel(station_triplet: str) -> dict | None:
             log.warning("snotel_empty_response", extra={"source": "snotel", "station": station_triplet})
             return None
         if result["pct_of_median"] is None and result["snow_water_equivalent_in"] is not None:
-            result["pct_of_median"] = await _compute_historical_median(
-                station_triplet, result["snow_water_equivalent_in"]
-            )
+            swe = result["snow_water_equivalent_in"]
+            if swe == 0.0:
+                # No snowpack — pct is 0 regardless of historical median
+                result["pct_of_median"] = 0.0
+            else:
+                result["pct_of_median"] = await _compute_historical_median(station_triplet, swe)
         return result
     except pybreaker.CircuitBreakerError:
         log.warning(
