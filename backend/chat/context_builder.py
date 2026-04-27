@@ -490,21 +490,24 @@ def _compute_volatile_delta(
             elif aqi >= 151:
                 delta -= 1.0
 
-    # WTA trail condition penalties — road and snow are access-blocking
+    # WTA trail condition penalties and access bonus
     wta_tc = (wta_data or {}).get("trail_conditions")
     if wta_tc:
-        total = wta_tc.get("total_reports") or 1
+        total = wta_tc.get("total_reports") or 0
         road = wta_tc.get("road", 0)
         snow = wta_tc.get("snow", 0)
         bugs = wta_tc.get("bugs", 0)
+        trail_obs = wta_tc.get("trail", 0)
         if road > 0:
-            delta -= 1.5 if road / total >= 0.4 else 0.5
+            delta -= 1.5 if road / max(total, 1) >= 0.4 else 0.5
             warnings.append(f"WTA: road conditions flagged in {road}/{total} recent reports")
         if snow > 0:
             delta -= 1.0
             warnings.append(f"WTA: snow conditions in {snow}/{total} recent reports")
         if bugs > 0:
             warnings.append(f"WTA: bugs reported ({bugs}/{total} recent reports)")
+        if total > 0 and road == 0 and snow == 0 and trail_obs == 0:
+            delta += 0.5
 
     delta += _species_match_delta(target_species, water_body)
 
@@ -724,9 +727,8 @@ def _format_conditions_block(candidates: list[dict]) -> str:
             lines.append("Angler reports (WTA):")
             for r in wta_reports[:3]:
                 date_str = r.get("note_date") or "unknown date"
-                confidence = r.get("confidence", "low")
                 text = (r.get("report_text") or "")[:200]
-                lines.append(f"  [{date_str}] ({confidence} confidence) {text}")
+                lines.append(f"  [{date_str}] {text}")
 
         # Surface penalty warnings so the LLM can advise the angler
         for w in (c.get("warnings") or []):

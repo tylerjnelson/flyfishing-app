@@ -167,7 +167,7 @@ async def job_wdfw_emergency() -> None:
     async with AsyncSessionLocal() as session:
         async with session.begin():
             await session.execute(
-                text("DELETE FROM emergency_closures WHERE expires IS NULL OR expires >= CURRENT_DATE")
+                text("DELETE FROM emergency_closures")
             )
             matched = 0
             for rule in rules:
@@ -353,10 +353,9 @@ async def job_wta() -> None:
         fishing_reports = result["fishing_reports"]
         trail_conditions = result["trail_conditions"]
 
-        has_trail_issues = any(
-            trail_conditions.get(k, 0) > 0 for k in ("road", "snow", "bugs", "trail")
-        )
-        if not fishing_reports and not has_trail_issues:
+        # Write to cache when there are reports (even all-clear — scorer needs
+        # the "no issues" signal to award the positive access bonus).
+        if not fishing_reports and trail_conditions.get("total_reports", 0) == 0:
             continue
 
         async with AsyncSessionLocal() as session:
