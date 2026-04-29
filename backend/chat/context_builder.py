@@ -681,6 +681,7 @@ def _format_conditions_block(candidates: list[dict], departure_time: datetime | 
         if c.get("spot_name") and c["spot_name"] != c["water_body_name"]:
             heading = f"{c['water_body_name']} — {c['spot_name']}"
         lines.append(f"\n=== {heading} ===")
+        lines.append(f"Spot ID: {c['fishing_spot_id']}")
 
         if c.get("is_haversine"):
             lines.append(f"Distance: ~{c.get('straight_line_miles', '?')} miles straight-line")
