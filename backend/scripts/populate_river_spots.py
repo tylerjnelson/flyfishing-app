@@ -193,7 +193,9 @@ def main():
     parser.add_argument("--apply", action="store_true", help="Write changes to DB")
     args = parser.parse_args()
 
-    db_url = os.environ.get("DATABASE_URL", "postgresql://<user>:<password>@localhost/flyfish")
+    db_url = os.environ.get("DATABASE_URL")
+    if not db_url:
+        raise RuntimeError("DATABASE_URL environment variable is not set")
     db_url = db_url.replace("postgresql+asyncpg://", "postgresql://")
 
     conn = psycopg2.connect(db_url)

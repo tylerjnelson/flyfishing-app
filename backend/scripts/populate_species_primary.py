@@ -156,7 +156,9 @@ def main():
                         help='WDFW stocking years to fetch (default: 2024 2025 2026)')
     args = parser.parse_args()
 
-    db_url = os.environ.get('DATABASE_URL', 'postgresql://<user>:<password>@localhost/flyfish')
+    db_url = os.environ.get('DATABASE_URL')
+    if not db_url:
+        raise RuntimeError('DATABASE_URL environment variable is not set')
     # Convert SQLAlchemy URL to psycopg2 format
     db_url = db_url.replace('postgresql+asyncpg://', 'postgresql://')
 
