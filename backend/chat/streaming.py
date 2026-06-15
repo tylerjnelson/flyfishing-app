@@ -13,23 +13,13 @@ using the state this handler accumulates.
 
 import logging
 import re
-import uuid
 
 log = logging.getLogger(__name__)
 
 # Structured token patterns
-_RE_EXCLUDE = re.compile(r'\[EXCLUDE_SPOT:\s*([\w-]+)\]')
 _RE_FILTER = re.compile(r'\[FILTER_UPDATE:\s*(\w+)=(.+?)\]')
-_RE_ALTERNATE = re.compile(r'\[SURFACE_ALTERNATE:\s*([\w-]+),\s*(.+?)\]')
 _RE_SAVE_NOTE = re.compile(r'\[SAVE_NOTE:\s*(.+?)\]', re.DOTALL)
-
-
-def _is_valid_uuid(value: str) -> bool:
-    try:
-        uuid.UUID(str(value))
-        return True
-    except ValueError:
-        return False
+_RE_RECOMMEND = re.compile(r'\[RECOMMEND:\s*[^\]]+\]', re.IGNORECASE)
 
 
 class StreamHandler:
@@ -48,18 +38,14 @@ class StreamHandler:
             yield sse_event("filter_confirmation_required", final)
     """
 
-    def __init__(self, session_candidates: list[dict]):
+    def __init__(self, session_candidates: list[dict] = None):
         self.buffer: str = ""
         self.full_response: str = ""  # accumulates complete response for DB storage
 
         # Session state — applied to DB after stream ends
         self.pending_filter_update: dict | None = None
-        self.excluded_spot_ids: list[str] = []
-        self.surface_alternate: dict | None = None
         self.save_note_contents: list[str] = []
-
-        # Local copy for candidate pool navigation
-        self._candidates = list(session_candidates)
+        self.recommend_block: str | None = None  # raw "[RECOMMEND: ...]" for turn_builder
 
     # ------------------------------------------------------------------
     # Per-token processing
@@ -87,38 +73,6 @@ class StreamHandler:
                 self.full_response += out
             return out
 
-        # --- [EXCLUDE_SPOT: uuid] ---
-        m = re.search(_RE_EXCLUDE, self.buffer)
-        if m:
-            spot_id = m.group(1)
-            if _is_valid_uuid(spot_id):
-                self.excluded_spot_ids.append(spot_id)
-                log.debug("exclude_spot_intercepted", extra={"spot_id": spot_id})
-            else:
-                log.debug("exclude_spot_parse_failure", extra={"raw": self.buffer[:200]})
-            pre = self.buffer[:m.start()]
-            self.buffer = self.buffer[m.end():]
-            out = pre if pre.strip() else None
-            if out:
-                self.full_response += out
-            return out
-
-        # --- [SURFACE_ALTERNATE: spot_id, reason] ---
-        m = re.search(_RE_ALTERNATE, self.buffer)
-        if m:
-            spot_id, reason = m.group(1), m.group(2).strip()
-            if _is_valid_uuid(spot_id):
-                self.surface_alternate = {"spot_id": spot_id, "reason": reason}
-                log.debug("surface_alternate_intercepted", extra={"spot_id": spot_id})
-            else:
-                log.debug("surface_alternate_parse_failure", extra={"raw": self.buffer[:200]})
-            pre = self.buffer[:m.start()]
-            self.buffer = self.buffer[m.end():]
-            out = pre if pre.strip() else None
-            if out:
-                self.full_response += out
-            return out
-
         # --- [SAVE_NOTE: content] ---
         m = re.search(_RE_SAVE_NOTE, self.buffer)
         if m:
@@ -126,6 +80,18 @@ class StreamHandler:
             if note_content:
                 self.save_note_contents.append(note_content)
                 log.debug("save_note_intercepted", extra={"chars": len(note_content)})
+            pre = self.buffer[:m.start()]
+            self.buffer = self.buffer[m.end():]
+            out = pre if pre.strip() else None
+            if out:
+                self.full_response += out
+            return out
+
+        # --- [RECOMMEND: uuid, uuid, uuid] ---
+        m = re.search(_RE_RECOMMEND, self.buffer)
+        if m:
+            self.recommend_block = m.group(0)
+            log.debug("recommend_block_intercepted", extra={"block": self.recommend_block})
             pre = self.buffer[:m.start()]
             self.buffer = self.buffer[m.end():]
             out = pre if pre.strip() else None
@@ -177,34 +143,3 @@ class StreamHandler:
             }
         return None
 
-    # ------------------------------------------------------------------
-    # Session candidate navigation helpers
-    # ------------------------------------------------------------------
-
-    def advance_candidates(self) -> list[dict]:
-        """
-        Remove excluded spots from the candidate list and return the updated list.
-        Called by the router after stream ends to persist updated session_candidates.
-        """
-        if not self.excluded_spot_ids:
-            return self._candidates
-        excluded_set = set(self.excluded_spot_ids)
-        return [c for c in self._candidates if c.get("spot_id") not in excluded_set]
-
-    def apply_surface_alternate(self, candidates: list[dict]) -> tuple[list[dict], bool]:
-        """
-        Promote the surface_alternate spot to index 0 in the candidate list.
-
-        Returns (updated_candidates, found) where found=False means the spot
-        was absent from the current pool (hard-filtered) and the router must
-        do a DB lookup and re-insert with surfaced_with_caveat=True.
-        """
-        if not self.surface_alternate:
-            return candidates, False
-        spot_id = self.surface_alternate["spot_id"]
-        for i, c in enumerate(candidates):
-            if c.get("spot_id") == spot_id:
-                if i == 0:
-                    return list(candidates), True
-                return [candidates[i]] + candidates[:i] + candidates[i + 1:], True
-        return candidates, False

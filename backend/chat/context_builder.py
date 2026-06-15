@@ -25,11 +25,17 @@ from datetime import date, datetime, timezone
 
 from sqlalchemy import select, text
 
-from chat.response_cache import get_cached_response
+from chat.response_cache import compute_intake_hash, get_cached_response
 from conditions.airnow import fetch_airnow
 from conditions.normalizer import INTERVAL_REALTIME, compute_conditions_hash
 from conditions.noaa_nws import fetch_noaa_nws
-from conditions.routing import get_drive_time, haversine_km, haversine_miles
+from conditions import here_budget
+from conditions.routing import (
+    get_drive_time,
+    haversine_drive_minutes,
+    haversine_km,
+    haversine_miles,
+)
 from conditions.usgs import fetch_usgs_gauge
 from db.connection import AsyncSessionLocal
 from db.models import (
@@ -95,6 +101,7 @@ class BuildResult:
     messages: list[dict]           # [{role, content}] for Ollama chat endpoint
     session_candidates: dict       # serialised for conversations.session_candidates JSONB
     conditions_hash: str | None    # cache key for top spot
+    intake_hash: str               # cache key segment for trip intake config
     drive_time_unavailable: bool   # True when HERE fell back to Haversine
     cached_response: str | None    # non-None on cache hit — skip LLM call
 
@@ -245,25 +252,34 @@ async def _fetch_and_cache_realtime(fishing_spots: list, water_bodies: list[Wate
         return
 
     usgs_results = await asyncio.gather(
-        *[fetch_usgs_gauge(wb.usgs_site_ids[0]) for _, wb in usgs_pairs]
+        *[fetch_usgs_gauge(wb.usgs_site_ids[0]) for _, wb in usgs_pairs],
+        return_exceptions=True,
     )
     nws_results = await asyncio.gather(
-        *[fetch_noaa_nws(float(fs.latitude), float(fs.longitude)) for fs in geo_spots]
+        *[fetch_noaa_nws(float(fs.latitude), float(fs.longitude)) for fs in geo_spots],
+        return_exceptions=True,
     )
     airnow_results = await asyncio.gather(
-        *[fetch_airnow(float(fs.latitude), float(fs.longitude)) for fs in geo_spots]
+        *[fetch_airnow(float(fs.latitude), float(fs.longitude)) for fs in geo_spots],
+        return_exceptions=True,
     )
 
     to_write: list[tuple] = []  # (water_body_id, source, data_dict)
     for (fs, wb), data in zip(usgs_pairs, usgs_results):
-        if data is not None:
+        if data is not None and not isinstance(data, BaseException):
             to_write.append((wb.id, "usgs", data))
+        elif isinstance(data, BaseException):
+            log.warning("realtime_fetch_error", extra={"source": "usgs", "wb": wb.name, "err": str(data)})
     for fs, data in zip(geo_spots, nws_results):
-        if data is not None:
+        if data is not None and not isinstance(data, BaseException):
             to_write.append((fs.water_body_id, "noaa_nws", data))
+        elif isinstance(data, BaseException):
+            log.warning("realtime_fetch_error", extra={"source": "noaa_nws", "err": str(data)})
     for fs, data in zip(geo_spots, airnow_results):
-        if data is not None:
+        if data is not None and not isinstance(data, BaseException):
             to_write.append((fs.water_body_id, "airnow", data))
+        elif isinstance(data, BaseException):
+            log.warning("realtime_fetch_error", extra={"source": "airnow", "err": str(data)})
 
     if not to_write:
         return
@@ -835,6 +851,7 @@ async def _build_debrief_context(
         messages=messages,
         session_candidates=conversation.session_candidates or {},
         conditions_hash=None,
+        intake_hash="",
         drive_time_unavailable=False,
         cached_response=None,
     )
@@ -865,6 +882,7 @@ async def build_context(
 
     intake = trip.session_intake or {}
     prefs = user.preferences or {}
+    intake_hash = compute_intake_hash(intake)
 
     water_types: list[str] = intake.get("water_type") or []
     target_species: list[str] = intake.get("target_species") or []
@@ -993,17 +1011,49 @@ async def build_context(
         candidates_raw: list[dict] = []
 
         if origin_lat and origin_lon and filtered_pairs:
-            tasks = [
-                get_drive_time(
-                    origin_lat, origin_lon,
-                    float(fs.latitude), float(fs.longitude),
-                    departure_time,
+            # Claim the monthly HERE budget up front (§19.6 hard cap). Only the
+            # granted spots may call HERE this build; any remainder fall back to
+            # Haversine WITHOUT a HERE request, so we can never exceed the cap.
+            granted = await here_budget.reserve(len(filtered_pairs))
+            here_pairs = filtered_pairs[:granted]
+            fallback_pairs = filtered_pairs[granted:]
+            if fallback_pairs:
+                log.warning(
+                    "here_budget_capped_build",
+                    extra={
+                        "total": len(filtered_pairs),
+                        "via_here": len(here_pairs),
+                        "via_haversine": len(fallback_pairs),
+                    },
                 )
-                for fs, _ in filtered_pairs
-            ]
-            drive_results = await asyncio.gather(*tasks)
 
-            for (fs, wb), (drive_min, is_fallback) in zip(filtered_pairs, drive_results):
+            here_results = (
+                await asyncio.gather(*[
+                    get_drive_time(
+                        origin_lat, origin_lon,
+                        float(fs.latitude), float(fs.longitude),
+                        departure_time,
+                    )
+                    for fs, _ in here_pairs
+                ])
+                if here_pairs
+                else []
+            )
+            # Budget-denied spots: Haversine fallback, flagged is_fallback=True so
+            # the drive_time_unavailable banner fires exactly as on a HERE outage.
+            fallback_results = [
+                (
+                    haversine_drive_minutes(
+                        origin_lat, origin_lon, float(fs.latitude), float(fs.longitude)
+                    ),
+                    True,
+                )
+                for fs, _ in fallback_pairs
+            ]
+            ordered_pairs = here_pairs + fallback_pairs
+            drive_results = here_results + fallback_results
+
+            for (fs, wb), (drive_min, is_fallback) in zip(ordered_pairs, drive_results):
                 if is_fallback:
                     drive_time_unavailable = True
                 if drive_min > max_drive_minutes:
@@ -1130,7 +1180,7 @@ async def build_context(
                 fetched_at=datetime.now(tz=timezone.utc),
                 interval_minutes=INTERVAL_REALTIME,
             )
-            cached_response = await get_cached_response(db, top["fishing_spot_id"], conditions_hash)
+            cached_response = await get_cached_response(db, top["fishing_spot_id"], conditions_hash, intake_hash)
 
     serialised_candidates = {
         "candidates": candidates,
@@ -1142,6 +1192,7 @@ async def build_context(
             messages=[],
             session_candidates=serialised_candidates,
             conditions_hash=conditions_hash,
+            intake_hash=intake_hash,
             drive_time_unavailable=drive_time_unavailable,
             cached_response=cached_response,
         )
@@ -1210,6 +1261,7 @@ async def build_context(
         messages=messages,
         session_candidates=serialised_candidates,
         conditions_hash=conditions_hash,
+        intake_hash=intake_hash,
         drive_time_unavailable=drive_time_unavailable,
         cached_response=None,
     )

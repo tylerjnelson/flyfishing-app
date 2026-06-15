@@ -41,3 +41,13 @@ alembic.ini
 
 # Testing
 /test-notes/
+
+# Batch / benchmark / model-comparison harness + their outputs (throwaway, not app code)
+backend/scripts/batch_test.py
+backend/scripts/batch_test_2.py
+backend/scripts/benchmark_gemma4.py
+backend/scripts/run_conversation.py
+backend/scripts/run_model_comparison.sh
+backend/scripts/e2e_http.py
+backend/scripts/migrate.sh
+backend/scripts/batch_results_*/

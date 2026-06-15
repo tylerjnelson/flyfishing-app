@@ -4,6 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import httpx
 
 from auth.middleware import get_current_user
+from conditions import here_budget
 from config import settings
 from db.connection import get_db
 from db.models import User
@@ -24,6 +25,10 @@ async def geocode_location(
     current_user: User = Depends(get_current_user),
 ):
     """Geocode a free-text location string via HERE. Returns {label, lat, lon} or 404."""
+    # Counts against the monthly HERE budget (§19.6). If the cap is exhausted,
+    # report the location as unresolved rather than issuing a billable call.
+    if await here_budget.reserve(1) == 0:
+        return {"result": None}
     async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
         resp = await client.get(
             "https://geocode.search.hereapi.com/v1/geocode",

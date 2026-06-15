@@ -278,6 +278,7 @@ class ResponseCache(Base):
     id = Column(Uuid(), primary_key=True, default=uuid.uuid4)
     fishing_spot_id = Column(Uuid(), ForeignKey("fishing_spots.id"))
     conditions_hash = Column(Text, nullable=False)
+    intake_hash = Column(String(16), nullable=False, server_default="")
     response_text = Column(Text, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -335,3 +336,16 @@ class BackupChecksum(Base):
     notes_count = Column(Integer, nullable=False)
     notes_hash = Column(Text, nullable=False)
     # MD5 of string_agg of note IDs ordered by created_at
+
+
+class HereUsageCounter(Base):
+    """
+    Per-month tally of billable HERE requests (routing + geocoding), used to
+    enforce an application-level hard cap — HERE has no dashboard spend limit.
+    One row per UTC month; see conditions/here_budget.py and spec §19.6.
+    """
+    __tablename__ = "here_usage_counter"
+
+    period = Column(String(7), primary_key=True)  # "YYYY-MM" (UTC)
+    used = Column(Integer, nullable=False, server_default="0")
+    updated_at = Column(DateTime(timezone=True), server_default=func.now())
