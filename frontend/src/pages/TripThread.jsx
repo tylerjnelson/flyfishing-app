@@ -13,6 +13,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import api from '../api/client'
+import SpotCard from '../components/SpotCard'
 import useAuthStore from '../store/auth'
 
 const STATE_LABELS = {
@@ -217,6 +218,7 @@ export default function TripThread() {
       const decoder = new TextDecoder()
       let buffer = ''
       let accumulated = ''
+      let pendingCards = []
 
       while (true) {
         const { done, value } = await reader.read()
@@ -234,9 +236,11 @@ export default function TripThread() {
               setStreamingContent(accumulated)
             } else if (event.type === 'drive_time_unavailable') {
               setDriveTimeUnavailable(true)
+            } else if (event.type === 'spot_cards') {
+              pendingCards = event.cards || []
             } else if (event.type === 'done') {
               if (accumulated) {
-                setMessages([{ id: Date.now(), role: 'assistant', content: accumulated }])
+                setMessages([{ id: Date.now(), role: 'assistant', content: accumulated, cards: pendingCards }])
               }
               setStreamingContent('')
             }
@@ -285,6 +289,7 @@ export default function TripThread() {
       const decoder = new TextDecoder()
       let buffer = ''
       let accumulated = ''
+      let pendingCards = []
 
       while (true) {
         const { done, value } = await reader.read()
@@ -311,12 +316,14 @@ export default function TripThread() {
               setDriveTimeUnavailable(true)
             } else if (event.type === 'filter_confirmation_required') {
               setPendingFilter({ key: event.key, value: event.value })
+            } else if (event.type === 'spot_cards') {
+              pendingCards = event.cards || []
             } else if (event.type === 'done') {
               // Commit streamed message to history
               if (accumulated) {
                 setMessages(prev => [
                   ...prev,
-                  { id: Date.now() + 1, role: 'assistant', content: accumulated },
+                  { id: Date.now() + 1, role: 'assistant', content: accumulated, cards: pendingCards },
                 ])
                 if (trip?.state === 'IN_WINDOW') {
                   setShowInWindowNudge(true)
@@ -473,7 +480,27 @@ export default function TripThread() {
         )}
 
         {messages.map(msg => (
-          <MessageBubble key={msg.id} msg={msg} isStreaming={false} />
+          <div key={msg.id}>
+            <MessageBubble msg={msg} isStreaming={false} />
+            {msg.cards?.length > 0 && (
+              <div className="px-4 mb-1">
+                {msg.cards.map((card, i) => (
+                  <SpotCard
+                    key={card.spot_id || i}
+                    card={card}
+                    conversationId={conversationId}
+                    onExcluded={(spotId) => {
+                      setMessages(prev => prev.map(m =>
+                        m.id === msg.id
+                          ? { ...m, cards: m.cards.filter(c => c.spot_id !== spotId) }
+                          : m
+                      ))
+                    }}
+                  />
+                ))}
+              </div>
+            )}
+          </div>
         ))}
 
         {/* Streaming in-progress */}

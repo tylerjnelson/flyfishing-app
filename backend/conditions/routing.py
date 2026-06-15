@@ -1,5 +1,8 @@
 """
-HERE Time-Aware Routing integration — §6.3.
+HERE Routing integration — §6.3.
+
+Uses planning mode (departureTime=any, traffic-free) to avoid HERE's premium
+Time-Aware Routing SKU — see the BILLING NOTE in _here_request().
 
 get_drive_time() is the public entry point. On circuit breaker trip or timeout
 > 3 s, falls back to Haversine straight-line × 1.4 road factor.
@@ -73,15 +76,26 @@ async def _here_request(
     departure_time: datetime,
 ) -> int:
     """
-    HERE Time-Aware Routing API call. Wrapped by routing_breaker
-    (fail_max=2, reset_timeout=60 per §6.3).
+    HERE Routing API call in planning mode (departureTime=any, traffic-free).
+    Wrapped by routing_breaker (fail_max=2, reset_timeout=60 per §6.3).
     Returns drive time in minutes.
+
+    NOTE: planning mode is used deliberately to stay off HERE's premium
+    Time-Aware Routing SKU — see the BILLING NOTE on the params below.
     """
+    # BILLING NOTE — departureTime=any ("planning mode"), intentionally NOT the
+    # real departure time. Sending a concrete departureTime makes HERE bill the
+    # call as "Time-Aware Routing", a PREMIUM SKU (this caused unexpected charges,
+    # see spec §19.6). "any" computes a traffic-free route in the non-premium,
+    # free-tier-eligible category. Trade-off: durations no longer reflect
+    # historical traffic. The `departure_time` arg is retained (callers/signature
+    # unchanged, still used elsewhere in the pipeline) so this is a one-line
+    # revert if a HERE spend cap is configured and time-aware routing is wanted.
     params = {
         "transportMode": "car",
         "origin": f"{lat1},{lon1}",
         "destination": f"{lat2},{lon2}",
-        "departureTime": departure_time.isoformat(),
+        "departureTime": "any",
         "return": "summary",
         "apikey": settings.here_api_key,
     }

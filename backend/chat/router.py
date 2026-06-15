@@ -24,9 +24,11 @@ from auth.middleware import get_current_user
 from chat.context_builder import build_context
 from chat.response_cache import store_response
 from chat.streaming import StreamHandler
+from chat.turn_builder import build_turn
+from conditions import here_budget
 from config import settings
 from db.connection import get_db
-from db.models import Conversation, FishingSpot, Message, Note, Trip, User, WaterBody
+from db.models import Conversation, Message, Note, Trip, User
 from llm.client import CHAT_MODEL
 from notes.ingestion import ingest_note_task
 from trips.service import get_trip, get_trip_conversation, refresh_state
@@ -205,6 +207,19 @@ async def chat_endpoint(
         if final_event:
             yield _sse({"type": final_event["event"], "key": final_event["key"], "value": final_event["value"]})
 
+        # Turn builder — assemble spot cards from [RECOMMEND: ...] block
+        if handler.recommend_block:
+            turn = await build_turn(
+                narrative=handler.full_response,
+                recommend_block=handler.recommend_block,
+                candidates=build_result.session_candidates.get("candidates", []),
+                db=db,
+            )
+            if turn.get("cards"):
+                yield _sse({"type": "spot_cards", "cards": turn["cards"]})
+            elif turn.get("error"):
+                log.warning("turn_builder_error", extra={"error": turn["error"], "trip_id": str(trip.id)})
+
         yield _sse({"type": "done"})
 
         # ---- Post-stream DB writes ----
@@ -221,71 +236,14 @@ async def chat_endpoint(
             db.add(assistant_msg)
 
             # Store in response cache (top candidate)
-            if build_result.conditions_hash:
+            if build_result.conditions_hash and build_result.intake_hash:
                 candidates = build_result.session_candidates.get("candidates", [])
                 if candidates:
                     await store_response(
                         db, candidates[0]["fishing_spot_id"],
-                        build_result.conditions_hash, full_response,
+                        build_result.conditions_hash, build_result.intake_hash,
+                        full_response,
                     )
-
-        # Update session_candidates after EXCLUDE_SPOT and persist excluded IDs
-        if handler.excluded_spot_ids:
-            updated = handler.advance_candidates()
-            conversation.session_candidates = {
-                **build_result.session_candidates,
-                "candidates": updated,
-            }
-            existing_excluded = list(conversation.excluded_spot_ids or [])
-            new_ids = [
-                uuid.UUID(sid) for sid in handler.excluded_spot_ids
-                if sid not in {str(e) for e in existing_excluded}
-            ]
-            conversation.excluded_spot_ids = existing_excluded + new_ids
-
-        # Promote or re-insert SURFACE_ALTERNATE spot
-        if handler.surface_alternate:
-            current_candidates = (conversation.session_candidates or {}).get("candidates", [])
-            updated, found = handler.apply_surface_alternate(current_candidates)
-            if not found:
-                # Spot was hard-filtered — fetch from DB and re-insert with caveat
-                alt_spot_id = handler.surface_alternate["spot_id"]
-                fs_wb_res = await db.execute(
-                    select(FishingSpot, WaterBody)
-                    .join(WaterBody, FishingSpot.water_body_id == WaterBody.id)
-                    .where(FishingSpot.id == alt_spot_id)
-                )
-                fs_wb_row = fs_wb_res.one_or_none()
-                if fs_wb_row:
-                    alt_fs, alt_wb = fs_wb_row
-                    spot_name = alt_fs.name or alt_wb.name
-                    caveat_candidate = {
-                        "spot_id": str(alt_fs.id),
-                        "fishing_spot_id": str(alt_fs.id),
-                        "water_body_id": str(alt_wb.id),
-                        "spot_name": spot_name,
-                        "water_body_name": alt_wb.name,
-                        "spot_type": alt_wb.type,
-                        "session_score": 0.0,
-                        "drive_minutes": None,
-                        "is_haversine": False,
-                        "straight_line_miles": None,
-                        "last_visited": (
-                            alt_fs.last_visited.isoformat() if alt_fs.last_visited else None
-                        ),
-                        "conditions": {},
-                        "surfaced_with_caveat": True,
-                    }
-                    updated = [caveat_candidate] + current_candidates
-                else:
-                    log.debug(
-                        "surface_alternate_spot_not_found",
-                        extra={"spot_id": alt_spot_id},
-                    )
-            conversation.session_candidates = {
-                **(conversation.session_candidates or {}),
-                "candidates": updated,
-            }
 
         # Write FILTER_UPDATE to conversation for confirm-filter endpoint
         if handler.pending_filter_update:
@@ -314,6 +272,61 @@ async def chat_endpoint(
 
 def _sse(data: dict) -> str:
     return f"data: {json.dumps(data)}\n\n"
+
+
+# ---------------------------------------------------------------------------
+# POST /api/chat/exclude-spot
+# ---------------------------------------------------------------------------
+
+@router.post("/chat/exclude-spot")
+async def exclude_spot_endpoint(
+    body: dict,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Remove a spot from session_candidates and record it as excluded.
+
+    Body: {conversation_id, spot_id}
+
+    - Validates spot_id is present in conversation.session_candidates.
+    - Removes it from the candidates list.
+    - Appends to conversation.excluded_spot_ids.
+    - Returns the updated candidate list.
+    """
+    conversation_id = body.get("conversation_id")
+    spot_id = body.get("spot_id")
+    if not conversation_id or not spot_id:
+        raise HTTPException(status_code=400, detail="conversation_id and spot_id required")
+
+    conv_result = await db.execute(
+        select(Conversation).where(
+            Conversation.id == conversation_id,
+            Conversation.user_id == user.id,
+        )
+    )
+    conversation = conv_result.scalar_one_or_none()
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    candidates = (conversation.session_candidates or {}).get("candidates", [])
+    if not any(c.get("spot_id") == spot_id for c in candidates):
+        raise HTTPException(status_code=404, detail="Spot not in session candidates")
+
+    updated_candidates = [c for c in candidates if c.get("spot_id") != spot_id]
+    conversation.session_candidates = {
+        **(conversation.session_candidates or {}),
+        "candidates": updated_candidates,
+    }
+
+    existing_excluded = list(conversation.excluded_spot_ids or [])
+    if spot_id not in {str(e) for e in existing_excluded}:
+        existing_excluded.append(uuid.UUID(spot_id))
+    conversation.excluded_spot_ids = existing_excluded
+
+    await db.commit()
+    log.info("spot_excluded", extra={"spot_id": spot_id, "conversation_id": str(conversation_id)})
+    return {"candidates": updated_candidates}
 
 
 # ---------------------------------------------------------------------------
@@ -420,6 +433,11 @@ async def confirm_filter_endpoint(
 
 async def _geocode_location(query: str) -> dict | None:
     """Geocode a free-text location string via HERE Geocoding API."""
+    # Counts against the monthly HERE budget (§19.6). If the cap is exhausted,
+    # skip the HERE call and treat the location as unresolved.
+    if await here_budget.reserve(1) == 0:
+        log.warning("geocode_skipped_budget", extra={"query": query})
+        return None
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
             resp = await client.get(

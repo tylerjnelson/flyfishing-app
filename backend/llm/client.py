@@ -96,7 +96,7 @@ async def ollama_generate(
         "model": model,
         "prompt": prompt,
         "stream": True,
-        "options": {"temperature": temperature},
+        "options": {"temperature": temperature, "num_ctx": 16384},
         "keep_alive": keep_alive,
     }
     if format:
