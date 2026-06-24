@@ -18,6 +18,11 @@ class Settings:
         self.mail_from = _require("MAIL_FROM")
         self.airnow_api_key = _require("AIRNOW_API_KEY")
         self.here_api_key = _require("HERE_API_KEY")
+        # Kill-switch for ALL HERE traffic (routing + geocoding). When set, drive
+        # times come from deterministic Haversine and geocoding is skipped — used
+        # by batch/benchmark runs so they never touch the HERE API (spec §11.1).
+        # Off in production. Enable with FLYFISH_DISABLE_HERE=1.
+        self.here_disabled = os.environ.get("FLYFISH_DISABLE_HERE", "").lower() in ("1", "true", "yes")
         # NPS Developer API key — free at https://www.nps.gov/subjects/developer/get-started.htm
         # Falls back to DEMO_KEY (50 req/hr) if not set; real key allows 1000 req/hr.
         self.nps_api_key = os.environ.get("NPS_API_KEY", "DEMO_KEY")
