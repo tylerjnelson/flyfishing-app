@@ -1,0 +1,73 @@
+# 🎣 Fly Fish WA — Conditions & Recommendations Engine
+
+A private, self-hosted web app that recommends fly fishing spots in Washington State from *live* data and the group's own accumulated trip notes — never the model's memory. Open a trip, and the app deterministically filters and scores every candidate water against current flow, temperature, closures, and snowpack, then hands an on-server LLM only the spots that already passed every hard constraint and asks it to *explain* the call. The numbers you see are rendered from cached data, not written by the model. If a supporting note or reading isn't in context, the assistant says so rather than guess.
+
+> 🚧 **Work in progress.** The Gemma 4 + turn-builder + tool-call migration (the architecture described below) is complete in code but **not yet deployed** — production still runs the prior Llama pipeline. Open threads: re-tuning the (Llama-era) system prompt for Gemma, trimming E4B's CPU latency, a drive-time cache to cut HERE volume to near-zero, and fixing HERE routing for lake spots (their coordinates sit on open water, off the road network).
+
+## The one principle that shapes everything
+
+**The LLM explains; deterministic code decides.** A local 8B-class model, asked to "recommend a spot," will invent flow numbers, call closed rivers fishable, and re-rank its own answers between turns. So everything that must be correct is computed *around* the model, never *by* it:
+
+- **Hard constraints** — flow out of range, lethal water temperature, emergency closures, fly-fishing-illegal water — are evaluated in Python. A spot that fails any is removed from the candidate list, so the model literally cannot recommend it.
+- **Scoring** is a deterministic two-tier numeric model; the LLM never scores spots.
+- **Every number shown** — CFS, water temp, drive time, stocking dates — is rendered into structured spot cards by a "turn builder." The model's prose never contains a number it could get wrong. Numeric hallucination is eliminated as a *class* of error.
+
+The model owns only what it's good at: qualitative narrative over clean, pre-validated context — *"the Pilchuck is low and clear this week, good for technical dries if you get there early."*
+
+And one boundary above all: **the internet is write-once, inbound only.** External APIs populate a local cache; all inference runs on-server via Ollama. No notes, prompts, or recommendations ever leave the box.
+
+## Data ingest
+
+Conditions come from public government and community sources on a tiered schedule that matches each source's volatility against its cost — and **real-time data is fetched only for the handful of spots a user is actively considering**, never the whole database. Every source maps to a concrete role in ranking, and ranking has exactly three mechanisms: a **hard filter** (the spot is removed from the pool entirely — the LLM never sees it), the **nightly base score** (stable signals, computed at 3:30 AM and stored), and the **session volatile delta** (a signed adjustment from live conditions, computed per request and never persisted).
+
+| Source | Cadence | Data collected | Contribution to ranking |
+|---|---|---|---|
+| **USGS Water Services** | Session open | Live discharge (CFS), gauge height, water temperature, turbidity (FNU), 4-reading flow trend | **Hard filter** if CFS is outside the water's fishable range. **Delta:** +1.0/+0.5 as flow nears the ideal midpoint; +0.5 falling / −0.5 rising trend; −1.0 to −2.5 as temp approaches the species safety ceiling; −1.0 below the feeding floor; −1.5 for turbidity >100 FNU. **Nightly:** flow-trend and conditions-reliability weights. |
+| **NOAA NWS** | Session open | Current weather + 7-day forecast (precipitation totals, wind) | **Delta only:** +1.0 for a dry week (≤0.25"), −0.5 / −1.5 for moderate / heavy precip; −0.5 / −1.0 for wind >15 / >25 mph. Deliberately excluded from the response-cache key so a forecast tweak doesn't bust a cached narrative. |
+| **AirNow (EPA)** | Session open | Air Quality Index + category | **Delta only:** −1.0 at AQI 151–200, −3.0 above 200 — a real signal in wildfire-smoke season. |
+| **HERE Routing** | Session open | Door-to-spot drive time from the user's departure point | **Hard filter** if drive time exceeds the trip's max-drive setting. Not a score signal — rendered on the card; budget-capped with a Haversine fallback. |
+| **NOAA NWRFC** | Every 2 h | River flow *forecast*, 3–10 days out | For trips >24 h away, supplies the forecast CFS that drives the flow-proximity **delta** in place of live USGS, and is shown on the card. |
+| **WDFW Emergency Rules** | Every 2 h | Active emergency closures (rule text, effective/expiry dates) | **Hard filter** — an active closure removes the spot outright. A safety gate, never a score; exempt from the circuit breaker. |
+| **InciWeb** | Every 2 h | Active Washington wildfire incidents (location, perimeter) | **Delta:** −2.5 plus an angler-facing warning when a fire is within 25 km. |
+| **NPS park alerts** | Every 2 h | Closure / danger / caution advisories for North Cascades & Olympic | **Delta:** −2.0 / −1.5 / −1.0 by category for spots within 80 km of a park center, each surfaced as a warning. |
+| **WDFW stocking** | Daily 3 AM | Stocking history + most-recent plant date and species | **Nightly (lakes):** the primary lake signal — a step function from full credit at ≤30 days since stocking down to zero past 180. Also feeds species matching and the card. |
+| **WTA trail reports** | Daily 3 AM | Fishing-intent-filtered trail reports → road / snow / bug / trail-obstruction counts | **Delta:** −0.5 to −1.5 for road issues (scaled by share of recent reports), −1.0 for snow, +0.5 when reports exist and are all-clear; bugs advisory-only. Surfaced as warnings. |
+| **NRCS SNOTEL** | Daily 3 AM | Mountain snowpack — snow-water-equivalent and % of 30-yr median | **Nightly (alpine lakes):** the seasonal-access signal, mapping snowpack to open / uncertain / ice-on. **Delta:** −2.5 when SWE exceeds 30". |
+| **WDFW regulations** | Annual (manual) | Per-water open seasons, gear restrictions, size/bag limits → `fishing_regs` + `fly_fishing_legal` | **Hard filter** — bait-only (fly-illegal) water is removed entirely. Also upgrades a spot's seed-confidence (which scales the data-coverage signal) and is summarized on the card. |
+| **Group notes & debriefs** *(internal corpus)* | On upload / post-trip | Star rating, sentiment, species, flies, outcome, approximate flow & temp | **Nightly:** debrief rating (top weight, each rating weighted by how close that trip's flow was to today's) and note sentiment. **Retrieval:** hybrid RAG pulls them in to ground the narrative. Filing a debrief also graduates the spot's seed-confidence. |
+
+Two cross-cutting modifiers ride on top: a **seed-confidence multiplier** (`confirmed` 1.0 / `probable` 0.6 / `unvalidated` 0.2) scales how much an unproven spot's data coverage counts, and a **data-coverage** signal rewards spots wired to more of the sources above — so a well-instrumented, confirmed water outranks a sparsely-known one at equal conditions.
+
+The parts touching the open internet assume things break: every fetcher is wrapped in a **circuit breaker** (serve last-good with a `stale` flag, not an error); every HTML scraper asserts a **structural fingerprint** before parsing, so a silently-changed page raises a `CRITICAL` instead of returning garbage; the cache-write `DELETE` is gated on a non-empty fetch so a bad pull can't wipe good data; and **emergency-closure fetching is exempt from all of it** — a failure escalates straight to a UI banner, because stale closure data is a safety problem, not a caching one. With three workers, exactly one is elected to run the scheduler via a Postgres advisory lock.
+
+## How a recommendation is built
+
+The pipeline (`chat/context_builder.py`) runs in a strict order, and the order *is* the contract — the cheap, infallible steps narrow the pool before the expensive, metered ones run.
+
+1. **Hard pre-filter, branched by spot type.** A free Haversine + water-type + legality pass narrows the database to ~20–30 survivors *before* any paid HERE drive-time call fans out. Only three things actually remove a spot: an active closure, fly-illegal water, and live flow outside the fishable CFS range. Everything else once hard-filtered — wildfire, snowpack, AQI, turbidity, temp near the species ceiling — is now a **soft penalty**: the spot stays and the LLM surfaces the concern, because hard-filtering every risk left users staring at empty results with no "why."
+2. **Two-tier score.** A nightly **base score** over stable signals (debrief ratings, note sentiment, flow reliability, stocking recency, species match, over-visit penalty), weighted by a confidence multiplier so unproven spots can't outrank known producers. Then a session-time **volatile overlay** — signed deltas for current flow, trend, temp-vs-ceiling, forecast precip, fire/AQI/wind — added live and never written back. Past trips are weighted by how close *their* flow was to *today's*; a variety rule guarantees a long-unvisited spot always makes the shortlist.
+3. **Response-cache check** keyed on `(spot, conditions_hash, intake_hash)` — a hit reuses the narrative; cards are always re-assembled fresh, so even a cache hit shows current conditions.
+4. **Hybrid RAG.** Relevant notes are retrieved by **Reciprocal Rank Fusion** over a dense pgvector pass (semantic) *and* a Postgres full-text pass (exact fly/place names), then re-ranked by same-season recency, species match, and flow similarity. Hand-drawn maps retrieve on a separate track and render inline.
+5. **Assemble** within a hard ~10K-token budget (conditions / notes / history / conversation each capped) so CPU inference latency stays bounded.
+
+## The two-tier spot model
+
+The schema's load-bearing decision is splitting "a spot" into two tables. **`water_bodies`** is the *fishery* — what conditions, regulations, and scoring attach to (USGS/SNOTEL stations, CFS/temp thresholds, stocking, nightly score); it's never recommended directly. **`fishing_spots`** is the *recommendation* — the precise public access point (a parking lot, boat launch, bridge) the LLM surfaces and that trips and notes hang off. The context builder joins them: drive-time geo uses the spot's road-network coordinates, every conditions signal comes from the fishery. A neat payoff — stocking records with no known access point have no `fishing_spot` row and drop out of recommendations automatically, while still feeding the score.
+
+## Note ingestion
+
+The group's notes — many **handwritten in physical notebooks over years** — are the core asset, and the system treats a scanned page and an in-app debrief as structurally identical. A photo upload runs as a background task: MIME-validate, strip EXIF, re-encode to WebP. The 11B vision model (loaded on demand, evicted immediately so it never displaces the chat model) detects whether the page holds a hand-drawn map; if so, an **OpenCV** chain — deskew, adaptive threshold, contrast-normalise — extracts and corrects it in parallel with OCR, and the model writes a spatial description that's embedded and made searchable. The trip date is read from the *handwriting*, not unreliable EXIF. Then **spot entity resolution** answers "which row is 'the hatchery pool on the Yak'?" by running semantic (pgvector) and fuzzy (pg_trgm, over names *and* aliases) lookups in parallel, merging `0.6·semantic + 0.4·fuzzy`, and branching on confidence to auto-link, ask, or create. Every user correction is appended to that spot's aliases and re-embedded — so the group's informal vocabulary is learned organically and resolution improves the more the corpus is used.
+
+## The LLM turn: three phases
+
+1. **Plan.** Before generating, the model gets a *trimmed* context (a compact spot list, not the full conditions block) plus a catalog of read-only tools, via Gemma's native function calling. It decides whether it needs more — recent notes for a spot, a side-by-side comparison, a semantic note search — and those run in parallel, capped at four. **Every tool is a local DB read; none touches the internet.** The pass is skipped entirely on opening turns (context is already complete) and trivial follow-ups, which keeps CPU latency in check.
+2. **Stream.** The model streams narrative while a `StreamHandler` intercepts structured tokens mid-stream — `[RECOMMEND: …]`, `[FILTER_UPDATE: …]`, `[SAVE_NOTE: …]` — and strips them from the user's view. (Ollama emits sub-word fragments, so the handler accumulates a buffer and matches on the whole thing rather than per token.) Spot *exclusion* was deliberately moved out of the model's hands to a plain button — batch testing proved the model never reliably emitted the token.
+3. **Assemble.** The turn builder validates the `[RECOMMEND]` block (exactly three valid spot IDs, with retry and a score-based fallback) and renders a structured **spot card** per spot — name, parent water, drive time, live CFS / temp / weather / AQI, regs, fly-only flag, last-stocked, note count — emitted as a final SSE event. The assembled output is stored as the assistant message, so on the next turn the model sees its own prior picks by name and keeps the ranking stable.
+
+## Privacy and cost as hard boundaries — enforced in code, not policy
+
+`ufw` default-deny egress; Ollama and Postgres bound to localhost; only the fetcher modules make outbound calls. Adopting Gemma cleared a verification gate first (open weights, static after download, fully local, no training-on-inference clause). The one metered dependency, HERE, has no server-side spend cap — so after a benchmark once fanned out ~7,100 billable calls in a day, an **application-level hard cap** (1,000 requests/UTC-month, atomic, Postgres-backed across all workers, fails *safe*) and a `FLYFISH_DISABLE_HERE` kill-switch were added; over-budget requests fall back to Haversine, never an error, and drive-time-unavailable degrades honestly (labelled straight-line miles, no fabricated minutes).
+
+## Stack
+
+React 19 + Vite **PWA** (Tailwind, Leaflet, Zustand) · **FastAPI** (async, Python 3.12) on Gunicorn/Uvicorn · **PostgreSQL 16 + pgvector + pg_trgm** (HNSW index — unified primary store *and* vector store) · **Ollama** running **Gemma 4 E4B** (chat + native tool calls), **Llama 3.2 11B Vision** (OCR/maps, on-demand), **nomic-embed-text** (768-dim RAG), and **faster-whisper** (voice notes) — all on-server · APScheduler for tiered fetches · Alembic migrations · BeautifulSoup + HTTPX scrapers · OpenCV + Pillow image pipeline · Nginx (TLS, SSE pass-through) on a single Oracle Cloud Free Tier ARM64 box (4 cores / 24 GB / 50 GB).
