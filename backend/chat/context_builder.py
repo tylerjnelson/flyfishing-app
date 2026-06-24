@@ -37,6 +37,7 @@ from conditions.routing import (
     haversine_miles,
 )
 from conditions.usgs import fetch_usgs_gauge
+from config import settings
 from db.connection import AsyncSessionLocal
 from db.models import (
     ConditionsCache,
@@ -1014,7 +1015,13 @@ async def build_context(
             # Claim the monthly HERE budget up front (§19.6 hard cap). Only the
             # granted spots may call HERE this build; any remainder fall back to
             # Haversine WITHOUT a HERE request, so we can never exceed the cap.
-            granted = await here_budget.reserve(len(filtered_pairs))
+            # When HERE is disabled (batch/benchmark), skip the reserve entirely and
+            # route every pair through get_drive_time, which returns deterministic
+            # Haversine minutes with is_fallback=False (no budget touched, no banner).
+            if settings.here_disabled:
+                granted = len(filtered_pairs)
+            else:
+                granted = await here_budget.reserve(len(filtered_pairs))
             here_pairs = filtered_pairs[:granted]
             fallback_pairs = filtered_pairs[granted:]
             if fallback_pairs:

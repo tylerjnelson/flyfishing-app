@@ -121,6 +121,12 @@ async def get_drive_time(
     distances as straight-line mileage — never present fallback minutes as
     drive time to the user.
     """
+    # HERE kill-switch (batch/benchmark only — spec §11.1). Return a deterministic
+    # Haversine estimate as if it were a real drive time (is_fallback=False) so the
+    # pipeline filters and renders normally without touching the HERE API.
+    if settings.here_disabled:
+        return haversine_drive_minutes(origin_lat, origin_lon, dest_lat, dest_lon), False
+
     try:
         minutes = await asyncio.wait_for(
             _here_request(origin_lat, origin_lon, dest_lat, dest_lon, departure_time),
