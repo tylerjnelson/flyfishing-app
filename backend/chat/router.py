@@ -24,6 +24,7 @@ from auth.middleware import get_current_user
 from chat.context_builder import build_context
 from chat.response_cache import store_response
 from chat.streaming import StreamHandler
+from chat.tools import run_tool_planning, should_skip_planning
 from chat.turn_builder import build_turn
 from conditions import here_budget
 from config import settings
@@ -165,6 +166,29 @@ async def chat_endpoint(
             await db.commit()
             return
 
+        # Planning pass (Phase 5a/5b) — let the model fetch extra context before
+        # generation. Skipped for trivial turns; failures fall through to a plain
+        # generation pass. Tool results are appended as `tool` messages (5c).
+        messages = build_result.messages
+        planning_ms = 0
+        tools_ms = 0
+        num_tools = 0
+        # History exists when there are turns beyond [system, current_user].
+        has_history = len(messages) > 2
+        if not should_skip_planning(message_text, has_history=has_history):
+            plan = await run_tool_planning(
+                messages,
+                conversation_id=str(conversation.id),
+                db=db,
+                model=CHAT_MODEL,
+                candidates=build_result.session_candidates.get("candidates", []),
+            )
+            planning_ms = plan.planning_ms
+            tools_ms = plan.tools_ms
+            num_tools = plan.num_tools
+            if plan.tool_messages:
+                messages = messages + plan.tool_messages
+
         # Stream from Ollama
         handler = StreamHandler(
             build_result.session_candidates.get("candidates", [])
@@ -172,17 +196,26 @@ async def chat_endpoint(
         t_start = time.monotonic()
         t_first_token = None
 
-        async for chunk in _stream_ollama(build_result.messages):
+        async for chunk in _stream_ollama(messages):
             # Sentinel from generator
             if isinstance(chunk, dict) and chunk.get("_done"):
                 token_count = chunk.get("token_count", 0)
-                total_ms = round((time.monotonic() - t_start) * 1000)
+                generation_ms = round((time.monotonic() - t_start) * 1000)
                 ttft_ms = round((t_first_token - t_start) * 1000) if t_first_token else None
+                # Timings are embedded in the message string because the JSON log
+                # formatter only renders `message` (extra fields are dropped) —
+                # this keeps the Phase 5 planning/tools/generation split visible.
                 log.info(
-                    "llm_stream_complete",
+                    f"llm_stream_complete planning_ms={planning_ms} tools_ms={tools_ms} "
+                    f"num_tools={num_tools} gen_ms={generation_ms} ttft_ms={ttft_ms} "
+                    f"tokens={token_count}",
                     extra={
                         "ttft_ms": ttft_ms,
-                        "total_ms": total_ms,
+                        "planning_ms": planning_ms,
+                        "tools_ms": tools_ms,
+                        "num_tools": num_tools,
+                        "generation_ms": generation_ms,
+                        "total_ms": planning_ms + tools_ms + generation_ms,
                         "token_count": token_count,
                         "trip_id": str(trip.id),
                     },
@@ -433,6 +466,10 @@ async def confirm_filter_endpoint(
 
 async def _geocode_location(query: str) -> dict | None:
     """Geocode a free-text location string via HERE Geocoding API."""
+    # HERE kill-switch (batch/benchmark — spec §11.1): never call HERE geocoding.
+    if settings.here_disabled:
+        log.warning("geocode_skipped_here_disabled", extra={"query": query})
+        return None
     # Counts against the monthly HERE budget (§19.6). If the cap is exhausted,
     # skip the HERE call and treat the location as unresolved.
     if await here_budget.reserve(1) == 0:

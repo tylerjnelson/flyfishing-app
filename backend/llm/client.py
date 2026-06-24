@@ -64,13 +64,53 @@ def transcribe_audio(audio_bytes: bytes) -> str:
 # Ollama
 # ---------------------------------------------------------------------------
 
-RESIDENT_MODELS = {"llama3.1:8b-instruct-q4_K_M", "nomic-embed-text"}
-CHAT_MODEL = "llama3.1:8b-instruct-q4_K_M"
+# Gemma 4 E4B is the migration target (Phase 1). The 2026-06-16 batch comparison
+# confirmed it: 0% [RECOMMEND]-leak / 100% ≥3-card / 67% FILTER_UPDATE vs llama's
+# 22% / 94% / 33% — the structured-token reliability the card pipeline depends on.
+# Overridable via env (FLYFISH_CHAT_MODEL) so batch/benchmark runs can select a model.
+CHAT_MODEL = os.environ.get("FLYFISH_CHAT_MODEL", "gemma4:e4b-it-q4_K_M")
+RESIDENT_MODELS = {CHAT_MODEL, "nomic-embed-text"}
 VISION_MODEL = "llama3.2-vision:11b-instruct-q4_K_M"
 EMBED_MODEL = "nomic-embed-text"
 
 _GENERATE_URL = "/api/generate"
+_CHAT_URL = "/api/chat"
 _TIMEOUT = httpx.Timeout(connect=5.0, read=1800.0, write=10.0, pool=5.0)
+
+
+async def ollama_chat(
+    model: str,
+    messages: list[dict],
+    *,
+    tools: list[dict] | None = None,
+    temperature: float = 0.0,
+    num_ctx: int = 16384,
+    keep_alive: int = -1,
+) -> dict:
+    """
+    Non-streaming /api/chat call.  Returns the assistant `message` dict, which
+    may carry a `tool_calls` array when `tools` are supplied and the model
+    elects to call one (native function calling).
+
+    Used for the Phase 5 planning pass (5a): the model decides whether to fetch
+    extra context before the streamed generation pass.  Non-streaming because we
+    need the complete tool_calls array before we can act on it.
+    """
+    payload: dict = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+        "options": {"temperature": temperature, "num_ctx": num_ctx},
+        "keep_alive": keep_alive,
+    }
+    if tools:
+        payload["tools"] = tools
+
+    async with httpx.AsyncClient(base_url=settings.ollama_base_url, timeout=_TIMEOUT) as client:
+        resp = await client.post(_CHAT_URL, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+    return data.get("message", {}) or {}
 
 
 async def ollama_generate(
