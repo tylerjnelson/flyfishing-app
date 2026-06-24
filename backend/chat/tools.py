@@ -8,18 +8,32 @@ TOOL_SCHEMAS — Ollama-compatible function definitions (OpenAI format).
 execute_tool() — dispatch by name, return JSON-serialisable result dict.
 """
 
+import asyncio
 import json
 import logging
 import re
+import time
 import uuid as _uuid_mod
+from dataclasses import dataclass, field
 
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models import ConditionsCache, FishingSpot, Message, Note, WaterBody
+from llm.client import ollama_chat
+from prompts.registry import PLANNING_SYSTEM_PROMPT
 from rag.embedder import embed_text
 
 log = logging.getLogger(__name__)
+
+# Cap on tool calls executed per turn, to bound planning latency (§Phase 5b).
+MAX_TOOL_CALLS = 4
+# Small context for the planning pass — it sees only a compact spot list + the
+# conversation, never the full conditions block, so a large window is wasteful
+# and slow on CPU. This is the main lever on planning-pass latency.
+PLANNING_NUM_CTX = 4096
+# Cap how many spots are listed to the planner (id + name + type only).
+_PLANNING_SPOT_CAP = 12
 
 # ---------------------------------------------------------------------------
 # Tool schemas (sent to Ollama in the planning pass)
@@ -194,11 +208,179 @@ async def execute_tool(
             return await _get_my_previous_recommendations(
                 db, arguments.get("conversation_id") or conversation_id
             )
-        log.warning("unknown_tool", extra={"name": name})
+        log.warning("unknown_tool", extra={"tool": name})
         return {"error": f"unknown tool: {name}"}
     except Exception as exc:
-        log.warning("tool_execution_error", extra={"name": name, "reason": str(exc)})
+        log.warning("tool_execution_error", extra={"tool": name, "reason": str(exc)})
         return {"error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# Two-phase planning orchestration (Phase 5a + 5b)
+# ---------------------------------------------------------------------------
+
+# A turn is "trivial" — needing no extra fetches beyond the pre-stuffed context —
+# when it neither asks a question nor probes notes / conditions / regs / history.
+# Skipping the planning pass on these turns avoids ~10-30s of overhead (§Phase 5.6).
+_PROBE_RE = re.compile(
+    r"\b(compare|versus|vs|regulation|regs|stocked|stocking|permit|fly[- ]?only|"
+    r"conditions?|flow|cfs|temperature|water\s*temp|notes?|last\s*time|previous|"
+    r"recommend|you\s+(said|mentioned)|history|past\s+trip|species|hatch|"
+    r"caught|access)\b",
+    re.IGNORECASE,
+)
+
+
+def should_skip_planning(message_text: str, has_history: bool = False) -> bool:
+    """
+    Return True when the planning pass can be skipped entirely.
+
+    Skipped when:
+      - This is the opening turn (no prior conversation). The opening
+        recommendation already receives full conditions + notes context, so a
+        tool fetch is never needed — and the planning pass costs ~85s on CPU.
+      - The message is trivial (no question, no probe keyword) on a later turn.
+
+    On follow-up turns, any question mark or probe keyword forces a planning pass.
+    """
+    t = (message_text or "").strip()
+    if not has_history:
+        return True
+    if not t:
+        return True
+    if "?" in t:
+        return False
+    return _PROBE_RE.search(t) is None
+
+
+@dataclass
+class PlanningResult:
+    """Outcome of the planning pass — messages to inject + timing metrics."""
+
+    tool_messages: list[dict] = field(default_factory=list)
+    planning_ms: int = 0
+    tools_ms: int = 0
+    num_tools: int = 0
+    skipped: bool = False
+
+
+def _coerce_args(arguments) -> dict:
+    """Tool-call arguments may arrive as a dict or a JSON string — normalise."""
+    if isinstance(arguments, dict):
+        return arguments
+    if isinstance(arguments, str):
+        try:
+            parsed = json.loads(arguments)
+            return parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def _build_planning_messages(
+    messages: list[dict], candidates: list[dict] | None
+) -> list[dict]:
+    """
+    Construct the trimmed context for the planning pass: a compact planning
+    system prompt + a short spot list (id/name/type), followed by the
+    conversation history and current user message. Deliberately drops the
+    original system message (which carries the full conditions block) — the
+    planner only needs to decide which tools to fetch, so re-processing every
+    spot's conditions on CPU is pure latency. This is the optimisation that
+    brings the planning pass back from ~280s to a few seconds.
+    """
+    candidates = candidates or []
+    spot_lines = []
+    for c in candidates[:_PLANNING_SPOT_CAP]:
+        name = c.get("spot_name") or c.get("water_body_name") or c.get("name") or "unknown"
+        spot_lines.append(f"{c.get('spot_id')} — {name} ({c.get('spot_type', '?')})")
+    spot_block = (
+        "Available spots:\n" + "\n".join(spot_lines)
+        if spot_lines else "Available spots: (none in current context)"
+    )
+    system = PLANNING_SYSTEM_PROMPT.strip() + "\n\n" + spot_block
+    # Keep history + current user query; drop the heavy original system message.
+    tail = [m for m in messages if m.get("role") != "system"]
+    return [{"role": "system", "content": system}, *tail]
+
+
+async def run_tool_planning(
+    messages: list[dict],
+    *,
+    conversation_id: str,
+    db: AsyncSession,
+    model: str,
+    candidates: list[dict] | None = None,
+) -> PlanningResult:
+    """
+    Run the planning pass (5a) and tool execution (5b) for one chat turn.
+
+    5a: send a TRIMMED context (compact spot list + conversation, not the full
+        conditions block) plus the tool catalog to the model; it either declares
+        tool calls (native function calling) or returns no calls.
+    5b: execute up to MAX_TOOL_CALLS tools in parallel and package the
+        assistant tool-call message plus each tool result as `tool` messages,
+        ready to be appended to the generation-pass context (5c).
+
+    Never raises — a failed planning call returns an empty (no-op) result so the
+    turn falls through to a plain generation pass.
+    """
+    planning_messages = _build_planning_messages(messages, candidates)
+    t0 = time.monotonic()
+    try:
+        msg = await ollama_chat(
+            model, planning_messages, tools=TOOL_SCHEMAS,
+            temperature=0.0, num_ctx=PLANNING_NUM_CTX,
+        )
+    except Exception as exc:
+        log.warning("planning_pass_failed", extra={"reason": str(exc)})
+        return PlanningResult(planning_ms=round((time.monotonic() - t0) * 1000))
+    planning_ms = round((time.monotonic() - t0) * 1000)
+
+    tool_calls = msg.get("tool_calls") or []
+    if not tool_calls:
+        return PlanningResult(planning_ms=planning_ms)
+
+    if len(tool_calls) > MAX_TOOL_CALLS:
+        log.info("planning_tool_cap", extra={"requested": len(tool_calls), "cap": MAX_TOOL_CALLS})
+        tool_calls = tool_calls[:MAX_TOOL_CALLS]
+
+    async def _run(tc: dict) -> tuple[str, dict]:
+        fn = tc.get("function", {}) or {}
+        name = fn.get("name", "")
+        args = _coerce_args(fn.get("arguments"))
+        result = await execute_tool(name, args, conversation_id=conversation_id, db=db)
+        return name, result
+
+    t1 = time.monotonic()
+    results = await asyncio.gather(*[_run(tc) for tc in tool_calls])
+    tools_ms = round((time.monotonic() - t1) * 1000)
+
+    # The assistant tool-call message must precede its tool results so the model
+    # can pair them on the generation pass.
+    tool_messages: list[dict] = [
+        {"role": "assistant", "content": msg.get("content", "") or "", "tool_calls": tool_calls}
+    ]
+    for name, result in results:
+        tool_messages.append(
+            {"role": "tool", "tool_name": name, "content": json.dumps(result, default=str)}
+        )
+
+    log.info(
+        "planning_complete",
+        extra={
+            "num_tools": len(tool_calls),
+            "tools": [tc.get("function", {}).get("name") for tc in tool_calls],
+            "planning_ms": planning_ms,
+            "tools_ms": tools_ms,
+        },
+    )
+    return PlanningResult(
+        tool_messages=tool_messages,
+        planning_ms=planning_ms,
+        tools_ms=tools_ms,
+        num_tools=len(tool_calls),
+    )
 
 
 # ---------------------------------------------------------------------------
