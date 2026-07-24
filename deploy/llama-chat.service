@@ -1,0 +1,28 @@
+[Unit]
+# Flyfish Phase 1 (Option B) — interactive gemma-4-E4B chat instance on llama.cpp.
+# Serves the planning pass (native tool calling) + streaming generation for the
+# chat path when FLYFISH_CHAT_ENGINE=llamacpp. Weights are mmap-shared with
+# llama-util.service (same GGUF). See deploy/README-phase1-llamacpp.md.
+Description=llama.cpp chat instance (gemma-4-E4B) — Flyfish Option B
+After=network.target
+
+[Service]
+Type=simple
+User=flyfish
+Group=flyfish
+# The b10091 shared libraries ship alongside the binary in the same dir.
+Environment=LD_LIBRARY_PATH=/opt/flyfish/llamacpp/bin
+ExecStart=/opt/flyfish/llamacpp/bin/llama-server \
+  --model /opt/flyfish/llamacpp/models/gemma-4-E4B_q4_0-it.gguf \
+  --alias gemma \
+  --host 127.0.0.1 --port 8080 \
+  --jinja --reasoning on \
+  --swa-full --slot-save-path /opt/flyfish/llamacpp/slots \
+  --parallel 1 --ctx-size 16384 --threads 4
+Restart=always
+RestartSec=5
+# ~100 s model load budget before systemd treats a non-start as failure.
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target

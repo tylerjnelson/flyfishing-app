@@ -1,0 +1,31 @@
+[Unit]
+# Flyfish Phase 1 (Option B) — background "utility" gemma-4-E4B instance on llama.cpp.
+# Serves the three non-interactive tasks (field extraction, location extraction,
+# debrief summarisation) over templated /v1/chat/completions when
+# FLYFISH_CHAT_ENGINE=llamacpp. Its own KV slot means a background note-ingestion
+# job can never evict the chat instance's pre-warmed KV. Weights are mmap-shared
+# with llama-chat.service (same GGUF, ~0 extra RAM). See README-phase1-llamacpp.md.
+Description=llama.cpp utility instance (gemma-4-E4B) — Flyfish Option B
+After=network.target
+
+[Service]
+Type=simple
+User=flyfish
+Group=flyfish
+Environment=LD_LIBRARY_PATH=/opt/flyfish/llamacpp/bin
+# Lean + stateless: reasoning OFF (one-shot extraction/summaries don't think),
+# thread-capped so a background job can't starve a live chat turn on the 4-core
+# box, small context, mmap default (NEVER --no-mmap — that would un-share weights),
+# and no --swa-full/--slot-save-path (nothing to persist).
+ExecStart=/opt/flyfish/llamacpp/bin/llama-server \
+  --model /opt/flyfish/llamacpp/models/gemma-4-E4B_q4_0-it.gguf \
+  --alias gemma \
+  --host 127.0.0.1 --port 8081 \
+  --jinja --reasoning off \
+  --parallel 1 --ctx-size 4096 --threads 2
+Restart=always
+RestartSec=5
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target

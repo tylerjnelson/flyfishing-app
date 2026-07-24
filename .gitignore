@@ -49,5 +49,6 @@ backend/scripts/benchmark_gemma4.py
 backend/scripts/run_conversation.py
 backend/scripts/run_model_comparison.sh
 backend/scripts/e2e_http.py
+backend/scripts/tool_layer_probe.py
 backend/scripts/migrate.sh
 backend/scripts/batch_results_*/

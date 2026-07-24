@@ -32,11 +32,24 @@ _CANDIDATE_THRESHOLD = 0.50
 
 _LOCATION_DEFAULT = {"location_string": "", "confidence": "none"}
 
+# JSON Schema enforced via response_format under the llama.cpp utility engine
+# (Phase 1 / Phase 0g). Ignored on ollama, so behaviour there is unchanged.
+_LOCATION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "location_string": {"type": "string"},
+        "confidence": {"type": "string", "enum": ["high", "medium", "low", "none"]},
+    },
+    "required": ["location_string", "confidence"],
+}
+
 
 async def extract_location(note_text: str) -> dict:
     """Call Llama 3.1 8B to extract the fishing location from note text."""
     prompt = LOCATION_EXTRACTION_PROMPT.format(note_text=note_text)
-    result = await call_json_llm(prompt, CHAT_MODEL, _LOCATION_DEFAULT)
+    result = await call_json_llm(
+        prompt, CHAT_MODEL, _LOCATION_DEFAULT, schema=_LOCATION_SCHEMA
+    )
     return result
 
 

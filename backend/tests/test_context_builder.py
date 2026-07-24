@@ -24,6 +24,7 @@ import pytest
 from chat.context_builder import (
     _apply_variety_rotation,
     _cfs_out_of_range,
+    _filter_excluded,
     _has_active_closure,
     _wildfire_near_spot,
 )
@@ -292,3 +293,33 @@ class TestVarietyRotation:
         # No rotation; "f" should stay at position 5 (index 5), not injected at 4
         assert result[4]["spot_id"] == "e"
         assert result[5]["spot_id"] == "f"
+
+
+# ---------------------------------------------------------------------------
+# _filter_excluded — pipeline re-run must not resurface set-aside spots
+# ---------------------------------------------------------------------------
+
+class TestFilterExcluded:
+    def _pair(self, spot_id):
+        fs = make_spot()
+        fs.id = spot_id  # str(fs.id) is the exclusion key
+        return (fs, MagicMock())
+
+    def test_empty_excluded_returns_pairs_unchanged(self):
+        pairs = [self._pair("a"), self._pair("b")]
+        assert _filter_excluded(pairs, set()) is pairs
+
+    def test_drops_excluded_spot(self):
+        pairs = [self._pair("a"), self._pair("b"), self._pair("c")]
+        out = _filter_excluded(pairs, {"b"})
+        assert [str(fs.id) for fs, _ in out] == ["a", "c"]
+
+    def test_drops_multiple_excluded(self):
+        pairs = [self._pair("a"), self._pair("b"), self._pair("c")]
+        out = _filter_excluded(pairs, {"a", "c"})
+        assert [str(fs.id) for fs, _ in out] == ["b"]
+
+    def test_excluded_id_absent_is_noop(self):
+        pairs = [self._pair("a"), self._pair("b")]
+        out = _filter_excluded(pairs, {"zzz"})
+        assert [str(fs.id) for fs, _ in out] == ["a", "b"]

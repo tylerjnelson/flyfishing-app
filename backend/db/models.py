@@ -241,6 +241,15 @@ class Conversation(Base):
     # written by streaming handler when [FILTER_UPDATE] intercepted;
     # read by POST /chat/confirm-filter; cleared after Yes or No
 
+    # Agentic-harness transcript state (Phase 2). frozen_context holds the
+    # verbatim rendered stable prefix (top-3 bundles + compact menu + history/
+    # maps) as TEXT — byte-exact so it can seed a llama.cpp slot restore /
+    # prefix match (Phase 4); frozen_context_at stamps its as-of freshness.
+    # context_state is the Phase 6 budget guard (inert until then).
+    frozen_context = Column(Text)
+    frozen_context_at = Column(DateTime(timezone=True))
+    context_state = Column(Text)
+
     user = relationship("User", back_populates="conversations")
     trip = relationship("Trip", back_populates="conversations")
     messages = relationship("Message", back_populates="conversation")
@@ -251,9 +260,25 @@ class Message(Base):
 
     id = Column(Uuid(), primary_key=True, default=uuid.uuid4)
     conversation_id = Column(Uuid(), ForeignKey("conversations.id"))
-    role = Column(String, nullable=False)  # user | assistant
+    role = Column(String, nullable=False)  # user | assistant | tool
     content = Column(Text, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    # Per-conversation monotonic ordinal (Phase 2). Transcript order MUST come
+    # from `seq`, NOT `created_at`: created_at is server_default=now() and
+    # Postgres now() is transaction-start time, so every row an agentic turn
+    # commits in one transaction shares a byte-identical timestamp — ordering
+    # by it is non-deterministic once a turn appends more than one row
+    # (user -> assistant[tool_calls] -> tool digest -> assistant[final]).
+    # Assigned max(seq)+1 at append; backfilled by (created_at, id) in 0011.
+    seq = Column(Integer)
+
+    # Tool-turn columns (Phase 2 schema; written by the Phase 3 loop). A
+    # role="assistant" row may carry tool_calls (the model's requested calls);
+    # a role="tool" row carries tool_name + digest (the compact result).
+    tool_name = Column(String)
+    tool_calls = Column(JSONB)
+    digest = Column(Text)
 
     conversation = relationship("Conversation", back_populates="messages")
 

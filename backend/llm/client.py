@@ -69,7 +69,15 @@ def transcribe_audio(audio_bytes: bytes) -> str:
 # 22% / 94% / 33% — the structured-token reliability the card pipeline depends on.
 # Overridable via env (FLYFISH_CHAT_MODEL) so batch/benchmark runs can select a model.
 CHAT_MODEL = os.environ.get("FLYFISH_CHAT_MODEL", "gemma4:e4b-it-q4_K_M")
-RESIDENT_MODELS = {CHAT_MODEL, "nomic-embed-text"}
+# Under the llama.cpp engine (Phase 1) gemma is served by llama-server, NOT ollama,
+# so it must not be pinned resident in ollama (that would double-load it and blow the
+# 23 GB box). Only nomic-embed stays resident there. Rollback (engine=ollama) restores
+# gemma to the resident set atomically — same FLYFISH_CHAT_ENGINE flag.
+RESIDENT_MODELS = (
+    {"nomic-embed-text"}
+    if settings.chat_engine == "llamacpp"
+    else {CHAT_MODEL, "nomic-embed-text"}
+)
 VISION_MODEL = "llama3.2-vision:11b-instruct-q4_K_M"
 EMBED_MODEL = "nomic-embed-text"
 
@@ -96,6 +104,16 @@ async def ollama_chat(
     extra context before the streamed generation pass.  Non-streaming because we
     need the complete tool_calls array before we can act on it.
     """
+    # Phase 1 (Option B): route the gemma chat/planning pass to the llama-server
+    # chat instance. Returns the same ollama-shaped message dict, so callers are
+    # unchanged. num_ctx is a launch flag on that server (-c 16384), not per-request.
+    if settings.chat_engine == "llamacpp" and model == CHAT_MODEL:
+        from llm import llamacpp
+        return await llamacpp.chat(
+            messages, base_url=settings.llama_chat_url,
+            tools=tools, temperature=temperature,
+        )
+
     payload: dict = {
         "model": model,
         "messages": messages,
@@ -132,6 +150,16 @@ async def ollama_generate(
     keep_alive=-1 keeps resident models loaded indefinitely.
     keep_alive=0 evicts the model immediately after the response (vision only).
     """
+    # Phase 1 (Option B): gemma prose generation (debrief) routes to the llama-server
+    # utility instance. Only CHAT_MODEL text calls — vision (images / VISION_MODEL) and
+    # embeddings always stay on ollama. JSON callers go through call_json_llm, which
+    # branches earlier with its schema, so `format` never reaches here under llamacpp.
+    if settings.chat_engine == "llamacpp" and model == CHAT_MODEL and not images:
+        from llm import llamacpp
+        return await llamacpp.complete(
+            prompt, base_url=settings.llama_util_url, temperature=temperature, schema=None,
+        )
+
     payload: dict = {
         "model": model,
         "prompt": prompt,
@@ -164,6 +192,7 @@ async def call_json_llm(
     default: dict,
     images: list[str] | None = None,
     keep_alive: int | None = None,
+    schema: dict | None = None,
 ) -> dict:
     """
     Call the LLM expecting a JSON response.  Retries once with a correction
@@ -175,19 +204,33 @@ async def call_json_llm(
       Pass keep_alive=60 for intermediate vision calls so the model stays warm across
       consecutive calls in the same ingestion pipeline run.
     images: list of base64-encoded image strings (required for vision model calls).
+    schema: JSON Schema enforced via response_format when the llama.cpp utility
+      engine is active (Phase 1). Ignored on ollama (which uses format="json") and
+      for vision calls, so behaviour there is byte-identical to before.
     """
     if keep_alive is None:
         keep_alive = -1 if model in RESIDENT_MODELS else 0
 
+    # Phase 1 (Option B): text gemma JSON tasks (field/location extraction) route to
+    # the llama-server utility instance with response_format json_schema (Phase 0g:
+    # constraint mandatory). Vision JSON (images) stays on ollama, untouched.
+    use_llamacpp = settings.chat_engine == "llamacpp" and model == CHAT_MODEL and not images
+
     for attempt in range(2):
-        raw = await ollama_generate(
-            model,
-            prompt,
-            temperature=0.0,
-            format="json",
-            keep_alive=keep_alive,
-            images=images,
-        )
+        if use_llamacpp:
+            from llm import llamacpp
+            raw = await llamacpp.complete(
+                prompt, base_url=settings.llama_util_url, temperature=0.0, schema=schema,
+            )
+        else:
+            raw = await ollama_generate(
+                model,
+                prompt,
+                temperature=0.0,
+                format="json",
+                keep_alive=keep_alive,
+                images=images,
+            )
         cleaned = raw.strip().lstrip("```json").rstrip("```").strip()
         try:
             return json.loads(cleaned)
