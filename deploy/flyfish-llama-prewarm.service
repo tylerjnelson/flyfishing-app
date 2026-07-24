@@ -1,0 +1,21 @@
+[Unit]
+# Flyfish Phase 1 (Option B) — static-prefix pre-warm (Piece 3). Cold-prefills the
+# chat instance's slot 0 with the static planning prefix (system prompt + tools) at
+# boot, then saves the slot so restarts restore instead of re-prefilling on CPU.
+Description=Flyfish llama-server static-prefix pre-warm
+After=llama-chat.service
+Requires=llama-chat.service
+
+[Service]
+Type=oneshot
+User=flyfish
+Group=flyfish
+# App env supplies APP_SECRET_KEY / DATABASE_URL etc. that the imported app modules
+# require, plus any FLYFISH_LLAMA_CHAT_URL override (defaults to 127.0.0.1:8080).
+EnvironmentFile=/etc/flyfish/app.env
+WorkingDirectory=/opt/flyfish/backend
+ExecStart=/opt/flyfish/venv/bin/python scripts/prewarm_llama.py
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

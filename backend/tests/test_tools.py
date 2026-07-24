@@ -17,6 +17,8 @@ from chat.tools import (
     TOOL_SCHEMAS,
     _build_planning_messages,
     _coerce_args,
+    _digest_compare,
+    _digest_search,
     execute_tool,
     run_tool_planning,
     should_skip_planning,
@@ -28,14 +30,12 @@ from chat.tools import (
 # ---------------------------------------------------------------------------
 
 def test_tool_schema_shape():
+    # Phase 5: 6 tools collapsed to 3 (get_spot folds in details/conditions/notes).
     names = {t["function"]["name"] for t in TOOL_SCHEMAS}
     assert names == {
-        "get_notes_for_spot",
-        "get_historical_conditions",
-        "get_spot_details",
+        "get_spot",
         "compare_spots",
         "search_notes_by_text",
-        "get_my_previous_recommendations",
     }
     for t in TOOL_SCHEMAS:
         assert t["type"] == "function"
@@ -103,8 +103,9 @@ def test_coerce_args_bad():
 @pytest.mark.asyncio
 async def test_execute_tool_unknown():
     db = MagicMock()
-    out = await execute_tool("does_not_exist", {}, conversation_id="c", db=db)
-    assert "error" in out
+    full, digest = await execute_tool("does_not_exist", {}, conversation_id="c", db=db)
+    assert "error" in full
+    assert "unknown tool" in digest
 
 
 # ---------------------------------------------------------------------------
@@ -166,11 +167,12 @@ async def test_planning_executes_and_packages():
     msg = {
         "content": "",
         "tool_calls": [
-            _call("get_spot_details", {"spot_id": "s1"}),
-            _call("get_notes_for_spot", '{"spot_id": "s2"}'),  # JSON-string args
+            _call("get_spot", {"spot_id": "s1"}),
+            _call("search_notes_by_text", '{"query": "hoppers"}'),  # JSON-string args
         ],
     }
-    exec_mock = AsyncMock(side_effect=lambda name, args, **kw: {"ok": name})
+    # Phase 5 execute_tool contract: returns (full_result, digest).
+    exec_mock = AsyncMock(side_effect=lambda name, args, **kw: ({"ok": name}, f"{name}-digest"))
     chat_mock = AsyncMock(return_value=msg)
     with patch("chat.tools.ollama_chat", new=chat_mock), \
          patch("chat.tools.execute_tool", new=exec_mock):
@@ -184,20 +186,20 @@ async def test_planning_executes_and_packages():
     assert res.tool_messages[0]["tool_calls"] == msg["tool_calls"]
     tool_msgs = res.tool_messages[1:]
     assert [m["role"] for m in tool_msgs] == ["tool", "tool"]
-    assert {m["tool_name"] for m in tool_msgs} == {"get_spot_details", "get_notes_for_spot"}
-    # Content is JSON-serialised tool output.
-    assert json.loads(tool_msgs[0]["content"]) == {"ok": "get_spot_details"}
+    assert {m["tool_name"] for m in tool_msgs} == {"get_spot", "search_notes_by_text"}
+    # Two-pass path injects the FULL result (not the digest) for the generation pass.
+    assert json.loads(tool_msgs[0]["content"]) == {"ok": "get_spot"}
     # The JSON-string args were coerced to a dict before dispatch.
     second_call_args = exec_mock.await_args_list[1].args[1]
-    assert second_call_args == {"spot_id": "s2"}
+    assert second_call_args == {"query": "hoppers"}
 
 
 @pytest.mark.asyncio
 async def test_planning_caps_tool_calls():
     db = MagicMock()
-    msg = {"content": "", "tool_calls": [_call("get_spot_details", {"spot_id": str(i)}) for i in range(7)]}
+    msg = {"content": "", "tool_calls": [_call("get_spot", {"spot_id": str(i)}) for i in range(7)]}
     with patch("chat.tools.ollama_chat", new=AsyncMock(return_value=msg)), \
-         patch("chat.tools.execute_tool", new=AsyncMock(return_value={})):
+         patch("chat.tools.execute_tool", new=AsyncMock(return_value=({}, ""))):
         res = await run_tool_planning([], conversation_id="c", db=db, model="m")
     assert res.num_tools == MAX_TOOL_CALLS
     assert len(res.tool_messages) == MAX_TOOL_CALLS + 1  # +1 assistant message
@@ -211,3 +213,101 @@ async def test_planning_failure_is_noop():
         res = await run_tool_planning([], conversation_id="c", db=db, model="m")
     assert res.tool_messages == []
     assert res.num_tools == 0
+
+
+# ---------------------------------------------------------------------------
+# get_spot — the collapsed per-spot tool (Phase 5)
+# ---------------------------------------------------------------------------
+
+def _cand(sid="s1", name="Yakima"):
+    return {"fishing_spot_id": sid, "water_body_id": "w1", "spot_name": name,
+            "water_body_name": name, "spot_type": "river", "conditions": {}}
+
+
+@pytest.mark.asyncio
+async def test_get_spot_returns_bundle_and_digest_is_the_bundle():
+    # A promoted spot arrives with EVERYTHING (conditions+notes+details) via the
+    # shared formatter, and its digest IS that full bundle (persists like a top-3).
+    db = MagicMock()
+    with patch("chat.tools._fetch_spot_notes", new=AsyncMock(return_value=[{"x": 1}])), \
+         patch("chat.tools._fetch_spot_details", new=AsyncMock(return_value={"fly_fishing_legal": True})), \
+         patch("chat.tools._format_spot_bundle", return_value="=== Yakima ===\nFlow: 450 CFS"):
+        full, digest = await execute_tool(
+            "get_spot", {"spot_id": "s1"}, conversation_id="c", db=db,
+            candidates=[_cand()], active_ids=set(), excluded_ids=set(),
+        )
+    assert full["spot_id"] == "s1"
+    assert full["name"] == "Yakima"
+    assert full["bundle"] == "=== Yakima ===\nFlow: 450 CFS"
+    assert digest == full["bundle"]          # digest IS the full bundle
+
+
+@pytest.mark.asyncio
+async def test_get_spot_active_set_short_circuits_without_fetch():
+    # Spot already loaded (frozen top-3 or already promoted) → pointer, never re-fetch.
+    db = MagicMock()
+    notes = AsyncMock(return_value=[])
+    with patch("chat.tools._fetch_spot_notes", new=notes), \
+         patch("chat.tools._fetch_spot_details", new=AsyncMock(return_value={})), \
+         patch("chat.tools._format_spot_bundle", return_value="BUNDLE"):
+        full, digest = await execute_tool(
+            "get_spot", {"spot_id": "s1"}, conversation_id="c", db=db,
+            candidates=[_cand()], active_ids={"s1"}, excluded_ids=set(),
+        )
+    assert full["status"] == "already_in_context"
+    assert digest == "Yakima is already in your context"
+    notes.assert_not_awaited()               # short-circuit — no DB read
+
+
+@pytest.mark.asyncio
+async def test_get_spot_excluded_short_circuits():
+    db = MagicMock()
+    notes = AsyncMock(return_value=[])
+    with patch("chat.tools._fetch_spot_notes", new=notes):
+        full, digest = await execute_tool(
+            "get_spot", {"spot_id": "s1"}, conversation_id="c", db=db,
+            candidates=[_cand()], active_ids=set(), excluded_ids={"s1"},
+        )
+    assert full["status"] == "set_aside"
+    assert digest == "Yakima was set aside earlier"
+    notes.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_get_spot_not_found_is_error():
+    db = MagicMock()
+    with patch("chat.tools._build_candidate_from_db", new=AsyncMock(return_value=None)):
+        full, digest = await execute_tool(
+            "get_spot", {"spot_id": "ghost"}, conversation_id="c", db=db,
+            candidates=[], active_ids=set(), excluded_ids=set(),
+        )
+    assert "error" in full
+    assert digest == "spot not found"
+
+
+@pytest.mark.asyncio
+async def test_get_spot_missing_id_is_error():
+    db = MagicMock()
+    full, digest = await execute_tool("get_spot", {}, conversation_id="c", db=db)
+    assert full["error"] == "spot_id required"
+
+
+def test_digest_helpers_are_one_liners():
+    assert _digest_search({"query": "hoppers", "count": 3}) == '3 note(s) match "hoppers"'
+    assert _digest_search({"error": "boom"}) == "note search failed: boom"
+    assert _digest_compare({"comparison": [{"name": "A"}, {"name": "B"}]}) == "compared: A, B"
+    assert _digest_compare({"error": "boom"}) == "compare failed: boom"
+
+
+def test_tool_layer_never_touches_here():
+    """Standing constraint (spec §11.1, Phase 5 validation): the loop's HERE cost
+    surface is ZERO — every tool is a pure DB read. Guard against a future
+    HERE/geocoding/routing-touching tool being wired into the catalog by asserting the
+    module never references those call paths. (`find_spots` never existed.)"""
+    import inspect
+
+    import chat.tools as tools_mod
+
+    src = inspect.getsource(tools_mod)
+    for banned in ("here_budget", "conditions.routing", "fetch_route", "geocode"):
+        assert banned not in src, f"HERE/routing leaked into the tool layer: {banned!r}"

@@ -46,6 +46,33 @@ _VALID_NEGATIVE_REASONS = {"conditions", "access", "fish_absence", "gear", "unkn
 _VALID_OUTCOMES = {"positive", "neutral", "negative"}
 _VALID_TIME_OF_DAY = {"morning", "afternoon", "evening", "all-day"}
 
+# JSON Schema enforced via response_format when the llama.cpp utility engine is
+# active (Phase 1 / Phase 0g). Derived from the valid-value sets above so it can't
+# drift from _sanitise_fields; nullable fields include null in their enum. Ignored
+# on ollama (which uses format="json"), so ollama behaviour is unchanged.
+_FIELD_EXTRACTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "species": {"type": "array", "items": {"type": "string"}},
+        "flies": {"type": "array", "items": {"type": "string"}},
+        "outcome": {"type": "string", "enum": sorted(_VALID_OUTCOMES)},
+        "negative_reason": {
+            "type": ["string", "null"],
+            "enum": sorted(_VALID_NEGATIVE_REASONS) + [None],
+        },
+        "approx_cfs": {"type": ["number", "null"]},
+        "approx_temp": {"type": ["number", "null"]},
+        "time_of_day": {
+            "type": ["string", "null"],
+            "enum": sorted(_VALID_TIME_OF_DAY) + [None],
+        },
+    },
+    "required": [
+        "species", "flies", "outcome", "negative_reason",
+        "approx_cfs", "approx_temp", "time_of_day",
+    ],
+}
+
 
 def _sanitise_fields(fields: dict) -> dict:
     """
@@ -102,7 +129,9 @@ async def _ingest_typed(note_id: UUID, db: AsyncSession) -> None:
 
     # Field extraction
     prompt = FIELD_EXTRACTION_PROMPT.format(note_text=note.content)
-    fields = await call_json_llm(prompt, CHAT_MODEL, _FIELD_EXTRACTION_DEFAULT)
+    fields = await call_json_llm(
+        prompt, CHAT_MODEL, _FIELD_EXTRACTION_DEFAULT, schema=_FIELD_EXTRACTION_SCHEMA
+    )
     fields = _sanitise_fields(fields)
 
     # Spot resolution
@@ -175,7 +204,9 @@ async def _ingest_debrief(note_id: UUID, db: AsyncSession) -> None:
 
     # Field extraction
     prompt = FIELD_EXTRACTION_PROMPT.format(note_text=note.content)
-    fields = await call_json_llm(prompt, CHAT_MODEL, _FIELD_EXTRACTION_DEFAULT)
+    fields = await call_json_llm(
+        prompt, CHAT_MODEL, _FIELD_EXTRACTION_DEFAULT, schema=_FIELD_EXTRACTION_SCHEMA
+    )
     fields = _sanitise_fields(fields)
 
     # Embedding

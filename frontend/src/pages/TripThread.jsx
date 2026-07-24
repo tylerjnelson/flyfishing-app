@@ -4,10 +4,14 @@
  * Full planning/IN_WINDOW conversation with streaming SSE from /api/chat.
  * Handles:
  *   - Token-by-token streaming via fetch + ReadableStream
+ *   - tool_status → live "Thinking…/Looking up…" label during silent hops
  *   - filter_confirmation_required → Yes/No confirmation card
  *   - drive_time_unavailable → persistent banner
+ *   - context_warning → soft nudge banner (Phase 6 warn band)
+ *   - conversation_closed → length-limit card routing to a new trip (Phase 6 hard stop)
  *   - IN_WINDOW mode → note-logging nudge on assistant responses
- *   - Map images surfaced for top recommended spots
+ *   - Map images surfaced for the confirmed spot (prep reference, keyed off
+ *     trip.fishing_spot_id — opaque to the model; deferred until maps exist)
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react'
@@ -75,6 +79,30 @@ function InWindowNudge() {
   )
 }
 
+// Phase 6 warn band — soft nudge while the conversation is still usable.
+function ContextWarningBanner({ message }) {
+  return (
+    <div className="mx-4 mt-3 px-3 py-2 bg-amber-50 border border-amber-200 rounded-lg text-sm text-amber-800">
+      {message}
+    </div>
+  )
+}
+
+// Phase 6 hard stop — the conversation is closed; route the user to a new trip.
+function ConversationClosedCard({ message }) {
+  return (
+    <div className="mx-4 my-2 px-4 py-3 bg-gray-100 border border-gray-300 rounded-lg text-center">
+      <p className="text-sm text-gray-700 mb-3">{message}</p>
+      <Link
+        to="/trips/new"
+        className="inline-block px-4 py-2 bg-blue-600 text-white text-sm rounded-lg font-medium hover:bg-blue-700"
+      >
+        Start a new trip
+      </Link>
+    </div>
+  )
+}
+
 function MessageBubble({ msg, isStreaming }) {
   const isUser = msg.role === 'user'
   return (
@@ -95,20 +123,24 @@ function MessageBubble({ msg, isStreaming }) {
   )
 }
 
-function MapThumbs({ spotIds }) {
+// Hand-drawn maps as prep reference for the CONFIRMED spot only — surfaced
+// regardless of whether asked, keyed off trip.fishing_spot_id, not the LLM's
+// recommendations (Phase 7). Maps stay opaque to the model. No map content
+// exists yet (deferred stretch goal); this serving path lights up when it does.
+function MapThumbs({ spotId }) {
   const [maps, setMaps] = useState([])
 
   useEffect(() => {
-    if (!spotIds || spotIds.length === 0) return
-    // Fetch map notes for the top recommended spots
+    if (!spotId) return
+    // Fetch map notes for the confirmed spot
     const params = new URLSearchParams({ source_type: 'map', limit: 10 })
     api.get(`/notes?${params}`).then(({ data }) => {
       const relevant = (data.notes || []).filter(
-        n => spotIds.includes(n.spot_id)
+        n => n.spot_id === spotId
       )
       setMaps(relevant)
     }).catch(() => {})
-  }, [spotIds?.join(',')])
+  }, [spotId])
 
   if (maps.length === 0) return null
 
@@ -142,7 +174,6 @@ export default function TripThread() {
   const [trip, setTrip] = useState(null)
   const [conversationId, setConversationId] = useState(null)
   const [messages, setMessages] = useState([])
-  const [topSpotIds, setTopSpotIds] = useState([])
   const [driveTimeUnavailable, setDriveTimeUnavailable] = useState(false)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
@@ -152,6 +183,9 @@ export default function TripThread() {
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [streamingContent, setStreamingContent] = useState('')
+  const [toolStatus, setToolStatus] = useState('')          // live hop label
+  const [contextWarning, setContextWarning] = useState(null) // Phase 6 warn band
+  const [conversationClosed, setConversationClosed] = useState(null) // Phase 6 hard stop
 
   const [pendingFilter, setPendingFilter] = useState(null)   // {key, value}
   const [confirmLoading, setConfirmLoading] = useState(false)
@@ -175,9 +209,6 @@ export default function TripThread() {
         setMessages(data.messages || [])
         setDriveTimeUnavailable(data.drive_time_unavailable || false)
         setUserMessageCount((data.messages || []).filter(m => m.role === 'user').length)
-
-        const candidates = data.session_candidates || []
-        setTopSpotIds(candidates.slice(0, 5).map(c => c.spot_id).filter(Boolean))
       })
       .catch(() => setError('Failed to load trip'))
       .finally(() => setLoading(false))
@@ -219,6 +250,7 @@ export default function TripThread() {
       let buffer = ''
       let accumulated = ''
       let pendingCards = []
+      let closed = false
 
       while (true) {
         const { done, value } = await reader.read()
@@ -234,15 +266,24 @@ export default function TripThread() {
             if (event.type === 'token') {
               accumulated += event.content
               setStreamingContent(accumulated)
+              setToolStatus('')  // content flowing — clear the hop label
+            } else if (event.type === 'tool_status') {
+              setToolStatus(event.label || '')
             } else if (event.type === 'drive_time_unavailable') {
               setDriveTimeUnavailable(true)
+            } else if (event.type === 'context_warning') {
+              setContextWarning(event.message)
+            } else if (event.type === 'conversation_closed') {
+              closed = true
+              setConversationClosed(event.message)
             } else if (event.type === 'spot_cards') {
               pendingCards = event.cards || []
             } else if (event.type === 'done') {
-              if (accumulated) {
+              if (accumulated && !closed) {
                 setMessages([{ id: Date.now(), role: 'assistant', content: accumulated, cards: pendingCards }])
               }
               setStreamingContent('')
+              setToolStatus('')
             }
           }
         }
@@ -260,11 +301,13 @@ export default function TripThread() {
   // ------------------------------------------------------------------
   const send = useCallback(async () => {
     const text = input.trim()
-    if (!text || streaming || !conversationId) return
+    if (!text || streaming || !conversationId || conversationClosed) return
 
     setInput('')
     setStreaming(true)
     setStreamingContent('')
+    setToolStatus('')
+    setContextWarning(null)
     setPendingFilter(null)
     setShowInWindowNudge(false)
 
@@ -290,6 +333,7 @@ export default function TripThread() {
       let buffer = ''
       let accumulated = ''
       let pendingCards = []
+      let closed = false
 
       while (true) {
         const { done, value } = await reader.read()
@@ -312,15 +356,25 @@ export default function TripThread() {
             if (event.type === 'token') {
               accumulated += event.content
               setStreamingContent(accumulated)
+              setToolStatus('')  // content flowing — clear the hop label
+            } else if (event.type === 'tool_status') {
+              setToolStatus(event.label || '')
             } else if (event.type === 'drive_time_unavailable') {
               setDriveTimeUnavailable(true)
+            } else if (event.type === 'context_warning') {
+              setContextWarning(event.message)
+            } else if (event.type === 'conversation_closed') {
+              // The closed message renders as a CTA card, so drop the duplicate
+              // answer token the refusal stream also emits for token-only clients.
+              closed = true
+              setConversationClosed(event.message)
             } else if (event.type === 'filter_confirmation_required') {
               setPendingFilter({ key: event.key, value: event.value })
             } else if (event.type === 'spot_cards') {
               pendingCards = event.cards || []
             } else if (event.type === 'done') {
               // Commit streamed message to history
-              if (accumulated) {
+              if (accumulated && !closed) {
                 setMessages(prev => [
                   ...prev,
                   { id: Date.now() + 1, role: 'assistant', content: accumulated, cards: pendingCards },
@@ -330,11 +384,12 @@ export default function TripThread() {
                 }
               }
               setStreamingContent('')
+              setToolStatus('')
             }
           }
         }
       }
-    } catch (err) {
+    } catch {
       setMessages(prev => [
         ...prev,
         { id: Date.now() + 1, role: 'assistant', content: 'Something went wrong. Please try again.' },
@@ -344,7 +399,7 @@ export default function TripThread() {
       setStreamingContent('')
       inputRef.current?.focus()
     }
-  }, [input, streaming, conversationId, accessToken, trip?.state])
+  }, [input, streaming, conversationId, accessToken, trip?.state, conversationClosed])
 
   // ------------------------------------------------------------------
   // Filter confirmation
@@ -356,11 +411,8 @@ export default function TripThread() {
         conversation_id: conversationId,
         confirm,
       })
-      if (confirm && data.session_candidates) {
-        setTopSpotIds(
-          (data.session_candidates || []).slice(0, 5).map(c => c.spot_id).filter(Boolean)
-        )
-        if (data.drive_time_unavailable) setDriveTimeUnavailable(true)
+      if (confirm && data.drive_time_unavailable) {
+        setDriveTimeUnavailable(true)
       }
     } catch {
       // Silent failure — pending_filter clears regardless
@@ -512,12 +564,15 @@ export default function TripThread() {
         )}
         {streaming && !streamingContent && (
           <div className="flex justify-start mb-3 px-4">
-            <div className="bg-white border border-gray-200 rounded-2xl rounded-bl-sm shadow-sm px-4 py-3">
+            <div className="bg-white border border-gray-200 rounded-2xl rounded-bl-sm shadow-sm px-4 py-3 flex items-center gap-2">
               <div className="flex gap-1">
                 <span className="w-2 h-2 rounded-full bg-gray-300 animate-bounce" style={{ animationDelay: '0ms' }} />
                 <span className="w-2 h-2 rounded-full bg-gray-300 animate-bounce" style={{ animationDelay: '150ms' }} />
                 <span className="w-2 h-2 rounded-full bg-gray-300 animate-bounce" style={{ animationDelay: '300ms' }} />
               </div>
+              {toolStatus && (
+                <span className="text-xs text-gray-500">{toolStatus}</span>
+              )}
             </div>
           </div>
         )}
@@ -535,9 +590,17 @@ export default function TripThread() {
         {/* IN_WINDOW debrief nudge */}
         {showInWindowNudge && <InWindowNudge />}
 
-        {/* Map thumbnails for top recommended spots */}
-        {topSpotIds.length > 0 && messages.length > 0 && (
-          <MapThumbs spotIds={topSpotIds} />
+        {/* Context-budget warning (Phase 6 warn band) */}
+        {contextWarning && !conversationClosed && (
+          <ContextWarningBanner message={contextWarning} />
+        )}
+
+        {/* Conversation closed (Phase 6 hard stop) — route to a new trip */}
+        {conversationClosed && <ConversationClosedCard message={conversationClosed} />}
+
+        {/* Map thumbnails for the confirmed spot (prep reference) */}
+        {trip?.fishing_spot_id && messages.length > 0 && (
+          <MapThumbs spotId={trip.fishing_spot_id} />
         )}
 
         <div ref={bottomRef} />
@@ -600,14 +663,16 @@ export default function TripThread() {
             onChange={e => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
             placeholder={
-              isPostTrip
-                ? "Tell me how the trip went…"
-                : isInWindow
-                  ? "Quick lookup or log what you're seeing…"
-                  : "Ask about spots, conditions, or fishing…"
+              conversationClosed
+                ? "This conversation has ended — start a new trip"
+                : isPostTrip
+                  ? "Tell me how the trip went…"
+                  : isInWindow
+                    ? "Quick lookup or log what you're seeing…"
+                    : "Ask about spots, conditions, or fishing…"
             }
             rows={1}
-            disabled={streaming}
+            disabled={streaming || !!conversationClosed}
             className="flex-1 px-4 py-2.5 border border-gray-300 rounded-2xl text-sm bg-white text-gray-900 placeholder-gray-400 resize-none focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-50"
             style={{ maxHeight: '120px' }}
             onInput={e => {
@@ -617,7 +682,7 @@ export default function TripThread() {
           />
           <button
             onClick={send}
-            disabled={!input.trim() || streaming}
+            disabled={!input.trim() || streaming || !!conversationClosed}
             className="w-10 h-10 bg-blue-600 text-white rounded-full flex items-center justify-center hover:bg-blue-700 disabled:opacity-40 transition-colors shrink-0"
           >
             <svg className="w-4 h-4 rotate-90" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>

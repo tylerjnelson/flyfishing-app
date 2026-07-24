@@ -1,11 +1,21 @@
 """
-Tool catalog for Phase 5 two-phase planning.
+Tool catalog for the agentic loop + two-phase planning.
 
 All tools are pure DB reads or in-process computation.
-No internet calls; no external services.
+No internet calls; no external services (the HERE cost surface for the loop is zero).
+
+Catalog (Phase 5 — 6 tools collapsed to 3):
+  - get_spot(spot_id)          — the FULL per-spot bundle (conditions + notes + details)
+    in one call; replaces the old get_spot_details / get_historical_conditions /
+    get_notes_for_spot. Formats via context_builder._format_spot_bundle so a promoted
+    spot is byte-for-byte the shape a frozen top-3 spot had.
+  - search_notes_by_text(query) — cross-corpus semantic note search.
+  - compare_spots(spot_ids)     — side-by-side conditions table.
 
 TOOL_SCHEMAS — Ollama-compatible function definitions (OpenAI format).
-execute_tool() — dispatch by name, return JSON-serialisable result dict.
+execute_tool() — dispatch by name, returns a ``(full_result, digest)`` tuple: the full
+result is threaded into the SAME turn's context; the compact digest is what persists in
+the transcript tail (Phase 2 column) for cross-turn replay.
 """
 
 import asyncio
@@ -16,10 +26,18 @@ import time
 import uuid as _uuid_mod
 from dataclasses import dataclass, field
 
-from sqlalchemy import func, select, text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.models import ConditionsCache, FishingSpot, Message, Note, WaterBody
+# Reuse the frozen-top-3 formatter + fetchers so a promoted get_spot bundle is
+# byte-identical to a top-3 bundle by construction (Phase 4/5). context_builder does
+# not import chat.tools, so this one-directional import is cycle-free.
+from chat.context_builder import (
+    _fetch_spot_details,
+    _fetch_spot_notes,
+    _format_spot_bundle,
+)
+from db.models import ConditionsCache, FishingSpot, WaterBody
 from llm.client import ollama_chat
 from prompts.registry import PLANNING_SYSTEM_PROMPT
 from rag.embedder import embed_text
@@ -43,64 +61,23 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
-            "name": "get_notes_for_spot",
+            "name": "get_spot",
             "description": (
-                "Fetch the group's recent trip notes for a specific fishing spot. "
-                "Use this when the user asks about past experience at a named spot, "
-                "or when you want to reference specific note content for a recommendation."
+                "Return the FULL profile for one fishing spot in a single call: current "
+                "flow / water temp / weather, regulations, species, fly-only status, "
+                "stocking dates, permit requirements, AND the group's recent trip notes. "
+                "The notes carry structured detail — what was caught (species), the flies "
+                "that worked, the outcome, and the approximate flow at the time — so use "
+                "this to answer 'what did we catch there / what flies worked / what are "
+                "the regs'. Also the way to promote a spot from the 'MORE OPTIONS' menu "
+                "to full detail. One call gives everything a top recommendation already has."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "spot_id": {
                         "type": "string",
-                        "description": "UUID of the fishing spot (from the Spot ID in the conditions block)",
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum notes to return (default 5, max 10)",
-                    },
-                },
-                "required": ["spot_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_historical_conditions",
-            "description": (
-                "Return the latest cached conditions for a spot's water body "
-                "(flow, temperature, weather). Use when the user asks about current "
-                "or recent conditions for a specific spot not covered in your context."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "spot_id": {
-                        "type": "string",
-                        "description": "UUID of the fishing spot",
-                    },
-                },
-                "required": ["spot_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_spot_details",
-            "description": (
-                "Return full details for a spot: regulations, species, fly-only status, "
-                "stocking dates, permit requirements. Use when the user asks about "
-                "regulations or access specifics for a particular spot."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "spot_id": {
-                        "type": "string",
-                        "description": "UUID of the fishing spot",
+                        "description": "UUID of the fishing spot (the Spot ID from the conditions block or the MORE OPTIONS menu)",
                     },
                 },
                 "required": ["spot_id"],
@@ -153,30 +130,7 @@ TOOL_SCHEMAS = [
             },
         },
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_my_previous_recommendations",
-            "description": (
-                "Return the spots you recommended in earlier turns of this conversation. "
-                "Use to maintain continuity when the user refers to 'your recommendations' "
-                "or 'the spots you mentioned'."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "conversation_id": {
-                        "type": "string",
-                        "description": "UUID of the current conversation",
-                    },
-                },
-                "required": ["conversation_id"],
-            },
-        },
-    },
 ]
-
-_RE_RECOMMEND = re.compile(r'\[RECOMMEND:\s*([^\]]+)\]', re.IGNORECASE)
 
 # ---------------------------------------------------------------------------
 # Tool dispatcher
@@ -188,31 +142,44 @@ async def execute_tool(
     *,
     conversation_id: str,
     db: AsyncSession,
-) -> dict:
+    candidates: list[dict] | None = None,
+    active_ids: set[str] | None = None,
+    excluded_ids: set[str] | None = None,
+) -> tuple[dict, str]:
     """
-    Dispatch a tool call by name and return a JSON-serialisable result dict.
-    Always returns a dict — never raises (errors are surfaced in the result).
+    Dispatch a tool call by name and return a ``(full_result, digest)`` tuple.
+
+    ``full_result`` is the JSON-serialisable payload threaded into the SAME turn's
+    context (the model reads it this hop); ``digest`` is the compact string that
+    persists in the transcript tail for cross-turn replay. For ``get_spot`` the
+    digest IS the full ``_format_spot_bundle`` (a promoted spot persists fully, like
+    a top-3 spot — Phase 5/6); ``search_notes_by_text`` / ``compare_spots`` keep a
+    one-line digest.
+
+    ``candidates`` (the session's HERE-paid, pre-scored list), ``active_ids`` (spots
+    already loaded in context — frozen top-3 + already-promoted), and ``excluded_ids``
+    (spots the user set aside) let ``get_spot`` short-circuit instead of duplicating a
+    bundle. Never raises — errors are surfaced in the result.
     """
     try:
-        if name == "get_notes_for_spot":
-            return await _get_notes_for_spot(db, **arguments)
-        if name == "get_historical_conditions":
-            return await _get_historical_conditions(db, **arguments)
-        if name == "get_spot_details":
-            return await _get_spot_details(db, **arguments)
-        if name == "compare_spots":
-            return await _compare_spots(db, **arguments)
-        if name == "search_notes_by_text":
-            return await _search_notes_by_text(db, **arguments)
-        if name == "get_my_previous_recommendations":
-            return await _get_my_previous_recommendations(
-                db, arguments.get("conversation_id") or conversation_id
+        if name == "get_spot":
+            return await _get_spot(
+                db, arguments.get("spot_id"),
+                candidates=candidates, active_ids=active_ids, excluded_ids=excluded_ids,
             )
+        if name == "compare_spots":
+            full = await _compare_spots(db, **arguments)
+            return full, _digest_compare(full)
+        if name == "search_notes_by_text":
+            full = await _search_notes_by_text(db, **arguments)
+            return full, _digest_search(full)
         log.warning("unknown_tool", extra={"tool": name})
-        return {"error": f"unknown tool: {name}"}
+        err = {"error": f"unknown tool: {name}"}
+        return err, err["error"]
     except Exception as exc:
         log.warning("tool_execution_error", extra={"tool": name, "reason": str(exc)})
-        return {"error": str(exc)}
+        err = {"error": str(exc)}
+        return err, f"tool {name} failed: {exc}"
 
 
 # ---------------------------------------------------------------------------
@@ -349,8 +316,12 @@ async def run_tool_planning(
         fn = tc.get("function", {}) or {}
         name = fn.get("name", "")
         args = _coerce_args(fn.get("arguments"))
-        result = await execute_tool(name, args, conversation_id=conversation_id, db=db)
-        return name, result
+        # Two-pass path: no frozen active-set — get_spot just fetches. It sees the
+        # HERE-paid candidate list so it can reuse drive time + pipeline conditions.
+        full_result, _digest = await execute_tool(
+            name, args, conversation_id=conversation_id, db=db, candidates=candidates,
+        )
+        return name, full_result
 
     t1 = time.monotonic()
     results = await asyncio.gather(*[_run(tc) for tc in tool_calls])
@@ -387,62 +358,27 @@ async def run_tool_planning(
 # Tool implementations
 # ---------------------------------------------------------------------------
 
-async def _get_notes_for_spot(db: AsyncSession, spot_id: str, limit: int = 5) -> dict:
-    limit = min(int(limit), 10)
-    result = await db.execute(
-        select(
-            Note.id,
-            Note.content,
-            Note.note_date,
-            Note.outcome,
-            Note.species,
-            Note.approx_cfs,
-            Note.source_type,
-        )
-        .where(Note.fishing_spot_id == _uuid_mod.UUID(spot_id))
-        .where(Note.source_type != "map")
-        .order_by(Note.note_date.desc().nullslast())
-        .limit(limit)
+def _spot_name(candidate: dict) -> str:
+    return (
+        candidate.get("spot_name")
+        or candidate.get("water_body_name")
+        or candidate.get("name")
+        or "that spot"
     )
-    notes = []
-    for row in result.mappings():
-        notes.append({
-            "date": str(row["note_date"]) if row["note_date"] else None,
-            "outcome": row["outcome"],
-            "species": list(row["species"] or []),
-            "approx_cfs": row["approx_cfs"],
-            "content": (row["content"] or "")[:500],
-        })
-    return {"spot_id": spot_id, "notes": notes, "count": len(notes)}
 
 
-async def _get_historical_conditions(db: AsyncSession, spot_id: str) -> dict:
-    # Get the water_body_id for the spot, then fetch latest conditions_cache entries
-    wb_result = await db.execute(
-        select(FishingSpot.water_body_id).where(FishingSpot.id == _uuid_mod.UUID(spot_id))
-    )
-    row = wb_result.one_or_none()
-    if not row:
-        return {"error": "spot not found"}
-
-    water_body_id = row.water_body_id
-    cc_result = await db.execute(
-        select(ConditionsCache.source, ConditionsCache.data, ConditionsCache.fetched_at)
-        .where(ConditionsCache.water_body_id == water_body_id)
-        .order_by(ConditionsCache.fetched_at.desc())
-        .limit(4)
-    )
-    conditions = []
-    for cc in cc_result.mappings():
-        conditions.append({
-            "source": cc["source"],
-            "fetched_at": cc["fetched_at"].isoformat() if cc["fetched_at"] else None,
-            "data": cc["data"],
-        })
-    return {"spot_id": spot_id, "conditions": conditions}
+def _find_candidate(candidates: list[dict] | None, spot_id: str) -> dict | None:
+    """The session's HERE-paid, pre-scored candidate for this spot, if present."""
+    for c in candidates or []:
+        if str(c.get("fishing_spot_id")) == str(spot_id):
+            return c
+    return None
 
 
-async def _get_spot_details(db: AsyncSession, spot_id: str) -> dict:
+async def _build_candidate_from_db(db: AsyncSession, spot_id: str) -> dict | None:
+    """Build a `_format_spot_bundle`-shaped candidate for a spot NOT in the session
+    candidate list (e.g. referenced from history) — names + type + latest cached
+    conditions, DB-only (no HERE, so no drive time)."""
     result = await db.execute(
         select(FishingSpot, WaterBody)
         .join(WaterBody, FishingSpot.water_body_id == WaterBody.id)
@@ -450,23 +386,91 @@ async def _get_spot_details(db: AsyncSession, spot_id: str) -> dict:
     )
     row = result.one_or_none()
     if not row:
-        return {"error": "spot not found"}
-
+        return None
     fs, wb = row.FishingSpot, row.WaterBody
+    cc_result = await db.execute(
+        select(ConditionsCache.source, ConditionsCache.data)
+        .where(ConditionsCache.water_body_id == wb.id)
+        .order_by(ConditionsCache.fetched_at.desc())
+        .limit(12)
+    )
+    conditions: dict = {}
+    for cc in cc_result.mappings():
+        conditions.setdefault(cc["source"], cc["data"])  # first (freshest) per source
     return {
-        "spot_id": spot_id,
-        "name": fs.name or wb.name,
+        "fishing_spot_id": str(fs.id),
+        "water_body_id": str(wb.id),
+        "spot_name": fs.name or wb.name,
         "water_body_name": wb.name,
         "spot_type": wb.type,
-        "fly_fishing_legal": wb.fly_fishing_legal,
-        "fishing_regs": wb.fishing_regs,
-        "species_primary": list(wb.species_primary or []),
-        "last_stocked_date": str(wb.last_stocked_date) if wb.last_stocked_date else None,
-        "last_stocked_species": list(wb.last_stocked_species or []),
-        "permit_required": fs.permit_required,
-        "permit_notes": fs.permit_notes,
-        "last_visited": str(fs.last_visited) if fs.last_visited else None,
+        "drive_minutes": None,
+        "is_haversine": False,
+        "straight_line_miles": None,
+        "warnings": [],
+        "conditions": conditions,
     }
+
+
+async def _get_spot(
+    db: AsyncSession,
+    spot_id: str | None,
+    *,
+    candidates: list[dict] | None = None,
+    active_ids: set[str] | None = None,
+    excluded_ids: set[str] | None = None,
+) -> tuple[dict, str]:
+    """The one per-spot tool: the FULL bundle (conditions + notes + details) via the
+    shared `_format_spot_bundle`, so a promoted spot is byte-for-byte the shape a
+    frozen top-3 spot had. Two short-circuits run first (order per Phase 5):
+      1. active set — the spot's bundle is already loaded (frozen top-3 or already
+         promoted); re-appending would duplicate it. Return a pointer, don't re-fetch.
+      2. excluded — the user set this spot aside; don't resurface it.
+    Pure DB reads; never HERE."""
+    if not spot_id:
+        err = {"error": "spot_id required"}
+        return err, err["error"]
+
+    sid = str(spot_id)
+    cand = _find_candidate(candidates, sid)
+    display = _spot_name(cand) if cand else "that spot"
+
+    if active_ids and sid in active_ids:
+        return (
+            {"spot_id": sid, "name": display, "status": "already_in_context"},
+            f"{display} is already in your context",
+        )
+    if excluded_ids and sid in excluded_ids:
+        return (
+            {"spot_id": sid, "name": display, "status": "set_aside"},
+            f"{display} was set aside earlier",
+        )
+
+    if cand is None:
+        cand = await _build_candidate_from_db(db, sid)
+    if cand is None:
+        err = {"error": "spot not found"}
+        return err, err["error"]
+
+    notes = await _fetch_spot_notes(db, sid)
+    details = await _fetch_spot_details(db, sid)
+    bundle = _format_spot_bundle(cand, notes=notes, details=details)
+    display = _spot_name(cand)
+    # The digest IS the full bundle — a promoted spot persists fully in context like a
+    # top-3 spot (Phase 6), not as a transient lookup.
+    return {"spot_id": sid, "name": display, "bundle": bundle}, bundle
+
+
+def _digest_search(full: dict) -> str:
+    if "error" in full:
+        return f"note search failed: {full['error']}"
+    return f'{full.get("count", 0)} note(s) match "{full.get("query", "")}"'
+
+
+def _digest_compare(full: dict) -> str:
+    if "error" in full:
+        return f"compare failed: {full['error']}"
+    names = [c.get("name", "?") for c in full.get("comparison", [])]
+    return "compared: " + ", ".join(names) if names else "compared (no spots)"
 
 
 async def _compare_spots(db: AsyncSession, spot_ids: list) -> dict:
@@ -547,30 +551,3 @@ async def _search_notes_by_text(db: AsyncSession, query: str, limit: int = 5) ->
             "content": (row["content"] or "")[:500],
         })
     return {"query": query, "notes": notes, "count": len(notes)}
-
-
-async def _get_my_previous_recommendations(
-    db: AsyncSession, conversation_id: str
-) -> dict:
-    result = await db.execute(
-        select(Message.content, Message.created_at)
-        .where(Message.conversation_id == _uuid_mod.UUID(conversation_id))
-        .where(Message.role == "assistant")
-        .order_by(Message.created_at.asc())
-    )
-    all_recommendations: list[dict] = []
-    for row in result.mappings():
-        content = row["content"] or ""
-        m = re.search(_RE_RECOMMEND, content)
-        if m:
-            raw_ids = [s.strip() for s in m.group(1).split(",") if s.strip()]
-            all_recommendations.append({
-                "turn_at": row["created_at"].isoformat() if row["created_at"] else None,
-                "spot_ids": raw_ids,
-            })
-    latest = all_recommendations[-1] if all_recommendations else None
-    return {
-        "conversation_id": conversation_id,
-        "recommendation_history": all_recommendations,
-        "latest": latest,
-    }

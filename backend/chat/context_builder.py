@@ -19,7 +19,9 @@ and force_rerun=False. The pipeline re-runs only on confirmed FILTER_UPDATE.
 """
 
 import asyncio
+import json
 import logging
+import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 
@@ -63,6 +65,60 @@ _BUDGET_CONDITIONS = 8_000    # ~2 000 tokens
 _BUDGET_NOTES = 16_000        # ~4 000 tokens
 _BUDGET_HISTORY = 8_000       # ~2 000 tokens
 
+# ---------------------------------------------------------------------------
+# Context-budget guard (Phase 6) — hard stop before num_ctx overflow
+# ---------------------------------------------------------------------------
+# The agentic loop replays a growing transcript tail each turn (Phase 4/5). Left
+# unbounded, a deep conversation eventually exceeds the engine's context window
+# (llama.cpp `-c 16384`, ollama num_ctx=16384) and the engine SILENTLY truncates
+# the prefix — busting the frozen top-3 / active set and corrupting the
+# recommendation. Compaction is deferred (2026-07-22); instead we estimate the
+# assembled-context size each turn and gracefully close the conversation before
+# overflow. Estimate is chars/4 — the same ~4-char/token currency the _BUDGET_*
+# truncations above already use.
+_CHARS_PER_TOKEN = 4
+# Mirror the engine launch/request setting (llm/client.py num_ctx=16384,
+# llama.cpp `-c 16384`). If that changes, change here too.
+_CONTEXT_NUM_CTX = 16_384
+# Warn at ~80%: still room to answer, but nudge the UI to start a new trip
+# conversation soon. Hard-stop at ~92%: leaves headroom for the answer + one
+# reasoning pass; a turn assembled at/above this is refused, never sent.
+CONTEXT_WARN_TOKENS = int(_CONTEXT_NUM_CTX * 0.80)   # 13 107
+CONTEXT_HARD_TOKENS = int(_CONTEXT_NUM_CTX * 0.92)   # 15 073
+
+
+def estimate_context_tokens(messages: list[dict], tools: list[dict] | None = None) -> int:
+    """Estimate the assembled-context token count for a turn (chars/4).
+
+    Covers everything sent to the engine: the system prompt + frozen/assembled
+    prefix + transcript tail (all carried in ``messages`` — the ``content`` of
+    each row plus any ``tool_calls`` payload) and the tool-definition schemas
+    (``tools``). Deliberately cheap and slightly conservative — it is a guard, not
+    an exact tokenizer; the ~4-char/token currency matches the _BUDGET_* budgets.
+    """
+    chars = 0
+    for m in messages:
+        chars += len(m.get("content") or "")
+        for tc in m.get("tool_calls") or []:
+            chars += len(json.dumps(tc, default=str))
+    if tools:
+        chars += len(json.dumps(tools, default=str))
+    return chars // _CHARS_PER_TOKEN
+
+
+def assess_context_state(messages: list[dict], tools: list[dict] | None = None) -> tuple[str, int]:
+    """Classify a turn's assembled context against the budget guard.
+
+    Returns ``(state, tokens)`` where state is ``"closed"`` (>= hard stop — refuse
+    this turn), ``"warning"`` (>= warn threshold — run but nudge), or ``"ok"``.
+    """
+    tokens = estimate_context_tokens(messages, tools)
+    if tokens >= CONTEXT_HARD_TOKENS:
+        return "closed", tokens
+    if tokens >= CONTEXT_WARN_TOKENS:
+        return "warning", tokens
+    return "ok", tokens
+
 # Drive-time defaults
 _DEFAULT_MAX_DRIVE_MINUTES = 180
 _PREFILTER_KM = 250           # rough Haversine pre-filter before HERE calls
@@ -87,7 +143,22 @@ _NPS_ALERT_PENALTIES: dict[str, float] = {
 
 # Candidate pool size
 _MAX_CANDIDATES = 25
-_SURFACE_TOP_N = 5            # spots passed to LLM in initial context
+# Spots surfaced with FULL detail in the opening context. 3 = the recommendation
+# count (prompt mandates "recommend exactly 3 ranked by score"), down from a legacy
+# 5-wide selection buffer that predates the compact menu (Phase 4, 2026-07-24).
+# Alternates (rank 4-25) live in the one-line compact menu and promote to full
+# detail on demand via get_spot (Phase 5). Two call sites follow this constant:
+# _format_conditions_block (twopass) and top_fishing_spot_ids (map fetch). Variety
+# rotation is deliberately INDEPENDENT (keeps its 5-wide window; never touches the
+# top-3) — do NOT parametrize it to this constant.
+_SURFACE_TOP_N = 3
+
+# Frozen-context resume-freshness boundary (Phase 4). Matched to the dynamic
+# conditions cache TTL (usgs/noaa_nws/airnow = 6h); below it a re-freeze would
+# render ~identical bytes and needlessly bust KV reuse, above it the 2h scheduler
+# has refreshed the cache ~3x so a HERE-free re-read yields authentically fresher
+# conditions. Only fires on resume-after-a-gap; never within an active conversation.
+_FREEZE_TTL_HOURS = 6
 
 # Variety rotation
 _VARIETY_DAYS = 60
@@ -115,6 +186,20 @@ def _matches_water_type(water_body: WaterBody, water_types: list[str]) -> bool:
     if not water_types or "any" in water_types:
         return True
     return water_body.type in water_types
+
+
+def _filter_excluded(pairs: list[tuple], excluded_ids: set[str]) -> list[tuple]:
+    """Drop spots the user set aside via POST /chat/exclude-spot so a pipeline
+    re-run (force_rerun on a confirmed FILTER_UPDATE) never resurfaces them.
+
+    Fixes a pre-existing gap: exclude-spot pruned session_candidates directly and
+    recorded conversation.excluded_spot_ids, but build_context never read that column
+    on a re-run, so confirm-filter's force_rerun resurrected excluded spots. Each pair
+    is (FishingSpot, WaterBody); the exclusion key is the fishing-spot id.
+    """
+    if not excluded_ids:
+        return pairs
+    return [(fs, wb) for fs, wb in pairs if str(fs.id) not in excluded_ids]
 
 
 _CLOSURE_KEYWORDS: frozenset[str] = frozenset(
@@ -677,92 +762,107 @@ async def _fetch_maps(db, fishing_spot_ids: list[str]) -> list[dict]:
 # [7] Context formatting helpers
 # ---------------------------------------------------------------------------
 
+def _render_spot_conditions_lines(
+    c: dict, *, is_future_trip: bool, departure_time: datetime | None
+) -> list[str]:
+    """Render ONE candidate's conditions section as a list of lines (heading →
+    flow/temp/weather/AQI/WTA/advisories). Extracted from _format_conditions_block
+    so _format_spot_bundle (the freeze / get_spot) reuses the exact same rendering."""
+    conds = c.get("conditions") or {}
+    usgs = conds.get("usgs") or {}
+    nws = conds.get("noaa_nws") or {}
+    nwrfc = conds.get("noaa_nwrfc") or {}
+    wta = conds.get("wta") or {}
+    airnow = conds.get("airnow") or {}
+
+    lines: list[str] = []
+    # Display water_body_name; append spot name only when it differs
+    # (spot_name is backfilled with water_body_name for spots with no own name)
+    heading = c["water_body_name"]
+    if c.get("spot_name") and c["spot_name"] != c["water_body_name"]:
+        heading = f"{c['water_body_name']} — {c['spot_name']}"
+    lines.append(f"\n=== {heading} ===")
+    lines.append(f"Spot ID: {c['fishing_spot_id']}")
+
+    if c.get("is_haversine"):
+        lines.append(f"Distance: ~{c.get('straight_line_miles', '?')} miles straight-line")
+    elif c.get("drive_minutes"):
+        lines.append(f"Drive time: {c['drive_minutes']} min")
+
+    cfs = usgs.get("cfs")
+    temp = usgs.get("temp_f")
+    turb = usgs.get("turbidity_fnu")
+    trend = usgs.get("trend")
+    if cfs is not None:
+        trend_str = f" ({trend})" if trend and trend != "stable" else ""
+        lines.append(f"Flow: {cfs:.0f} CFS{trend_str}")
+    if is_future_trip and nwrfc and c.get("spot_type") in ("river", "creek"):
+        forecast_cfs = _nwrfc_cfs_at(nwrfc, departure_time)
+        if forecast_cfs is not None:
+            lines.append(f"Forecast flow at departure: {forecast_cfs:.0f} CFS")
+    if temp is not None:
+        lines.append(f"Water temp: {temp:.1f}°F")
+    if turb is not None:
+        lines.append(f"Turbidity: {turb:.0f} FNU")
+
+    current = (nws.get("current") or {})
+    if current.get("short_forecast"):
+        temp_str = f", {current['temp_f']}°F" if current.get("temp_f") else ""
+        lines.append(f"Weather: {current['short_forecast']}{temp_str}")
+    wind_mph = current.get("wind_speed_mph")
+    if wind_mph is not None and wind_mph > 10:
+        lines.append(f"Wind: {wind_mph:.0f} mph")
+
+    aqi = airnow.get("aqi")
+    if aqi is not None and aqi > 50:
+        category = airnow.get("category") or "Moderate"
+        pollutant = airnow.get("pollutant") or ""
+        pollutant_str = f", {pollutant}" if pollutant else ""
+        lines.append(f"Air quality: {category} (AQI {aqi}{pollutant_str})")
+
+    wta_tc = wta.get("trail_conditions")
+    if wta_tc:
+        total = wta_tc.get("total_reports") or 1
+        tc_parts = []
+        if wta_tc.get("road"):
+            tc_parts.append(f"road ({wta_tc['road']}/{total})")
+        if wta_tc.get("snow"):
+            tc_parts.append(f"snow ({wta_tc['snow']}/{total})")
+        if wta_tc.get("bugs"):
+            tc_parts.append(f"bugs ({wta_tc['bugs']}/{total})")
+        if wta_tc.get("trail"):
+            tc_parts.append(f"trail obstacles ({wta_tc['trail']}/{total})")
+        if tc_parts:
+            lines.append(f"Trail conditions (WTA, {total} recent reports): {', '.join(tc_parts)}")
+
+    wta_reports = wta.get("reports") or []
+    if wta_reports:
+        lines.append("Angler reports (WTA):")
+        for r in wta_reports[:3]:
+            date_str = r.get("note_date") or "unknown date"
+            text = (r.get("report_text") or "")[:200]
+            lines.append(f"  [{date_str}] {text}")
+
+    # Surface penalty warnings so the LLM can advise the angler
+    for w in (c.get("warnings") or []):
+        lines.append(f"Advisory: {w}")
+
+    return lines
+
+
 def _format_conditions_block(candidates: list[dict], departure_time: datetime | None = None) -> str:
     now = datetime.now(tz=timezone.utc)
     is_future_trip = (
         departure_time is not None
         and (departure_time - now).total_seconds() > _FUTURE_TRIP_HOURS * 3600
     )
-    lines = []
+    lines: list[str] = []
     for c in candidates[:_SURFACE_TOP_N]:
-        conds = c.get("conditions") or {}
-        usgs = conds.get("usgs") or {}
-        nws = conds.get("noaa_nws") or {}
-        nwrfc = conds.get("noaa_nwrfc") or {}
-        wta = conds.get("wta") or {}
-        airnow = conds.get("airnow") or {}
-
-        # Display water_body_name; append spot name only when it differs
-        # (spot_name is backfilled with water_body_name for spots with no own name)
-        heading = c["water_body_name"]
-        if c.get("spot_name") and c["spot_name"] != c["water_body_name"]:
-            heading = f"{c['water_body_name']} — {c['spot_name']}"
-        lines.append(f"\n=== {heading} ===")
-        lines.append(f"Spot ID: {c['fishing_spot_id']}")
-
-        if c.get("is_haversine"):
-            lines.append(f"Distance: ~{c.get('straight_line_miles', '?')} miles straight-line")
-        elif c.get("drive_minutes"):
-            lines.append(f"Drive time: {c['drive_minutes']} min")
-
-        cfs = usgs.get("cfs")
-        temp = usgs.get("temp_f")
-        turb = usgs.get("turbidity_fnu")
-        trend = usgs.get("trend")
-        if cfs is not None:
-            trend_str = f" ({trend})" if trend and trend != "stable" else ""
-            lines.append(f"Flow: {cfs:.0f} CFS{trend_str}")
-        if is_future_trip and nwrfc and c.get("spot_type") in ("river", "creek"):
-            forecast_cfs = _nwrfc_cfs_at(nwrfc, departure_time)
-            if forecast_cfs is not None:
-                lines.append(f"Forecast flow at departure: {forecast_cfs:.0f} CFS")
-        if temp is not None:
-            lines.append(f"Water temp: {temp:.1f}°F")
-        if turb is not None:
-            lines.append(f"Turbidity: {turb:.0f} FNU")
-
-        current = (nws.get("current") or {})
-        if current.get("short_forecast"):
-            temp_str = f", {current['temp_f']}°F" if current.get("temp_f") else ""
-            lines.append(f"Weather: {current['short_forecast']}{temp_str}")
-        wind_mph = current.get("wind_speed_mph")
-        if wind_mph is not None and wind_mph > 10:
-            lines.append(f"Wind: {wind_mph:.0f} mph")
-
-        aqi = airnow.get("aqi")
-        if aqi is not None and aqi > 50:
-            category = airnow.get("category") or "Moderate"
-            pollutant = airnow.get("pollutant") or ""
-            pollutant_str = f", {pollutant}" if pollutant else ""
-            lines.append(f"Air quality: {category} (AQI {aqi}{pollutant_str})")
-
-        wta_tc = wta.get("trail_conditions")
-        if wta_tc:
-            total = wta_tc.get("total_reports") or 1
-            tc_parts = []
-            if wta_tc.get("road"):
-                tc_parts.append(f"road ({wta_tc['road']}/{total})")
-            if wta_tc.get("snow"):
-                tc_parts.append(f"snow ({wta_tc['snow']}/{total})")
-            if wta_tc.get("bugs"):
-                tc_parts.append(f"bugs ({wta_tc['bugs']}/{total})")
-            if wta_tc.get("trail"):
-                tc_parts.append(f"trail obstacles ({wta_tc['trail']}/{total})")
-            if tc_parts:
-                lines.append(f"Trail conditions (WTA, {total} recent reports): {', '.join(tc_parts)}")
-
-        wta_reports = wta.get("reports") or []
-        if wta_reports:
-            lines.append("Angler reports (WTA):")
-            for r in wta_reports[:3]:
-                date_str = r.get("note_date") or "unknown date"
-                text = (r.get("report_text") or "")[:200]
-                lines.append(f"  [{date_str}] {text}")
-
-        # Surface penalty warnings so the LLM can advise the angler
-        for w in (c.get("warnings") or []):
-            lines.append(f"Advisory: {w}")
-
+        lines.extend(
+            _render_spot_conditions_lines(
+                c, is_future_trip=is_future_trip, departure_time=departure_time
+            )
+        )
     return "\n".join(lines)
 
 
@@ -793,6 +893,335 @@ def _truncate(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
     return text[:max_chars] + "\n[... truncated for token budget]"
+
+
+# ---------------------------------------------------------------------------
+# [7b] Frozen prefix — per-spot bundle + compact menu (Phase 4)
+# ---------------------------------------------------------------------------
+
+def _regs_str(regs) -> str:
+    """Render `WaterBody.fishing_regs` (JSONB — dict or string) terse."""
+    if isinstance(regs, dict):
+        summary = regs.get("summary")
+        if summary:
+            return str(summary)[:160]
+        return "; ".join(f"{k}: {v}" for k, v in list(regs.items())[:3])[:160]
+    return str(regs)[:160] if regs else ""
+
+
+def _format_note_line(n: dict) -> str:
+    """One spot-anchored note, structured-fields-first (date · outcome · species ·
+    cfs · flies) then a truncated content snippet — advertises to the 4B that
+    get_spot answers 'what did we catch / what flies worked' (Phase 5 gap #1)."""
+    nd = n.get("note_date") or "unknown date"
+    outcome = (n.get("outcome") or "neutral").upper()
+    parts = [f"[{nd}] {outcome}"]
+    species = n.get("species") or []
+    if species:
+        parts.append(", ".join(species))
+    if n.get("approx_cfs"):
+        parts.append(f"~{n['approx_cfs']} cfs")
+    flies = n.get("flies") or []
+    if flies:
+        parts.append("flies: " + ", ".join(flies))
+    head = " · ".join(parts)
+    snippet = (n.get("content") or "")[:250].replace("\n", " ").strip()
+    return f'{head} — "{snippet}"' if snippet else head
+
+
+def _format_spot_bundle(
+    candidate: dict, *, notes: list[dict], details: dict, departure_time: datetime | None = None
+) -> str:
+    """Render a single spot's COMPLETE section: conditions + spot-anchored notes +
+    details (regs / fly-only / species / stocking / permit). Called from two sites
+    with byte-identical shape — the freeze (each frozen top-3 spot) and, in Phase 5,
+    get_spot on promotion (so a promoted spot has everything a top-3 had). A2-depth
+    (full) because the catalog collapse makes get_spot the only way to fetch a spot's
+    regs/species/stocking. Render-once-store: the output is persisted verbatim
+    (frozen_context / tail digest), so the conditions' datetime.now()/forecast branch
+    is harmless — we store the rendered bytes and never re-render."""
+    now = datetime.now(tz=timezone.utc)
+    is_future_trip = (
+        departure_time is not None
+        and (departure_time - now).total_seconds() > _FUTURE_TRIP_HOURS * 3600
+    )
+    lines = _render_spot_conditions_lines(
+        candidate, is_future_trip=is_future_trip, departure_time=departure_time
+    )
+
+    if details:
+        detail_parts: list[str] = []
+        regs = _regs_str(details.get("fishing_regs"))
+        if regs:
+            detail_parts.append(f"Regs: {regs}")
+        detail_parts.append(f"Fly-only: {'yes' if details.get('fly_fishing_legal') else 'no'}")
+        species = details.get("species_primary") or []
+        if species:
+            detail_parts.append(f"Species: {', '.join(species)}")
+        stocked = details.get("last_stocked_date")
+        if stocked:
+            sp = ", ".join(details.get("last_stocked_species") or [])
+            detail_parts.append(f"Last stocked: {stocked}" + (f" ({sp})" if sp else ""))
+        if details.get("permit_required"):
+            pn = details.get("permit_notes")
+            detail_parts.append("Permit required" + (f" — {pn}" if pn else ""))
+        if detail_parts:
+            lines.append(" · ".join(detail_parts))
+
+    if notes:
+        lines.append(f"Notes (≤{len(notes)} recent):")
+        for n in notes:
+            lines.append("  " + _format_note_line(n))
+
+    return "\n".join(lines)
+
+
+def _condition_teaser(c: dict) -> str:
+    """One-line flow teaser for a compact-menu entry."""
+    usgs = (c.get("conditions") or {}).get("usgs") or {}
+    cfs = usgs.get("cfs")
+    if cfs is None:
+        return ""
+    trend = usgs.get("trend")
+    return f"{cfs:.0f} cfs" + (f" ({trend})" if trend and trend != "stable" else "")
+
+
+def _format_compact_menu(candidates: list[dict]) -> str:
+    """One-line-per-spot ranked menu of the alternates (rank 4-25). Gives the model
+    cheap awareness of every alternate; promoting one to full detail is a get_spot
+    hop (Phase 5). 'Card-only surfacing' stays hop-free — build_turn fills the card
+    from session_candidates."""
+    rest = candidates[_SURFACE_TOP_N:]
+    if not rest:
+        return ""
+    lines = ["=== MORE OPTIONS (ranked) ==="]
+    for c in rest:
+        name = c.get("spot_name") or c.get("water_body_name") or "unknown"
+        typ = c.get("spot_type", "?")
+        if c.get("drive_minutes"):
+            drive = f"{c['drive_minutes']} min"
+        elif c.get("is_haversine"):
+            drive = f"~{c.get('straight_line_miles', '?')} mi"
+        else:
+            drive = "?"
+        teaser = _condition_teaser(c)
+        line = f"- {c['fishing_spot_id']} · {name} ({typ}) · {drive}"
+        if teaser:
+            line += f" · {teaser}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+async def _fetch_spot_notes(db, fishing_spot_id: str, limit: int = 5) -> list[dict]:
+    """Spot-anchored recent notes — spot-anchored, not the query-anchored RAG. Used at
+    freeze time for each top-3 spot and by the `get_spot` tool on promotion (Phase 5),
+    so a promoted spot's notes match a frozen top-3 spot's."""
+    result = await db.execute(
+        select(
+            Note.note_date, Note.outcome, Note.species, Note.approx_cfs, Note.flies, Note.content
+        )
+        .where(Note.fishing_spot_id == uuid.UUID(fishing_spot_id))
+        .where(Note.source_type != "map")
+        .order_by(Note.note_date.desc().nullslast())
+        .limit(limit)
+    )
+    return [
+        {
+            "note_date": str(r.note_date) if r.note_date else None,
+            "outcome": r.outcome,
+            "species": list(r.species or []),
+            "approx_cfs": r.approx_cfs,
+            "flies": list(r.flies or []),
+            "content": r.content,
+        }
+        for r in result.all()
+    ]
+
+
+async def _fetch_spot_details(db, fishing_spot_id: str) -> dict:
+    """Regs / fly-only / species / stocking / permit for one spot. Used at freeze time
+    and by the `get_spot` tool (Phase 5) — one details read, shared by both."""
+    result = await db.execute(
+        select(FishingSpot, WaterBody)
+        .join(WaterBody, FishingSpot.water_body_id == WaterBody.id)
+        .where(FishingSpot.id == uuid.UUID(fishing_spot_id))
+    )
+    row = result.one_or_none()
+    if not row:
+        return {}
+    fs, wb = row
+    return {
+        "fishing_regs": wb.fishing_regs,
+        "fly_fishing_legal": wb.fly_fishing_legal,
+        "species_primary": list(wb.species_primary or []),
+        "last_stocked_date": str(wb.last_stocked_date) if wb.last_stocked_date else None,
+        "last_stocked_species": list(wb.last_stocked_species or []),
+        "permit_required": fs.permit_required,
+        "permit_notes": fs.permit_notes,
+    }
+
+
+async def _fetch_history_block(db, user: User) -> str:
+    """Past DEBRIEFED trips — same read the twopass assembly does, rendered once
+    into the frozen prefix."""
+    history_result = await db.execute(
+        select(Trip.trip_date, WaterBody.name)
+        .join(FishingSpot, Trip.fishing_spot_id == FishingSpot.id)
+        .join(WaterBody, FishingSpot.water_body_id == WaterBody.id)
+        .where(Trip.user_id == user.id)
+        .where(Trip.state == "DEBRIEFED")
+        .order_by(Trip.trip_date.desc())
+        .limit(5)
+    )
+    past_trips = [
+        {"trip_date": str(r.trip_date or ""), "spot_name": r.name}
+        for r in history_result.all()
+    ]
+    return _format_history_block(past_trips)
+
+
+async def _refresh_candidate_conditions(db, candidates: list[dict]) -> list[dict]:
+    """Re-read the freshest ConditionsCache rows for the candidates' water bodies —
+    a DB read only, NEVER HERE. Reuses each candidate's existing drive_minutes
+    (intake is immutable mid-conversation, so drive times never change). Used by the
+    TTL re-freeze so a resume-after-a-gap renders authentically fresher conditions
+    while preserving the HERE-free-loop invariant."""
+    wb_ids = [c["water_body_id"] for c in candidates if c.get("water_body_id")]
+    if not wb_ids:
+        return candidates
+    cond_result = await db.execute(
+        select(ConditionsCache.water_body_id, ConditionsCache.source, ConditionsCache.data)
+        .where(ConditionsCache.water_body_id.in_([uuid.UUID(w) for w in wb_ids]))
+        .order_by(
+            ConditionsCache.water_body_id,
+            ConditionsCache.source,
+            ConditionsCache.fetched_at.desc(),
+        )
+        .distinct(ConditionsCache.water_body_id, ConditionsCache.source)
+    )
+    cond_by: dict[str, dict] = {}
+    for r in cond_result.all():
+        cond_by.setdefault(str(r.water_body_id), {})[r.source] = r.data
+    refreshed = []
+    for c in candidates:
+        fresh = cond_by.get(c.get("water_body_id"))
+        if fresh:
+            c = {**c, "conditions": {
+                "usgs": fresh.get("usgs"),
+                "noaa_nws": fresh.get("noaa_nws"),
+                "noaa_nwrfc": fresh.get("noaa_nwrfc"),
+                "wta": fresh.get("wta"),
+                "airnow": fresh.get("airnow"),
+                "snotel": fresh.get("snotel"),
+            }}
+        refreshed.append(c)
+    return refreshed
+
+
+async def _freeze_context(db, user: User, candidates: list[dict], departure_time) -> str:
+    """Assemble the byte-stable frozen prefix: top-3 full bundles (conditions +
+    per-spot notes + details) + trip history + map refs + the compact menu of
+    alternates. Stored verbatim into conversation.frozen_context."""
+    top = candidates[:_SURFACE_TOP_N]
+    bundles: list[str] = []
+    for c in top:
+        sid = c["fishing_spot_id"]
+        notes = await _fetch_spot_notes(db, sid)
+        details = await _fetch_spot_details(db, sid)
+        bundles.append(
+            _format_spot_bundle(c, notes=notes, details=details, departure_time=departure_time)
+        )
+
+    history_block = await _fetch_history_block(db, user)
+    maps = await _fetch_maps(db, [c["fishing_spot_id"] for c in top])
+    map_refs = ""
+    if maps:
+        map_refs = "=== MAPS ===\n" + "\n".join(
+            f"MAP_ID:{m['id']}:SPOT:{m['fishing_spot_id']}" for m in maps
+        )
+    menu = _format_compact_menu(candidates)
+
+    return "\n\n".join(filter(None, [*bundles, history_block, map_refs, menu]))
+
+
+async def _build_agentic_context(
+    user: User,
+    trip: Trip,
+    conversation: Conversation,
+    query: str,
+    db,
+    *,
+    candidates: list[dict],
+    drive_time_unavailable: bool,
+    intake_hash: str,
+    departure_time,
+    force_rerun: bool,
+) -> BuildResult:
+    """Agentic-harness assembly (Phase 4): freeze the top-3 bundles + menu once, then
+    replay that byte-stable prefix verbatim on follow-ups so the KV cache reuses it.
+    The recommendation-quality re-assembly (`_format_conditions_block`/`_hybrid_rag`)
+    runs ONLY on the freeze; follow-ups never re-render it (that regeneration is the
+    cache-buster). Note needs beyond the frozen top-3 are served by tools in the loop.
+    Two-pass keeps the full per-turn re-assembly (byte-for-byte unchanged)."""
+    now = datetime.now(tz=timezone.utc)
+    serialised_candidates = {
+        "candidates": candidates,
+        "drive_time_unavailable": drive_time_unavailable,
+    }
+
+    frozen = conversation.frozen_context
+    frozen_at = conversation.frozen_context_at
+    stale = (
+        frozen_at is not None
+        and (now - frozen_at).total_seconds() > _FREEZE_TTL_HOURS * 3600
+    )
+    # (Re)freeze on: first turn, an explicit filter re-run, or resume past the TTL.
+    if force_rerun or not frozen or stale:
+        if stale and not force_rerun:
+            # HERE-free conditions refresh before re-rendering (resume-after-a-gap).
+            candidates = await _refresh_candidate_conditions(db, candidates)
+            serialised_candidates["candidates"] = candidates
+        frozen = await _freeze_context(db, user, candidates, departure_time)
+        conversation.frozen_context = frozen
+        conversation.frozen_context_at = now
+        frozen_at = now
+
+    # Prompt-hygiene: stamp the as-of time so the model never narrates frozen
+    # (sub-6h) conditions as "right now".
+    stamp = f"[Conditions as of {frozen_at.strftime('%Y-%m-%d %H:%M UTC')}]"
+    system_content = "\n\n".join(filter(None, [
+        RECOMMENDATION_SYSTEM_PROMPT.strip(),
+        stamp,
+        frozen,
+    ]))
+
+    msg_result = await db.execute(
+        select(
+            Message.role,
+            Message.content,
+            Message.tool_name,
+            Message.tool_calls,
+            Message.digest,
+        )
+        .where(Message.conversation_id == conversation.id)
+        .order_by(Message.seq)
+    )
+    prior_messages = _rebuild_transcript(msg_result.all())
+
+    messages = [{"role": "system", "content": system_content}]
+    messages.extend(prior_messages)
+    messages.append({"role": "user", "content": query})
+
+    # conditions_hash=None -> the router skips the single-shot response-cache write;
+    # agentic follow-ups are conversational, not cacheable opening recs.
+    return BuildResult(
+        messages=messages,
+        session_candidates=serialised_candidates,
+        conditions_hash=None,
+        intake_hash=intake_hash,
+        drive_time_unavailable=drive_time_unavailable,
+        cached_response=None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -832,11 +1261,17 @@ async def _build_debrief_context(
     trip_context = "\n".join(trip_context_lines)
 
     msg_result = await db.execute(
-        select(Message.role, Message.content)
+        select(
+            Message.role,
+            Message.content,
+            Message.tool_name,
+            Message.tool_calls,
+            Message.digest,
+        )
         .where(Message.conversation_id == conversation.id)
-        .order_by(Message.created_at)
+        .order_by(Message.seq)
     )
-    prior_messages = [{"role": r.role, "content": r.content} for r in msg_result.all()]
+    prior_messages = _rebuild_transcript(msg_result.all())
 
     system_content = "\n\n".join(filter(None, [
         DEBRIEF_CONVERSATION_PROMPT.strip(),
@@ -844,8 +1279,7 @@ async def _build_debrief_context(
     ]))
 
     messages = [{"role": "system", "content": system_content}]
-    for m in prior_messages:
-        messages.append({"role": m["role"], "content": m["content"]})
+    messages.extend(prior_messages)  # carries tool_calls / tool_name on tool turns
     messages.append({"role": "user", "content": query})
 
     return BuildResult(
@@ -856,6 +1290,37 @@ async def _build_debrief_context(
         drive_time_unavailable=False,
         cached_response=None,
     )
+
+
+def _rebuild_transcript(rows) -> list[dict]:
+    """Reconstruct the chat-format transcript from persisted Message rows.
+
+    Rows arrive ordered by `seq`. Plain user/assistant rows pass through as
+    ``{role, content}`` — byte-identical to the pre-Phase-3 read, so the two-pass
+    path (which never writes tool rows) is unchanged. Tool turns written by the
+    agentic loop (Phase 3) are replayed structurally: an assistant row carrying
+    ``tool_calls`` keeps them, and a ``role="tool"`` row replays its ``digest``
+    (the compact, cross-turn form — equal to ``content`` until Phase 5/6 diverge
+    them) tagged with ``tool_name``. This is the read side of the Phase-4
+    digest-replay slice.
+    """
+    out: list[dict] = []
+    for r in rows:
+        if r.role == "tool":
+            out.append({
+                "role": "tool",
+                "tool_name": r.tool_name,
+                "content": r.digest or r.content or "",
+            })
+        elif r.role == "assistant" and r.tool_calls:
+            out.append({
+                "role": "assistant",
+                "content": r.content or "",
+                "tool_calls": r.tool_calls,
+            })
+        else:
+            out.append({"role": r.role, "content": r.content})
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -925,6 +1390,12 @@ async def build_context(
             (fs, wb) for fs, wb in all_pairs
             if _matches_water_type(wb, water_types)
         ]
+
+        # Excluded-spot filter — spots the user set aside via /chat/exclude-spot must
+        # not resurface on a pipeline re-run (force_rerun). Applied here in the hard
+        # filters so excluded spots never reach the HERE / conditions fetch.
+        excluded_ids = {str(e) for e in (conversation.excluded_spot_ids or [])}
+        pairs = _filter_excluded(pairs, excluded_ids)
 
         # Rough geo pre-filter before calling HERE
         if origin_lat and origin_lon:
@@ -1171,6 +1642,26 @@ async def build_context(
         candidates = _apply_variety_rotation(candidates)
 
     # ------------------------------------------------------------------
+    # Agentic harness (Phase 4): frozen prefix + lean follow-ups. Distinct
+    # assembly path — freeze the top-3 bundles + compact menu once, replay
+    # verbatim after. Everything below (response cache, RAG, full re-assembly)
+    # is the two-pass path, left byte-for-byte unchanged.
+    # ------------------------------------------------------------------
+    if settings.harness_mode == "agentic":
+        return await _build_agentic_context(
+            user,
+            trip,
+            conversation,
+            query,
+            db,
+            candidates=candidates,
+            drive_time_unavailable=drive_time_unavailable,
+            intake_hash=intake_hash,
+            departure_time=departure_time,
+            force_rerun=force_rerun,
+        )
+
+    # ------------------------------------------------------------------
     # [4] Response cache check
     # ------------------------------------------------------------------
     cached_response = None
@@ -1235,11 +1726,17 @@ async def build_context(
     ]
 
     msg_result = await db.execute(
-        select(Message.role, Message.content)
+        select(
+            Message.role,
+            Message.content,
+            Message.tool_name,
+            Message.tool_calls,
+            Message.digest,
+        )
         .where(Message.conversation_id == conversation.id)
-        .order_by(Message.created_at)
+        .order_by(Message.seq)
     )
-    prior_messages = [{"role": r.role, "content": r.content} for r in msg_result.all()]
+    prior_messages = _rebuild_transcript(msg_result.all())
 
     conditions_block = _truncate(_format_conditions_block(candidates, departure_time=departure_time), _BUDGET_CONDITIONS)
     notes_block = _truncate(_format_notes_block(notes, maps), _BUDGET_NOTES)
@@ -1260,8 +1757,7 @@ async def build_context(
     ]))
 
     messages = [{"role": "system", "content": system_content}]
-    for m in prior_messages:
-        messages.append({"role": m["role"], "content": m["content"]})
+    messages.extend(prior_messages)  # carries tool_calls / tool_name on tool turns
     messages.append({"role": "user", "content": query})
 
     return BuildResult(
