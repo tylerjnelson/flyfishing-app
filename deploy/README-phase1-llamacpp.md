@@ -25,13 +25,20 @@ Both point at the **same** `gemma-4-E4B_q4_0-it.gguf`; the second instance loads
 the weights as shared read-only mmap pages (~0 extra RAM, ~1 GB for its own KV).
 Steady state ≈ **10 GB / 23 GB**.
 
-## Artifacts (pinned — Phase 0e)
+## Artifacts (pinned — Phase 0e) — RE-FETCH AT DEPLOY
 
-- Binary + shared libs: llama.cpp **b10091** (staged at
-  `dev-instructions/build-log/llamacpp-test/bin/llama-b10091/`).
-- Weights: Google QAT **`gemma-4-E4B_q4_0-it.gguf`** (staged at
-  `dev-instructions/build-log/llamacpp-test/models/`).
-- Do **not** use ollama's vendored binary/blob — it fails tool fidelity (Phase 0e E1).
+The binary + GGUF are **not** in the repo and are **no longer staged on the box**
+(they were removed to reclaim ~4.9 GB). Re-fetch them fresh at deploy time from the
+pinned sources below (box arch is **aarch64**). Both are large-ish one-time downloads;
+the box needs outbound HTTPS to GitHub + Hugging Face.
+
+- **Binary + shared libs:** llama.cpp **b10091**, **Linux aarch64** build — from
+  `https://github.com/ggml-org/llama.cpp/releases/tag/b10091` (grab the
+  `*-bin-ubuntu-arm64*` / aarch64 asset; the `.so` shared libs ship in the same
+  archive). Do **not** use ollama's vendored binary/blob — it fails tool fidelity
+  (Phase 0e E1).
+- **Weights:** Google QAT **`gemma-4-E4B_q4_0-it.gguf`** from Hugging Face repo
+  `google/gemma-4-E4B-it-qat-q4_0-gguf` (~4.9 GB).
 
 ## Install (maintenance window, as root unless noted)
 
@@ -40,9 +47,28 @@ Steady state ≈ **10 GB / 23 GB**.
 install -d -o flyfish -g flyfish /opt/flyfish/llamacpp/bin \
                                   /opt/flyfish/llamacpp/models \
                                   /opt/flyfish/llamacpp/slots
-cp dev-instructions/build-log/llamacpp-test/bin/llama-b10091/*        /opt/flyfish/llamacpp/bin/
-cp dev-instructions/build-log/llamacpp-test/models/gemma-4-E4B_q4_0-it.gguf /opt/flyfish/llamacpp/models/
+
+# 1a. Binary — llama.cpp b10091, Linux aarch64 (see Artifacts). Download the
+#     aarch64 release archive, extract the llama-server binary + *.so into bin/.
+#     Example (confirm the exact asset name on the release page):
+#   curl -L -o /tmp/llama-b10091.zip \
+#     https://github.com/ggml-org/llama.cpp/releases/download/b10091/<aarch64-asset>.zip
+#   unzip -j /tmp/llama-b10091.zip -d /opt/flyfish/llamacpp/bin
+#   chmod +x /opt/flyfish/llamacpp/bin/llama-server
+
+# 1b. Weights — Google QAT GGUF (~4.9 GB) straight into models/.
+/opt/flyfish/venv/bin/python - <<'PY'
+from huggingface_hub import hf_hub_download
+p = hf_hub_download(
+    repo_id="google/gemma-4-E4B-it-qat-q4_0-gguf",
+    filename="gemma-4-E4B_q4_0-it.gguf",
+    local_dir="/opt/flyfish/llamacpp/models",
+)
+print("GGUF at:", p)
+PY
+
 chown -R flyfish:flyfish /opt/flyfish/llamacpp
+# Sanity: bin/llama-server is executable and models/gemma-4-E4B_q4_0-it.gguf exists.
 
 # 2. Install the units + pre-warm oneshot
 cp deploy/llama-chat.service deploy/llama-util.service \
