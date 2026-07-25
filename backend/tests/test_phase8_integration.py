@@ -130,6 +130,22 @@ async def _drain(resp):
     return events
 
 
+async def _drain_until_done_then_close(resp):
+    """Simulate a client that closes the socket the instant it sees `done`.
+    Consume frames up to and including `done`, then aclose() the body iterator —
+    exactly what an ASGI server does on client disconnect (throws GeneratorExit
+    into the suspended generator). Any work the endpoint deferred until *after*
+    `yield done` is cancelled here; work done before it survives."""
+    events = []
+    async for chunk in resp.body_iterator:
+        evt = json.loads(chunk[len("data: "):].strip())
+        events.append(evt)
+        if evt["type"] == "done":
+            break
+    await resp.body_iterator.aclose()
+    return events
+
+
 def _install_common(monkeypatch, *, trip, build_result=None, engine=None):
     """Wire the endpoint's shared seams. `engine` is the scripted `_stream_hop`;
     `build_result` (when given) is what the mocked `build_context` returns."""
@@ -316,6 +332,56 @@ class TestNoHereThroughAgenticTurn:
         assert "hereapi.com" not in src
         assert "import httpx" not in src
         assert "from conditions.routing" not in src
+
+
+# ---------------------------------------------------------------------------
+# Gate 2b — turn state persists even when the client disconnects on `done`
+# ---------------------------------------------------------------------------
+
+class TestPersistenceSurvivesClientDisconnectOnDone:
+    async def test_assistant_row_and_side_effects_persist_when_client_closes_on_done(self, monkeypatch):
+        # Regression for the persist-after-`done` fragility (fixed by moving the
+        # post-stream DB writes AHEAD of `yield done`). A client that closes the
+        # socket the instant it sees `done` used to cancel the generator before the
+        # commit, dropping the assistant row + FILTER_UPDATE / cache side effects.
+        # Here we drive a full answer turn, stop iterating right after `done`, and
+        # aclose() the body iterator (the ASGI disconnect); the assistant row must
+        # still have been persisted and committed.
+        spot_a = str(uuid.uuid4())
+        candidates = [_candidate(spot_a, name="Yakima River")]
+        conv = types.SimpleNamespace(
+            id=uuid.uuid4(), user_id=uuid.uuid4(), trip_id=uuid.uuid4(),
+            context_state="ok", excluded_spot_ids=[],
+            pending_filter_update=None, session_candidates=None, last_active=None,
+        )
+        trip = types.SimpleNamespace(id=conv.trip_id)
+        user = types.SimpleNamespace(id=conv.user_id)
+        db = _FakeDB(conv)
+
+        # A single answer hop — prose, no tool call.
+        scripts = [["The Yakima is fishing well.", _sentinel()]]
+        engine, estate = _scripted_hop(scripts)
+        build_result = _build_result(
+            [{"role": "user", "content": "how's the Yakima?"}], candidates
+        )
+
+        _install_common(monkeypatch, trip=trip, build_result=build_result, engine=engine)
+
+        resp = await router.chat_endpoint(
+            {"conversation_id": str(conv.id), "message": "how's the Yakima?"},
+            user=user, db=db,
+        )
+        commits_at_start = db.commits
+        events = await _drain_until_done_then_close(resp)
+
+        assert events[-1]["type"] == "done"
+        # The assistant row was persisted BEFORE `done`, so closing on `done` can't
+        # cancel it. Pre-fix, this list was empty (the write ran after the yield).
+        assistant = [m for m in db.added if getattr(m, "role", None) == "assistant"]
+        assert len(assistant) == 1
+        assert assistant[0].content == "The Yakima is fishing well."
+        # And it was committed (not just staged) before the client went away.
+        assert db.commits > commits_at_start
 
 
 # ---------------------------------------------------------------------------
