@@ -519,11 +519,12 @@ async def chat_endpoint(
         if emit_context_warning:
             yield _sse({"type": "context_warning", "message": _CONTEXT_WARNING_MESSAGE})
 
-        # Cache hit — emit full response as single token, then done
+        # Cache hit — emit full response as single token, persist, then done.
+        # Persist BEFORE `done` for the same client-disconnect reason as the main
+        # path below (a client closing on `done` would otherwise drop this row).
         if build_result.cached_response:
             log.info("response_cache_hit_served")
             yield _sse({"type": "token", "content": build_result.cached_response})
-            yield _sse({"type": "done"})
 
             assistant_msg = Message(
                 id=uuid.uuid4(),
@@ -534,6 +535,8 @@ async def chat_endpoint(
             )
             db.add(assistant_msg)
             await db.commit()
+
+            yield _sse({"type": "done"})
             return
 
         messages = build_result.messages
@@ -637,9 +640,15 @@ async def chat_endpoint(
             elif turn.get("error"):
                 log.warning("turn_builder_error", extra={"error": turn["error"], "trip_id": str(trip.id)})
 
-        yield _sse({"type": "done"})
-
-        # ---- Post-stream DB writes ----
+        # ---- Persist BEFORE signalling `done` ----
+        # These writes must complete regardless of client behaviour. If `done` is
+        # yielded first, a client that closes the socket the instant it sees `done`
+        # cancels this async generator before `db.commit()` runs — dropping the
+        # assistant row plus the FILTER_UPDATE / SAVE_NOTE / response-cache side
+        # effects (all rolled back with the uncommitted session). Committing here,
+        # ahead of `done`, costs a few ms of latency before the client sees `done`
+        # but guarantees durability. (Agentic tool turns are already persisted
+        # mid-loop via _persist_tool_turn.)
 
         # Persist assistant message
         full_response = handler.full_response
@@ -684,6 +693,9 @@ async def chat_endpoint(
             asyncio.create_task(
                 ingest_note_task(note.id, "typed", user.id)
             )
+
+        # All turn state durably committed above — safe to signal completion.
+        yield _sse({"type": "done"})
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
