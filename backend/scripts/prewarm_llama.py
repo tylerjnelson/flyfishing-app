@@ -89,7 +89,9 @@ async def main() -> int:
         # Persist slot 0 so a service restart can restore the prefix instead of
         # cold-prefilling again. Requires --slot-save-path on the chat unit.
         try:
-            save = await client.post(f"/slots/0?action=save&filename={SLOT_FILE}")
+            # b10091: the filename goes in the JSON body, not the query string
+            # (query-param form → 500 "attempting to parse an empty input").
+            save = await client.post("/slots/0?action=save", json={"filename": SLOT_FILE})
             save.raise_for_status()
             log.info("saved slot 0 -> %s", SLOT_FILE)
         except httpx.HTTPError as exc:
