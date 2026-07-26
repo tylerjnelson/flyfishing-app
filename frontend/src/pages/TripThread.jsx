@@ -541,6 +541,10 @@ export default function TripThread() {
                     key={card.spot_id || i}
                     card={card}
                     conversationId={conversationId}
+                    lockedFishingSpotId={trip?.fishing_spot_id}
+                    onLocked={(fishingSpotId) =>
+                      setTrip(prev => ({ ...prev, fishing_spot_id: fishingSpotId }))
+                    }
                     onExcluded={(spotId) => {
                       setMessages(prev => prev.map(m =>
                         m.id === msg.id

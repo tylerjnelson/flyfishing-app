@@ -61,6 +61,23 @@ class TestFilterUpdate:
         assert h.pending_filter_update["key"] == "departure_location"
         assert h.pending_filter_update["value"] == "Seattle"
 
+    def test_filter_tolerates_whitespace_around_equals(self):
+        # The model emits "[FILTER_UPDATE: key = value]" (spaces around '=')
+        # ~half the time. The regex must parse it AND strip it — otherwise the
+        # filter is silently dropped and the raw token leaks into the reply.
+        # Regression for the whitespace-strict parser bug (found by the
+        # 2026-07-25 full-cohort contract-compliance run).
+        h = StreamHandler()
+        out = full_text(h, "Sure. [FILTER_UPDATE: max_drive_minutes = 90] Narrowed it.")
+        assert "[FILTER_UPDATE" not in out  # stripped, no leak
+        assert h.pending_filter_update == {"key": "max_drive_minutes", "value": "90"}
+
+    def test_filter_whitespace_non_numeric_value(self):
+        h = StreamHandler()
+        feed(h, "[FILTER_UPDATE: water_type = lake]")
+        h.flush_remaining()
+        assert h.pending_filter_update == {"key": "water_type", "value": "lake"}
+
     def test_malformed_filter_no_state_change(self, caplog):
         import logging
         h = StreamHandler()

@@ -17,7 +17,7 @@ import re
 log = logging.getLogger(__name__)
 
 # Structured token patterns
-_RE_FILTER = re.compile(r'\[FILTER_UPDATE:\s*(\w+)=(.+?)\]')
+_RE_FILTER = re.compile(r'\[FILTER_UPDATE:\s*(\w+)\s*=\s*(.+?)\]')
 _RE_SAVE_NOTE = re.compile(r'\[SAVE_NOTE:\s*(.+?)\]', re.DOTALL)
 _RE_RECOMMEND = re.compile(r'\[RECOMMEND:\s*[^\]]+\]', re.IGNORECASE)
 

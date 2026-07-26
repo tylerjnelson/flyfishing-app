@@ -133,6 +133,10 @@ async def build_turn(
         cards.append(
             {
                 "spot_id": spot_id,
+                # The real FishingSpot UUID (distinct from spot_id, the card/candidate
+                # key). Lets the frontend match trip.fishing_spot_id to render "locked"
+                # state for the lock-this-spot flow.
+                "fishing_spot_id": cand.get("fishing_spot_id"),
                 "name": cand.get("spot_name") or cand.get("water_body_name", ""),
                 "water_body_name": cand.get("water_body_name", ""),
                 "spot_type": cand.get("spot_type", ""),
