@@ -30,8 +30,14 @@ export default function App() {
           const { data } = await axios.post('/api/auth/refresh', {}, { withCredentials: true })
           return data
         } catch (err) {
-          if (err.response?.status === 401) return null
-          // Transient error — wait before retrying
+          const status = err.response?.status
+          // Definitive "no session" — stop.
+          if (status === 401) return null
+          // Rate-limited (429) or upstream-limited (503): a retry just burns
+          // more of the same budget and can starve a concurrent verify request.
+          // Treat as non-transient and give up rather than attack our own limit.
+          if (status === 429 || status === 503) return null
+          // True transient error (network blip, server restart) — back off + retry.
           await new Promise(r => setTimeout(r, 1000 * (attempt + 1)))
         }
       }
