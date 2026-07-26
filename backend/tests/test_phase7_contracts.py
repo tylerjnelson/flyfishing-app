@@ -278,3 +278,87 @@ class TestExcludeAndConfirmContracts:
         assert out["result"] == "rejected"
         assert out["session_candidates"] == candidates      # unchanged
         assert conv.pending_filter_update is None            # cleared
+
+
+# ---------------------------------------------------------------------------
+# Contract 4 — commit-spot ("lock this spot") sets trip.fishing_spot_id
+# ---------------------------------------------------------------------------
+
+class TestCommitSpotContract:
+    """The lock-this-spot flow: resolve the card's fishing_spot_id from the
+    candidate and set trip.fishing_spot_id via assign_spot. Purely additive —
+    no candidate mutation, no state transition; re-locking overwrites."""
+
+    def _conv(self, candidates):
+        return types.SimpleNamespace(
+            id=uuid.uuid4(),
+            user_id=uuid.uuid4(),
+            trip_id=uuid.uuid4(),
+            session_candidates={"candidates": candidates},
+        )
+
+    def _wire(self, monkeypatch, trip):
+        async def _fake_get_trip(trip_id, user_id, db):
+            return trip
+
+        async def _fake_assign_spot(t, fishing_spot_id, db):
+            t.fishing_spot_id = fishing_spot_id
+            return t
+
+        monkeypatch.setattr(router, "get_trip", _fake_get_trip)
+        monkeypatch.setattr(router, "assign_spot", _fake_assign_spot)
+
+    async def test_commit_resolves_fishing_spot_id_and_sets_trip(self, monkeypatch):
+        spot_a, fsid_a = str(uuid.uuid4()), str(uuid.uuid4())
+        conv = self._conv([{"spot_id": spot_a, "fishing_spot_id": fsid_a}])
+        user = types.SimpleNamespace(id=conv.user_id)
+        trip = types.SimpleNamespace(id=conv.trip_id, fishing_spot_id=None)
+        self._wire(monkeypatch, trip)
+
+        out = await router.commit_spot_endpoint(
+            {"conversation_id": str(conv.id), "spot_id": spot_a}, user=user, db=_ConvDB(conv),
+        )
+
+        # Returns the real FishingSpot UUID (NOT the card key spot_id) and sets the column.
+        assert out["fishing_spot_id"] == fsid_a
+        assert str(trip.fishing_spot_id) == fsid_a
+        # Candidates untouched — commit is purely additive.
+        assert conv.session_candidates["candidates"] == [{"spot_id": spot_a, "fishing_spot_id": fsid_a}]
+
+    async def test_commit_unknown_spot_id_404(self, monkeypatch):
+        conv = self._conv([{"spot_id": str(uuid.uuid4()), "fishing_spot_id": str(uuid.uuid4())}])
+        user = types.SimpleNamespace(id=conv.user_id)
+        self._wire(monkeypatch, types.SimpleNamespace(id=conv.trip_id, fishing_spot_id=None))
+
+        with pytest.raises(router.HTTPException) as ei:
+            await router.commit_spot_endpoint(
+                {"conversation_id": str(conv.id), "spot_id": str(uuid.uuid4())},
+                user=user, db=_ConvDB(conv),
+            )
+        assert ei.value.status_code == 404
+
+    async def test_commit_overwrites_existing_lock(self, monkeypatch):
+        spot_a, fsid_a = str(uuid.uuid4()), str(uuid.uuid4())
+        spot_b, fsid_b = str(uuid.uuid4()), str(uuid.uuid4())
+        conv = self._conv([
+            {"spot_id": spot_a, "fishing_spot_id": fsid_a},
+            {"spot_id": spot_b, "fishing_spot_id": fsid_b},
+        ])
+        user = types.SimpleNamespace(id=conv.user_id)
+        trip = types.SimpleNamespace(id=conv.trip_id, fishing_spot_id=uuid.UUID(fsid_a))
+        self._wire(monkeypatch, trip)
+
+        out = await router.commit_spot_endpoint(
+            {"conversation_id": str(conv.id), "spot_id": spot_b}, user=user, db=_ConvDB(conv),
+        )
+        assert out["fishing_spot_id"] == fsid_b
+        assert str(trip.fishing_spot_id) == fsid_b
+
+    async def test_commit_missing_body_400(self, monkeypatch):
+        conv = self._conv([{"spot_id": str(uuid.uuid4()), "fishing_spot_id": str(uuid.uuid4())}])
+        user = types.SimpleNamespace(id=conv.user_id)
+        with pytest.raises(router.HTTPException) as ei:
+            await router.commit_spot_endpoint(
+                {"conversation_id": str(conv.id)}, user=user, db=_ConvDB(conv),
+            )
+        assert ei.value.status_code == 400

@@ -39,7 +39,7 @@ from db.connection import get_db
 from db.models import Conversation, Message, Note, Trip, User
 from llm.client import CHAT_MODEL
 from notes.ingestion import ingest_note_task
-from trips.service import get_trip, get_trip_conversation, refresh_state
+from trips.service import assign_spot, get_trip, get_trip_conversation, refresh_state
 
 log = logging.getLogger(__name__)
 
@@ -762,6 +762,67 @@ async def exclude_spot_endpoint(
     await db.commit()
     log.info("spot_excluded", extra={"spot_id": spot_id, "conversation_id": str(conversation_id)})
     return {"candidates": updated_candidates}
+
+
+# ---------------------------------------------------------------------------
+# POST /api/chat/commit-spot
+# ---------------------------------------------------------------------------
+
+@router.post("/chat/commit-spot")
+async def commit_spot_endpoint(
+    body: dict,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Lock a recommended spot in as the trip's chosen spot (the "lock this spot" flow).
+
+    Body: {conversation_id, spot_id}
+
+    - Validates spot_id is present in conversation.session_candidates.
+    - Resolves that candidate's fishing_spot_id (the real FishingSpot UUID — candidates
+      carry both the card key `spot_id` and `fishing_spot_id`; assign_spot needs the
+      latter, and resolving it via the candidate sidesteps the legacy water_body-id
+      staleness).
+    - Sets trip.fishing_spot_id via assign_spot. Purely additive: does NOT close the
+      conversation or change trip state; re-locking simply overwrites.
+    """
+    conversation_id = body.get("conversation_id")
+    spot_id = body.get("spot_id")
+    if not conversation_id or not spot_id:
+        raise HTTPException(status_code=400, detail="conversation_id and spot_id required")
+
+    conv_result = await db.execute(
+        select(Conversation).where(
+            Conversation.id == conversation_id,
+            Conversation.user_id == user.id,
+        )
+    )
+    conversation = conv_result.scalar_one_or_none()
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    candidates = (conversation.session_candidates or {}).get("candidates", [])
+    match = next((c for c in candidates if c.get("spot_id") == spot_id), None)
+    if match is None:
+        raise HTTPException(status_code=404, detail="Spot not in session candidates")
+
+    fishing_spot_id = match.get("fishing_spot_id") or match.get("spot_id")
+
+    trip = await get_trip(conversation.trip_id, user.id, db)
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip not found")
+
+    await assign_spot(trip, uuid.UUID(str(fishing_spot_id)), db)
+    log.info(
+        "spot_committed",
+        extra={
+            "fishing_spot_id": str(fishing_spot_id),
+            "conversation_id": str(conversation_id),
+            "trip_id": str(trip.id),
+        },
+    )
+    return {"fishing_spot_id": str(fishing_spot_id), "spot_id": spot_id}
 
 
 # ---------------------------------------------------------------------------

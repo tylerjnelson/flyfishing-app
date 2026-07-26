@@ -41,9 +41,17 @@ function CfsDisplay({ cfs, trend }) {
   )
 }
 
-export default function SpotCard({ card, conversationId, onExcluded }) {
+export default function SpotCard({ card, conversationId, onExcluded, onLocked, lockedFishingSpotId }) {
   const [skipping, setSkipping] = useState(false)
   const [skipped, setSkipped] = useState(false)
+  const [locking, setLocking] = useState(false)
+  const [lockedLocal, setLockedLocal] = useState(false)
+
+  // This card is the trip's committed spot if either we just locked it, or the
+  // trip already carries this card's FishingSpot UUID (persists across reloads).
+  const isLocked =
+    lockedLocal ||
+    (!!lockedFishingSpotId && !!card.fishing_spot_id && lockedFishingSpotId === card.fishing_spot_id)
 
   async function handleSkip() {
     if (skipping || skipped || !conversationId) return
@@ -59,6 +67,23 @@ export default function SpotCard({ card, conversationId, onExcluded }) {
       // Silent — card stays visible, user can retry
     } finally {
       setSkipping(false)
+    }
+  }
+
+  async function handleLock() {
+    if (locking || isLocked || !conversationId) return
+    setLocking(true)
+    try {
+      const { data } = await api.post('/chat/commit-spot', {
+        conversation_id: conversationId,
+        spot_id: card.spot_id,
+      })
+      setLockedLocal(true)
+      onLocked?.(data.fishing_spot_id)
+    } catch {
+      // Silent — card stays interactive, user can retry
+    } finally {
+      setLocking(false)
     }
   }
 
@@ -162,6 +187,26 @@ export default function SpotCard({ card, conversationId, onExcluded }) {
           {card.warnings.map((w, i) => (
             <p key={i} className="text-xs text-amber-700 bg-amber-50 rounded px-2 py-1">{w}</p>
           ))}
+        </div>
+      )}
+
+      {/* Lock this spot — commit flow */}
+      {conversationId && (
+        <div className="mt-2 pt-2 border-t border-gray-100">
+          {isLocked ? (
+            <span className="inline-flex items-center gap-1 text-xs font-medium text-green-700">
+              <span aria-hidden="true">✓</span> Locked in for this trip
+            </span>
+          ) : (
+            <button
+              onClick={handleLock}
+              disabled={locking}
+              className="text-xs font-medium text-blue-600 hover:text-blue-800 disabled:opacity-40"
+              title="Lock this spot in as the trip's chosen spot"
+            >
+              {locking ? 'Locking…' : '📍 Lock this spot'}
+            </button>
+          )}
         </div>
       )}
     </div>
