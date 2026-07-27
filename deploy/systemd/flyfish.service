@@ -1,0 +1,24 @@
+[Unit]
+Description=Fly Fishing App (Gunicorn + Uvicorn)
+After=network.target postgresql.service ollama.service
+Requires=postgresql.service
+
+[Service]
+Type=notify
+User=flyfish
+Group=flyfish
+WorkingDirectory=/opt/flyfish/backend
+EnvironmentFile=/etc/flyfish/app.env
+ExecStart=/opt/flyfish/venv/bin/gunicorn main:app \
+  --workers 3 \
+  --worker-class uvicorn.workers.UvicornWorker \
+  --bind 127.0.0.1:8000 \
+  --timeout 300 \
+  --keep-alive 5 \
+  --access-logfile - \
+  --error-logfile -
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
