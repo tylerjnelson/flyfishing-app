@@ -1,0 +1,11 @@
+[Unit]
+Description=Fly Fish infra config drift check (repo deploy/ vs live /etc)
+Documentation=file:/home/ubuntu/flyfish/deploy/README.md
+
+[Service]
+Type=oneshot
+# Runs `sync.sh check`: diffs every managed file (nginx, systemd, logrotate)
+# against its git-tracked copy. Exits non-zero on drift, so a forgotten live
+# edit surfaces in `systemctl --failed` and the journal within the hour.
+ExecStart=/home/ubuntu/flyfish/deploy/sync.sh check
+# Read-only; no state to leave behind.

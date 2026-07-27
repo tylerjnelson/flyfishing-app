@@ -1,0 +1,11 @@
+[Unit]
+Description=Hourly Fly Fish infra config drift check
+Documentation=file:/home/ubuntu/flyfish/deploy/README.md
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
