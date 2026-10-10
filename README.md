@@ -71,3 +71,12 @@ The group's notes — many **handwritten in physical notebooks over years** — 
 ## Stack
 
 React 19 + Vite **PWA** (Tailwind, Leaflet, Zustand) · **FastAPI** (async, Python 3.12) on Gunicorn/Uvicorn · **PostgreSQL 16 + pgvector + pg_trgm** (HNSW index — unified primary store *and* vector store) · **Ollama** running **Gemma 4 E4B** (chat + native tool calls), **Llama 3.2 11B Vision** (OCR/maps, on-demand), **nomic-embed-text** (768-dim RAG), and **faster-whisper** (voice notes) — all on-server · APScheduler for tiered fetches · Alembic migrations · BeautifulSoup + HTTPX scrapers · OpenCV + Pillow image pipeline · Nginx (TLS, SSE pass-through) on a single ARM64 box (4 cores / 24 GB ram).
+
+## Secret scanning
+
+[gitleaks](https://github.com/gitleaks/gitleaks) guards against committing credentials (config: `.gitleaks.toml`, extends the default ruleset).
+
+- **Pre-commit hook** — enable once per clone: `git config core.hooksPath .githooks` (requires `gitleaks` on `PATH`). Staged changes are scanned; a finding blocks the commit.
+- **CI** — `.github/workflows/gitleaks.yml` scans full history on every push and PR.
+- **Manual** — `gitleaks git . --redact` (history) or `gitleaks dir . --redact` (working tree).
+- A confirmed false positive gets an inline `# gitleaks:allow` comment, not a broad allowlist.

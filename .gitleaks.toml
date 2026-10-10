@@ -1,0 +1,15 @@
+# gitleaks config — extends the built-in ruleset (https://github.com/gitleaks/gitleaks).
+# Add project-specific rules or allowlists below. Prefer an inline
+# `# gitleaks:allow` comment for a single known-safe line over a broad allowlist.
+title = "flyfish gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Paths that never hold real secrets"
+paths = [
+  '''(^|/)node_modules/''',
+  '''(^|/)dist/''',
+  '''(^|/)package-lock\.json$''',
+]
