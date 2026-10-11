@@ -18,7 +18,7 @@ Fetch-interval boundaries:
 
 import hashlib
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +74,35 @@ def compute_conditions_hash(
 # Per-source normalizers
 # ---------------------------------------------------------------------------
 
+# Readings older than this are treated as missing. A discontinued gauge keeps
+# returning its last value forever (Elwha 12044900's latest is from 2011).
+USGS_MAX_READING_AGE = timedelta(hours=24)
+_USGS_NO_DATA = -999999.0  # documented default; series also carry noDataValue
+
+
+def _usgs_valid_records(ts: dict) -> list[dict]:
+    """Records with a numeric value that isn't the series' no-data sentinel."""
+    no_data = ts.get("variable", {}).get("noDataValue", _USGS_NO_DATA)
+    valid = []
+    for rec in ts.get("values", [{}])[0].get("value", []):
+        try:
+            value = float(rec["value"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        if value in (no_data, _USGS_NO_DATA):
+            continue
+        valid.append({**rec, "value": value})
+    return valid
+
+
+def _usgs_reading_time(rec: dict) -> datetime | None:
+    try:
+        dt = datetime.fromisoformat(rec["dateTime"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
 def normalize_usgs(raw: dict, fetched_at: datetime) -> dict:
     """
     Normalizes a single USGS instantaneous-values API response for one gauge.
@@ -82,20 +111,30 @@ def normalize_usgs(raw: dict, fetched_at: datetime) -> dict:
       00060 — discharge (CFS)
       00065 — gauge height (ft)
       00010 — water temperature (°C)
+
+    A parameter is reported as None, and listed in `dropped` with the reason,
+    when its only values are the no-data sentinel or its latest reading is
+    older than USGS_MAX_READING_AGE. The caller pops `dropped` for logging.
     """
     values = raw.get("value", {}).get("timeSeries", [])
     by_param: dict[str, float | None] = {}
+    dropped: dict[str, str] = {}
     cfs_records: list = []
     for ts in values:
         code = ts.get("variable", {}).get("variableCode", [{}])[0].get("value")
-        records = ts.get("values", [{}])[0].get("value", [])
-        if records:
-            try:
-                by_param[code] = float(records[-1]["value"])
-            except (ValueError, KeyError):
-                by_param[code] = None
-            if code == "00060":
-                cfs_records = records
+        if not ts.get("values", [{}])[0].get("value"):
+            continue
+        records = _usgs_valid_records(ts)
+        if not records:
+            dropped[code] = "no_data_sentinel"
+            continue
+        observed = _usgs_reading_time(records[-1])
+        if observed is None or fetched_at - observed > USGS_MAX_READING_AGE:
+            dropped[code] = f"stale:{records[-1].get('dateTime')}"
+            continue
+        by_param[code] = records[-1]["value"]
+        if code == "00060":
+            cfs_records = records
 
     cfs = by_param.get("00060")
     gauge_height_ft = by_param.get("00065")
@@ -127,6 +166,7 @@ def normalize_usgs(raw: dict, fetched_at: datetime) -> dict:
         "turbidity_fnu": None,  # USGS turbidity requires separate parameterCd 63680
         "trend": trend,
         "stale": False,
+        "dropped": dropped,
     }
 
 
