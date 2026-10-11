@@ -38,6 +38,9 @@ log = logging.getLogger(__name__)
 WDFW_EMERGENCY_URL = "https://wdfw.wa.gov/fishing/regulations/emergency-rules"
 _WDFW_BASE = "https://wdfw.wa.gov"
 _TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=5.0, pool=5.0)
+# WDFW's CDN (Varnish) 403s the default "python-httpx/x.y" User-Agent; any
+# identifying UA is accepted. Without this every run failed from ~2026-04-29.
+_HEADERS = {"User-Agent": "FlyFishWA/1.0 (+https://waflyfish.com)"}
 
 # Structural fingerprint — at least one of these selectors must be present
 _FINGERPRINT_SELECTORS = ".view-content, .views-field-title"
@@ -53,7 +56,7 @@ async def fetch_wdfw_emergency() -> list[dict]:
     Raises ScraperStructureError if the page structure has changed.
     Raises httpx.HTTPError on connection / HTTP failures (caller logs WARNING).
     """
-    async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True) as client:
+    async with httpx.AsyncClient(headers=_HEADERS, timeout=_TIMEOUT, follow_redirects=True) as client:
         resp = await client.get(WDFW_EMERGENCY_URL)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")

@@ -50,3 +50,27 @@ class TestExtractDates:
         text = "This closure expires June 1, 2026."
         _, expires = _extract_dates(text)
         assert expires == "2026-06-01"
+
+
+class TestUserAgent:
+    async def test_requests_send_identifying_user_agent(self, monkeypatch):
+        """WDFW's CDN 403s the default python-httpx UA (TODO-10, 2026-10-11)."""
+        import httpx
+
+        import conditions.wdfw_emergency as w
+
+        seen: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request.headers["user-agent"])
+            return httpx.Response(200, text="<html><div class='view-content'></div></html>")
+
+        real_client = httpx.AsyncClient
+
+        def client(*args, **kwargs):
+            return real_client(*args, transport=httpx.MockTransport(handler), **kwargs)
+
+        monkeypatch.setattr(w.httpx, "AsyncClient", client)
+        assert await w.fetch_wdfw_emergency() == []  # no rule links in stub page
+        assert seen and all(not ua.startswith("python-httpx") for ua in seen)
+        assert seen[0] == w._HEADERS["User-Agent"]
