@@ -331,6 +331,12 @@ class EmergencyClosure(Base):
     id = Column(Uuid(), primary_key=True, default=uuid.uuid4)
     water_body_id = Column(Uuid(), ForeignKey("water_bodies.id"))
     rule_text = Column(Text, nullable=False)
+    title = Column(Text)
+    action = Column(Text)        # detail page "Action:" field
+    location = Column(Text)      # detail page "Location(s):" field
+    # True only for rules that close fishing outright and aren't superseded by
+    # a later reopening; only these are hard filters (see migration 0014).
+    closes_fishing = Column(Boolean, nullable=False, server_default="false")
     effective = Column(Date)
     expires = Column(Date)
     source_url = Column(Text)

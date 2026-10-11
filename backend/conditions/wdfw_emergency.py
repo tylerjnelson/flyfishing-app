@@ -26,7 +26,7 @@ Detail pages at /fishing/regulations/emergency-rules/{slug}:
 
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import httpx
 from bs4 import BeautifulSoup
@@ -103,18 +103,28 @@ async def fetch_wdfw_emergency() -> list[dict]:
                     if p.get_text(strip=True)
                 ]
                 rule_text = title + ". " + " ".join(paragraphs) if paragraphs else title
+                fields = _labeled_fields(paragraphs)
 
                 # Prefer posted-date on detail page; fall back to month heading
                 posted = detail_soup.select_one("p.posted-date")
                 posted_str = posted.get_text(strip=True).replace("Posted:", "").strip() if posted else None
-                effective, expires = _extract_dates(rule_text)
-                if not effective and posted_str:
-                    effective = _parse_date(posted_str)
-                if not effective and month_str:
-                    effective = _parse_month(month_str)
+                posted_iso = _parse_date(posted_str) if posted_str else None
+
+                # The structured "Effective date(s):" field is authoritative; the
+                # free-text regexes only matched the old "Month D, YYYY" wording,
+                # so every rule ended up with no expiry (TODO-15).
+                effective, expires = _parse_effective_field(fields.get("effective"), posted_iso)
+                if not effective and not expires:
+                    effective, expires = _extract_dates(rule_text)
+                if not effective:
+                    effective = posted_iso or (_parse_month(month_str) if month_str else None)
 
                 rules.append({
                     "rule_text": rule_text,
+                    "title": title,
+                    "action": fields.get("action"),
+                    "location": fields.get("location"),
+                    "closes_fishing": _closes_fishing(fields.get("action"), title),
                     "effective": effective,
                     "expires": expires,
                     "source_url": href,
@@ -126,6 +136,10 @@ async def fetch_wdfw_emergency() -> list[dict]:
                 effective = _parse_month(month_str) if month_str else None
                 rules.append({
                     "rule_text": title,
+                    "title": title,
+                    "action": None,
+                    "location": None,
+                    "closes_fishing": _closes_fishing(None, title),
                     "effective": effective,
                     "expires": None,
                     "source_url": href,
@@ -177,6 +191,129 @@ def _parse_month(s: str) -> str | None:
         except ValueError:
             continue
     return None
+
+
+# ---------------------------------------------------------------------------
+# Structured detail-page fields (TODO-15)
+# ---------------------------------------------------------------------------
+# Detail pages carry labelled paragraphs, with inconsistent spacing:
+#   "Action: Closes all fishing."  /  "Action : Opens the Mineral Lake ..."
+#   "Effective date: Oct. 9 – Nov. 1, 2026."  /  "Effective dates: Sept. 9, 2026, until further notice."
+#   "Location: Quillayute River (Clallam County), from ..."  /  "Locations: ..."
+
+_FIELD_RE = re.compile(
+    r"^\s*(action|effective dates?|species affected|locations?)\s*:\s*(.+)$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _labeled_fields(paragraphs: list[str]) -> dict[str, str]:
+    """{"action", "effective", "species", "location"} → first value found."""
+    out: dict[str, str] = {}
+    for p in paragraphs:
+        m = _FIELD_RE.match(p)
+        if not m:
+            continue
+        label = m.group(1).lower()
+        key = ("effective" if label.startswith("effective")
+               else "location" if label.startswith("location")
+               else "species" if label.startswith("species")
+               else "action")
+        out.setdefault(key, " ".join(m.group(2).split()))
+    return out
+
+
+_MON = (r"(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?"
+        r"|sept?(?:ember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?")
+_MONTH_NUM = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], start=1)}
+# "Sept. 16–Oct. 31, 2026" / "Oct. 9 – Nov. 1, 2026" / "Dec. 1, 2026 – Jan. 31, 2027"
+_RANGE_TWO_MONTHS = re.compile(
+    rf"{_MON}\s+(\d{{1,2}})(?:,\s*(\d{{4}}))?\s*-\s*{_MON}\s+(\d{{1,2}}),?\s*(\d{{4}})", re.IGNORECASE)
+# "Oct. 9–31, 2026"
+_RANGE_ONE_MONTH = re.compile(rf"{_MON}\s+(\d{{1,2}})\s*-\s*(\d{{1,2}}),?\s*(\d{{4}})", re.IGNORECASE)
+_THROUGH = re.compile(rf"\b(?:through|until)\s+{_MON}\s+(\d{{1,2}}),?\s*(\d{{4}})", re.IGNORECASE)
+_SINGLE = re.compile(rf"\b{_MON}\s+(\d{{1,2}}),?\s*(\d{{4}})", re.IGNORECASE)
+
+
+def _iso(month_tok: str, day: str, year: str | int) -> str | None:
+    try:
+        return date(int(year), _MONTH_NUM[month_tok.lower()[:3]], int(day)).isoformat()
+    except (KeyError, ValueError):
+        return None
+
+
+def _parse_effective_field(text: str | None, posted_iso: str | None = None) -> tuple[str | None, str | None]:
+    """
+    Parse a detail page's "Effective date(s):" value into (effective, expires)
+    ISO dates. "until further notice" → no expiry. "Immediately through X" →
+    effective = posted date. Returns (None, None) when nothing parses.
+    """
+    if not text:
+        return None, None
+    t = " ".join(text.replace("\u2013", "-").replace("\u2014", "-").split())
+
+    m = _RANGE_TWO_MONTHS.search(t)
+    if m:
+        m1, d1, y1, m2, d2, y2 = m.groups()
+        if not y1:  # year only on the end date; a Dec→Jan range starts the year before
+            y1 = int(y2) - (1 if _MONTH_NUM[m1.lower()[:3]] > _MONTH_NUM[m2.lower()[:3]] else 0)
+        return _iso(m1, d1, y1), _iso(m2, d2, y2)
+
+    m = _RANGE_ONE_MONTH.search(t)
+    if m:
+        mon, d1, d2, y = m.groups()
+        return _iso(mon, d1, y), _iso(mon, d2, y)
+
+    expires = None
+    through = _THROUGH.search(t)
+    if through:
+        expires = _iso(*through.groups())
+    effective = None
+    single = _SINGLE.search(t[: through.start()] if through else t)
+    if single:
+        effective = _iso(*single.groups())
+    elif re.search(r"\bimmediately\b", t, re.IGNORECASE):
+        effective = posted_iso
+    return effective, expires
+
+
+_CLOSES_FISHING_RE = re.compile(r"\bclos(?:e|es|ed|ing)\b[^.;]{0,60}?\bfishing\b", re.IGNORECASE)
+_REOPENS_RE = re.compile(r"\b(?:re)?opens?\b|\breturns?\b[^.]*\bpermanent rules\b", re.IGNORECASE)
+
+
+def _closes_fishing(action: str | None, title: str | None) -> bool:
+    """
+    True only for rules that close fishing outright ("Closes all fishing.",
+    "Closes recreational fishing in ...", title "... to close to all fishing").
+    Species-retention closures ("Closes Chinook salmon retention"), openings,
+    limit and gear changes are advisories, not closures.
+    """
+    text = action or title or ""
+    m = _CLOSES_FISHING_RE.search(text)
+    return bool(m) and "retention" not in m.group(0).lower()
+
+
+def reopens_fishing(action: str | None) -> bool:
+    """True for rules that (re)open fishing: used to supersede earlier closures."""
+    return bool(action and _REOPENS_RE.search(action))
+
+
+def location_head(location: str | None) -> str:
+    """
+    The water named at the start of a Location field, without the boundary
+    landmarks that follow: "Quillayute River (Clallam County), from ... the
+    confluence of Sol Duc and Bogachiel rivers" → "Quillayute River". Matching
+    against the full text linked this rule to the Bogachiel (TODO-15).
+    """
+    if not location:
+        return ""
+    s = re.sub(r"\([^)]*\)", " ", location)
+    s = re.split(
+        r"[,;:.]|\b(?:from|north|south|east|west|upstream|downstream|near|at|between|including|below|above)\b",
+        s, maxsplit=1, flags=re.IGNORECASE,
+    )[0]
+    return " ".join(s.split())
 
 
 def _extract_dates(text: str) -> tuple[str | None, str | None]:

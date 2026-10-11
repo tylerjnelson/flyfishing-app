@@ -74,3 +74,104 @@ class TestUserAgent:
         assert await w.fetch_wdfw_emergency() == []  # no rule links in stub page
         assert seen and all(not ua.startswith("python-httpx") for ua in seen)
         assert seen[0] == w._HEADERS["User-Agent"]
+
+
+# ---------------------------------------------------------------------------
+# TODO-15: structured fields, effective-date ranges, closure classification.
+# Strings are verbatim from wdfw.wa.gov rule pages, 2026-10-11.
+# ---------------------------------------------------------------------------
+
+from conditions.wdfw_emergency import (  # noqa: E402
+    _closes_fishing,
+    _labeled_fields,
+    _parse_effective_field,
+    location_head,
+    reopens_fishing,
+)
+
+
+class TestParseEffectiveField:
+    @pytest.mark.parametrize("text,expected", [
+        ("Oct. 9–31, 2026.", ("2026-10-09", "2026-10-31")),
+        ("Oct. 9 – Nov. 1, 2026.", ("2026-10-09", "2026-11-01")),
+        ("Sept. 16–Oct. 31, 2026.", ("2026-09-16", "2026-10-31")),
+        ("Oct. 1–31, 2026.", ("2026-10-01", "2026-10-31")),
+        ("Oct. 6, 2026, until further notice.", ("2026-10-06", None)),
+        ("Sept. 9, 2026, until further notice.", ("2026-09-09", None)),
+        ("Aug. 20, 2026, until further notice.", ("2026-08-20", None)),
+        ("Dec. 1, 2026 – Jan. 31, 2027", ("2026-12-01", "2027-01-31")),
+        ("Dec. 1–Jan. 31, 2027", ("2026-12-01", "2027-01-31")),
+    ])
+    def test_formats(self, text, expected):
+        assert _parse_effective_field(text) == expected
+
+    def test_immediately_through_uses_posted_date(self):
+        assert _parse_effective_field("Immediately through Oct. 31, 2026.", "2026-09-18") == \
+            ("2026-09-18", "2026-10-31")
+
+    def test_unparseable_or_empty(self):
+        assert _parse_effective_field(None) == (None, None)
+        assert _parse_effective_field("See below.") == (None, None)
+
+
+class TestLabeledFields:
+    def test_spacing_variants(self):
+        fields = _labeled_fields([
+            "Site search",
+            "Action : Opens the Mineral Lake game fish season through Oct. 31 annually.",
+            "Effective date : Oct. 1–31, 2026.",
+            "Location : Mineral Lake (Lewis County).",
+            "Action: a second action line is ignored",
+        ])
+        assert fields["action"].startswith("Opens the Mineral Lake")
+        assert fields["effective"] == "Oct. 1–31, 2026."
+        assert fields["location"] == "Mineral Lake (Lewis County)."
+
+    def test_plural_labels(self):
+        fields = _labeled_fields(["Effective dates: Sept. 9, 2026, until further notice.",
+                                  "Locations: Stillaguamish River from Marine Drive"])
+        assert fields["effective"].startswith("Sept. 9")
+        assert fields["location"].startswith("Stillaguamish River")
+
+
+class TestClosesFishing:
+    @pytest.mark.parametrize("action", [
+        "Closes all fishing.",
+        "Closes fishing.",
+        "Closes recreational fishing in the mainstem Stillaguamish River.",
+    ])
+    def test_closures(self, action):
+        assert _closes_fishing(action, "x") is True
+
+    @pytest.mark.parametrize("action", [
+        "Closes Chinook salmon retention.",
+        "Closes retention of wild (unmarked) fall Chinook.",
+        "Opens the Mineral Lake game fish season through Oct. 31 annually.",
+        "Returns Lake Washington to permanent rules listed in the Washington Sport Fishing Rules , "
+        "reopening salmon fishing.",
+        "Reopens fishing in the Quillayute River with reduced salmon retention limits and prohibits bait.",
+        "Maintains previously announced bait prohibitions, single-point barbless hooks requirement.",
+    ])
+    def test_not_closures(self, action):
+        assert _closes_fishing(action, "x") is False
+
+    def test_title_fallback_when_no_action(self):
+        assert _closes_fishing(None, "Stillaguamish River to close to all fishing Oct. 9") is True
+        assert _closes_fishing(None, "Green (Duwamish) River Chinook retention closed") is False
+
+
+class TestReopensAndLocation:
+    def test_reopens(self):
+        assert reopens_fishing("Reopens fishing in the Quillayute River with reduced limits.")
+        assert reopens_fishing("Opens the Icicle River to retention of coho salmon.")
+        assert reopens_fishing("Returns Lake Washington to permanent rules listed in the pamphlet.")
+        assert not reopens_fishing("Closes all fishing.")
+        assert not reopens_fishing(None)
+
+    def test_location_head_drops_landmarks(self):
+        loc = ("Quillayute River (Clallam County), from Olympic National Park boundary upstream to "
+               "confluence of Sol Duc and Bogachiel rivers.")
+        assert location_head(loc) == "Quillayute River"
+        assert location_head("Stillaguamish River from Marine Drive (south of Stanwood) upstream") == \
+            "Stillaguamish River"
+        assert location_head(None) == ""

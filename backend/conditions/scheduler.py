@@ -20,6 +20,7 @@ by the chat context builder — they are NOT scheduled here.
 """
 
 import logging
+import re
 
 
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
@@ -37,7 +38,7 @@ from conditions.noaa_nwrfc import fetch_noaa_nwrfc, resolve_gauge_id
 from conditions.inciweb import fetch_inciweb
 from conditions.nps_alerts import fetch_nps_alerts
 from conditions.snotel import fetch_snotel
-from conditions.wdfw_emergency import fetch_wdfw_emergency
+from conditions.wdfw_emergency import fetch_wdfw_emergency, location_head, reopens_fishing
 from conditions.wdfw_regulations import fetch_and_update_regulations
 from conditions.wdfw_stocking import fetch_wdfw_stocking
 from conditions.wta_scraper import fetch_wta_reports
@@ -164,31 +165,47 @@ async def job_wdfw_emergency() -> None:
     async with AsyncSessionLocal() as session:
         result = await session.execute(select(WaterBody.id, WaterBody.name, WaterBody.aliases))
         for row in result.all():
-            name_to_wb_id[row.name.upper()] = row.id
-            if row.aliases:
-                for alias in row.aliases:
-                    name_to_wb_id[alias.upper()] = row.id
+            for name in [row.name, *(row.aliases or [])]:
+                if name and "(" not in name:  # "MINERAL LK (LEWI)"-style stocking names never match prose
+                    name_to_wb_id.setdefault(" ".join(name.upper().split()), row.id)
+    # Longest first, whole words: "Lake Washington" before "Washington", and
+    # "Fish Lake" must not match inside "Spearfish Lake".
+    name_patterns = [
+        (re.compile(rf"\b{re.escape(n)}\b"), wb_id)
+        for n, wb_id in sorted(name_to_wb_id.items(), key=lambda kv: -len(kv[0]))
+    ]
 
-    def _resolve_water_body_id(rule_text: str) -> object:
-        rule_upper = rule_text.upper()
-        for name_upper, wb_id in name_to_wb_id.items():
-            if name_upper in rule_upper:
-                return wb_id
+    def _resolve_water_body_id(rule: dict) -> object:
+        """Match the rule's title, then the water named at the head of its
+        Location field. Never the full text: boundary landmarks ("...to the
+        confluence of Sol Duc and Bogachiel rivers") linked rules to the wrong
+        water (TODO-15)."""
+        for candidate in (rule.get("title"), location_head(rule.get("location"))):
+            text_upper = " ".join(re.sub(r"\([^)]*\)", " ", candidate or "").upper().split())
+            if not text_upper:
+                continue
+            for pattern, wb_id in name_patterns:
+                if pattern.search(text_upper):
+                    return wb_id
         return None
+
+    for rule in rules:
+        rule["water_body_id"] = _resolve_water_body_id(rule)
+    superseded = _apply_supersession(rules)
 
     async with AsyncSessionLocal() as session:
         async with session.begin():
             await session.execute(
                 text("DELETE FROM emergency_closures")
             )
-            matched = 0
             for rule in rules:
-                wb_id = _resolve_water_body_id(rule["rule_text"])
-                if wb_id:
-                    matched += 1
                 session.add(EmergencyClosure(
-                    water_body_id=wb_id,
+                    water_body_id=rule["water_body_id"],
                     rule_text=rule["rule_text"],
+                    title=rule.get("title"),
+                    action=rule.get("action"),
+                    location=rule.get("location"),
+                    closes_fishing=bool(rule.get("closes_fishing")),
                     effective=_parse_date(rule.get("effective")),
                     expires=_parse_date(rule.get("expires")),
                     source_url=rule["source_url"],
@@ -198,10 +215,39 @@ async def job_wdfw_emergency() -> None:
     _log_job_done(
         "wdfw_emergency",
         rules_stored=len(rules),
-        water_body_matched=matched,
-        # No parsed expiry ⇒ treated as active indefinitely; watch this number.
+        water_body_matched=sum(1 for r in rules if r["water_body_id"]),
+        closures=sum(1 for r in rules if r.get("closes_fishing")),
+        superseded_closures=superseded,
+        # No parsed expiry ⇒ active for as long as WDFW lists the rule.
         rules_without_expiry=sum(1 for r in rules if not r.get("expires")),
     )
+
+
+def _apply_supersession(rules: list[dict]) -> list[str]:
+    """
+    Clear closes_fishing on closures that a later rule for the same water
+    reopened (e.g. Quillayute: closed Sept. 9 "until further notice", reopened
+    Oct. 6). "Same water" = same water_body_id, or, for rules matching no water
+    body, the same Location head. Returns the superseded rules' titles.
+    """
+    def water_key(rule: dict):
+        return rule.get("water_body_id") or location_head(rule.get("location")).lower() or None
+
+    superseded = []
+    for closure in rules:
+        key = water_key(closure)
+        if not closure.get("closes_fishing") or key is None or not closure.get("effective"):
+            continue
+        for other in rules:
+            if (other is not closure and water_key(other) == key
+                    and reopens_fishing(other.get("action"))
+                    and (other.get("effective") or "") > closure["effective"]):
+                closure["closes_fishing"] = False
+                superseded.append(closure.get("title"))
+                break
+    if superseded:
+        log.info("wdfw_emergency_closures_superseded", extra={"titles": superseded})
+    return superseded
 
 
 # ---------------------------------------------------------------------------

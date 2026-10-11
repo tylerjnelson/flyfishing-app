@@ -43,14 +43,18 @@ async def get_spot(spot_id: UUID, db: AsyncSession) -> WaterBody | None:
 
 
 async def get_spot_closures(spot_id: UUID, db: AsyncSession) -> list[EmergencyClosure]:
-    """Return active (non-expired) closures for a water body."""
+    """Return closures in effect today for a water body.
+
+    Only rules the scraper flagged closes_fishing: openings, limit changes and
+    species-retention closures used to show in the "Active Closure" banner too.
+    """
+    today = date.today()
     result = await db.execute(
         select(EmergencyClosure)
         .where(EmergencyClosure.water_body_id == spot_id)
-        .where(
-            EmergencyClosure.expires.is_(None)
-            | (EmergencyClosure.expires >= date.today())
-        )
+        .where(EmergencyClosure.closes_fishing.is_(True))
+        .where(EmergencyClosure.effective.is_(None) | (EmergencyClosure.effective <= today))
+        .where(EmergencyClosure.expires.is_(None) | (EmergencyClosure.expires >= today))
         .order_by(EmergencyClosure.effective)
     )
     return list(result.scalars().all())

@@ -21,6 +21,7 @@ and force_rerun=False. The pipeline re-runs only on confirmed FILTER_UPDATE.
 import asyncio
 import json
 import logging
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -40,6 +41,7 @@ from conditions.routing import (
     haversine_miles,
 )
 from conditions.usgs import fetch_usgs_gauge
+from conditions.wdfw_emergency import location_head
 from config import settings
 from db.connection import AsyncSessionLocal
 from db.models import (
@@ -203,10 +205,6 @@ def _filter_excluded(pairs: list[tuple], excluded_ids: set[str]) -> list[tuple]:
     return [(fs, wb) for fs, wb in pairs if str(fs.id) not in excluded_ids]
 
 
-_CLOSURE_KEYWORDS: frozenset[str] = frozenset(
-    {"close", "closed", "closure", "closes", "prohibited", "emergency"}
-)
-
 _GEO_TYPE_WORDS: frozenset[str] = frozenset({
     "river", "creek", "lake", "pond", "reservoir", "stream",
     "tributary", "bay", "channel", "fork", "run",
@@ -215,9 +213,17 @@ _GEO_TYPE_WORDS: frozenset[str] = frozenset({
 
 def _has_active_closure(water_body_name: str, active_closures: list, water_body_id=None) -> bool:
     """
-    Return True if any active closure applies to this water body.
-    Prefers FK match when water_body_id is provided; falls back to rule_text
-    name scan for closure rows where water_body_id is NULL (statewide rules).
+    Return True if an active closure applies to this water body.
+
+    Only rules with closes_fishing count: the scraper sets it from the rule's
+    Action field ("Closes all fishing"), not for openings, limit/gear changes or
+    species-retention closures, and clears it when a later rule reopened the
+    water. Before TODO-15 every linked rule was treated as a closure.
+
+    Prefers the FK match. For rules linked to no water body, the spot's
+    distinctive name words must all appear in the rule's title or the water
+    named at the head of its Location field, never in the full text, whose
+    boundary landmarks name other rivers.
     """
     if not active_closures or not water_body_name:
         return False
@@ -226,12 +232,14 @@ def _has_active_closure(water_body_name: str, active_closures: list, water_body_
     if not content_words:
         content_words = all_name_words
     for cl in active_closures:
+        if cl.closes_fishing is not True:
+            continue
         if water_body_id and cl.water_body_id == water_body_id:
             return True
         if cl.water_body_id is None:
-            text_lower = (cl.rule_text or "").lower()
-            text_words = frozenset(text_lower.split())
-            if content_words <= text_words and _CLOSURE_KEYWORDS & text_words:
+            text = f"{cl.title or ''} {location_head(cl.location)}"
+            text_words = frozenset(re.sub(r"[^\w\s]", " ", text.lower()).split())
+            if content_words <= text_words:
                 return True
     return False
 
@@ -1415,6 +1423,7 @@ async def build_context(
         today_date = date.today()
         closure_result = await db.execute(
             select(EmergencyClosure).where(
+                EmergencyClosure.closes_fishing.is_(True),
                 (EmergencyClosure.effective <= today_date) | EmergencyClosure.effective.is_(None),
                 (EmergencyClosure.expires >= today_date) | EmergencyClosure.expires.is_(None),
             )

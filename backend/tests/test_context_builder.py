@@ -19,6 +19,8 @@ from datetime import date, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import uuid
+
 import pytest
 
 from chat.context_builder import (
@@ -55,12 +57,16 @@ def make_spot(**kwargs) -> MagicMock:
     return spot
 
 
-def make_closure(effective=None, expires=None, rule_text="Emergency closure — Yakima River closed") -> MagicMock:
+def make_closure(effective=None, expires=None, rule_text="Emergency closure — Yakima River closed",
+                 title=None, location=None, closes_fishing=True, water_body_id=None) -> MagicMock:
     cl = MagicMock()
     cl.effective = effective
     cl.expires = expires
     cl.rule_text = rule_text
-    cl.water_body_id = None  # MagicMock auto-creates truthy attrs; statewide/unmatched rows have NULL FK
+    cl.title = title if title is not None else rule_text
+    cl.location = location
+    cl.closes_fishing = closes_fishing
+    cl.water_body_id = water_body_id  # MagicMock auto-creates truthy attrs; statewide/unmatched rows have NULL FK
     return cl
 
 
@@ -70,42 +76,72 @@ def make_closure(effective=None, expires=None, rule_text="Emergency closure — 
 
 class TestHasActiveClosure:
     """
-    _has_active_closure(spot_name, active_closures) — text-based matching.
-    active_closures is a pre-filtered list (date range already applied by caller).
+    _has_active_closure(spot_name, active_closures, water_body_id) — only rules
+    the scraper flagged closes_fishing count (TODO-15). active_closures is
+    pre-filtered by date by the caller.
     """
 
     def test_active_closure_matches_spot_name(self):
-        cl = make_closure(rule_text="Emergency closure — Yakima River closed to fishing")
+        cl = make_closure(title="Yakima River closed to all fishing")
         assert _has_active_closure("Yakima River", [cl]) is True
 
     def test_closure_without_spot_name_does_not_match(self):
-        cl = make_closure(rule_text="Emergency closure — Methow River closed to fishing")
+        cl = make_closure(title="Methow River closed to all fishing")
         assert _has_active_closure("Yakima River", [cl]) is False
 
     def test_no_closures_returns_false(self):
         assert _has_active_closure("Yakima River", []) is False
 
     def test_empty_spot_name_returns_false(self):
-        cl = make_closure(rule_text="Emergency closure — Yakima River closed")
+        cl = make_closure(title="Yakima River closed")
         assert _has_active_closure("", [cl]) is False
 
-    def test_closure_without_keyword_does_not_match(self):
-        # rule_text mentions the spot but has no closure keyword
-        cl = make_closure(rule_text="Yakima River regulation update — check local rules")
-        assert _has_active_closure("Yakima River", [cl]) is False
+    def test_non_closure_rule_never_filters(self):
+        # Openings, limit changes, retention closures: closes_fishing=False
+        cl = make_closure(title="Lake Washington reopens for salmon fishing", closes_fishing=False)
+        assert _has_active_closure("Lake Washington", [cl]) is False
+
+    def test_linked_non_closure_never_filters(self):
+        """Mineral Lake 'season extended' was linked by FK and hard-filtered the lake."""
+        wb = uuid.uuid4()
+        cl = make_closure(title="Mineral Lake fishing season extended through Oct. 31",
+                          closes_fishing=False, water_body_id=wb)
+        assert _has_active_closure("Mineral Lake", [cl], water_body_id=wb) is False
+
+    def test_linked_closure_filters(self):
+        wb = uuid.uuid4()
+        cl = make_closure(title="Stillaguamish River to close to all fishing Oct. 9", water_body_id=wb)
+        assert _has_active_closure("Stillaguamish River", [cl], water_body_id=wb) is True
 
     def test_partial_name_word_match(self):
-        # "Yakima" alone is enough to match "Yakima River closed"
-        cl = make_closure(rule_text="Yakima closed to all angling")
+        # "Yakima" alone is enough to match "Yakima closed..."
+        cl = make_closure(title="Yakima closed to all angling")
         assert _has_active_closure("Yakima River", [cl]) is True
 
+    def test_parenthetical_name_matches(self):
+        cl = make_closure(title="Upper Green (Duwamish) River closed to fishing from Sept. 16–Oct. 31")
+        assert _has_active_closure("Green River", [cl]) is True
+
+    def test_landmark_in_location_does_not_match(self):
+        """The Quillayute closure's Location ends '...confluence of Sol Duc and
+        Bogachiel rivers'. That must not close the Bogachiel."""
+        cl = make_closure(
+            title="Quillayute River closing to all fishing due to low flows",
+            rule_text="Quillayute River closing ... Location: Quillayute River (Clallam County) from the "
+                      "Olympic National Park boundary upstream to confluence of Sol Duc and Bogachiel rivers.",
+            location="Quillayute River (Clallam County) from the Olympic National Park boundary upstream "
+                     "to confluence of Sol Duc and Bogachiel rivers.",
+        )
+        assert _has_active_closure("Bogachiel River", [cl]) is False
+        assert _has_active_closure("Quillayute River", [cl]) is True
+
     def test_multiple_closures_any_match_returns_true(self):
-        cl1 = make_closure(rule_text="Methow River prohibited — emergency")
-        cl2 = make_closure(rule_text="Icicle Creek emergency closure")
+        cl1 = make_closure(title="Methow River closed to all fishing")
+        cl2 = make_closure(title="Icicle Creek closed to all fishing")
         assert _has_active_closure("Icicle Creek", [cl1, cl2]) is True
 
-    def test_none_rule_text_does_not_raise(self):
-        cl = make_closure(rule_text=None)
+    def test_none_title_does_not_raise(self):
+        cl = make_closure(rule_text=None, title="")
         assert _has_active_closure("Yakima River", [cl]) is False
 
 
