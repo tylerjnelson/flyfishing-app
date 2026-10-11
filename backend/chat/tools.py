@@ -388,15 +388,17 @@ async def _build_candidate_from_db(db: AsyncSession, spot_id: str) -> dict | Non
     if not row:
         return None
     fs, wb = row.FishingSpot, row.WaterBody
+    # Freshest row per source. (Was "newest 12 rows overall", so a burst of
+    # NWS/AirNow rows could crowd snotel/wta/nwrfc out entirely.)
     cc_result = await db.execute(
         select(ConditionsCache.source, ConditionsCache.data)
         .where(ConditionsCache.water_body_id == wb.id)
-        .order_by(ConditionsCache.fetched_at.desc())
-        .limit(12)
+        .order_by(ConditionsCache.source, ConditionsCache.fetched_at.desc())
+        .distinct(ConditionsCache.source)
     )
     conditions: dict = {}
     for cc in cc_result.mappings():
-        conditions.setdefault(cc["source"], cc["data"])  # first (freshest) per source
+        conditions.setdefault(cc["source"], cc["data"])
     return {
         "fishing_spot_id": str(fs.id),
         "water_body_id": str(wb.id),

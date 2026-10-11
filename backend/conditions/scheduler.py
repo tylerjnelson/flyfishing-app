@@ -19,8 +19,6 @@ Real-time fetchers (USGS, NOAA NWS, AirNow) are triggered at session open
 by the chat context builder — they are NOT scheduled here.
 """
 
-import hashlib
-import json
 import logging
 
 
@@ -28,11 +26,12 @@ from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from sqlalchemy import delete, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from config import settings
+from conditions.cache import write_conditions_cache
 from conditions.fetch_errors import log_fetch_failure
 from conditions.noaa_nwrfc import fetch_noaa_nwrfc, resolve_gauge_id
 from conditions.inciweb import fetch_inciweb
@@ -218,7 +217,7 @@ async def job_inciweb() -> None:
 
     async with AsyncSessionLocal() as session:
         async with session.begin():
-            await _write_conditions_cache(
+            await write_conditions_cache(
                 session, water_body_id=None, source="inciweb", data=data
             )
 
@@ -238,7 +237,7 @@ async def job_nps_alerts() -> None:
 
     async with AsyncSessionLocal() as session:
         async with session.begin():
-            await _write_conditions_cache(
+            await write_conditions_cache(
                 session, water_body_id=None, source="nps_alerts", data=data
             )
 
@@ -270,7 +269,7 @@ async def job_noaa_nwrfc() -> None:
                 continue
             async with AsyncSessionLocal() as session:
                 async with session.begin():
-                    await _write_conditions_cache(
+                    await write_conditions_cache(
                         session, water_body_id=wb.id, source="noaa_nwrfc", data=data
                     )
             wrote += 1
@@ -284,7 +283,8 @@ async def job_noaa_nwrfc() -> None:
 
 async def job_wdfw_stocking() -> None:
     log.info("job_start", extra={"job": "wdfw_stocking"})
-    records = await fetch_wdfw_stocking()
+    year = datetime.now(tz=timezone.utc).year
+    records = await fetch_wdfw_stocking(year)
     if records is None:
         _log_job_done("wdfw_stocking", failed=1, serving="stale_cache")
         return
@@ -311,6 +311,20 @@ async def job_wdfw_stocking() -> None:
                     fetched_at=datetime.now(tz=timezone.utc),
                 ).on_conflict_do_nothing(index_elements=["source_record_id"])
                 await session.execute(stmt)
+
+            # The fetch is the full year's dataset, so drop that year's rows it no
+            # longer contains: records WDFW corrected/removed, and rows keyed by the
+            # old unstable Socrata :id (~271k duplicates as of 2026-10).
+            removed = 0
+            if records:
+                current_ids = [r["source_record_id"] for r in records]
+                result = await session.execute(
+                    delete(StockingEvent)
+                    .where(StockingEvent.stocked_date >= date(year, 1, 1))
+                    .where(StockingEvent.stocked_date < date(year + 1, 1, 1))
+                    .where(StockingEvent.source_record_id.not_in(current_ids))
+                )
+                removed = result.rowcount
 
     # Propagate most-recent stocked_date per water body
     latest_by_name: dict[str, object] = {}
@@ -339,7 +353,12 @@ async def job_wdfw_stocking() -> None:
                     )
                     water_bodies_updated += result.rowcount
 
-    _log_job_done("wdfw_stocking", records_fetched=len(records), water_bodies_updated=water_bodies_updated)
+    _log_job_done(
+        "wdfw_stocking",
+        records_fetched=len(records),
+        stale_rows_removed=removed,
+        water_bodies_updated=water_bodies_updated,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -379,7 +398,7 @@ async def job_wta() -> None:
 
         async with AsyncSessionLocal() as session:
             async with session.begin():
-                await _write_conditions_cache(
+                await write_conditions_cache(
                     session,
                     water_body_id=wb.id,
                     source="wta",
@@ -420,7 +439,7 @@ async def job_snotel() -> None:
             continue
         async with AsyncSessionLocal() as session:
             async with session.begin():
-                await _write_conditions_cache(
+                await write_conditions_cache(
                     session, water_body_id=wb.id, source="snotel", data=data
                 )
         wrote += 1
@@ -475,47 +494,6 @@ async def job_wdfw_regulations() -> None:
 # ---------------------------------------------------------------------------
 # DB helpers
 # ---------------------------------------------------------------------------
-
-# How long to retain rows per source before pruning on write.
-# We only ever read the freshest row; history is kept briefly for debugging.
-_CACHE_TTL_HOURS: dict[str, int] = {
-    "inciweb":    6,
-    "nps_alerts": 6,
-    "noaa_nws":   6,
-    "usgs":       6,
-    "airnow":     6,
-    "noaa_nwrfc": 48,
-    "snotel":     48,
-    "wta":        48,
-}
-
-
-async def _write_conditions_cache(session, water_body_id, source: str, data: dict) -> None:
-    """Insert a new conditions_cache row and prune rows older than the source TTL.
-
-    water_body_id may be None for global sources (inciweb, nps_alerts).
-    """
-    ttl_hours = _CACHE_TTL_HOURS.get(source)
-    if ttl_hours:
-        cutoff = datetime.now(tz=timezone.utc) - timedelta(hours=ttl_hours)
-        await session.execute(
-            delete(ConditionsCache)
-            .where(ConditionsCache.water_body_id == water_body_id)
-            .where(ConditionsCache.source == source)
-            .where(ConditionsCache.fetched_at < cutoff)
-        )
-
-    data_hash = hashlib.md5(
-        json.dumps(data, sort_keys=True, separators=(",", ":"), default=str).encode()
-    ).hexdigest()
-    session.add(ConditionsCache(
-        water_body_id=water_body_id,
-        source=source,
-        data=data,
-        data_hash=data_hash,
-        fetched_at=datetime.now(tz=timezone.utc),
-    ))
-
 
 async def _mark_stale(water_body_id, source: str) -> None:
     """Set stale=True on the most recent conditions_cache entry for a water_body+source."""

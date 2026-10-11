@@ -195,8 +195,7 @@ class TestNormalizeInciweb:
 
 class TestNormalizeWdfwStocking:
     def test_basic_record(self):
-        # Uses dataset 6fex-3r7d field names; :id is the Socrata row identifier
-        # (requested via $select=*,:id — geo_code is a location code, not a unique row ID)
+        # Uses dataset 6fex-3r7d field names
         raw = [{"release_location": "Lake X", "county": "King",
                 "release_start_date": "2026-03-01T00:00:00.000", "species": "Rainbow Trout",
                 "number_released": "500", "lifestage": "Legals", "geo_code": "L1234",
@@ -205,7 +204,24 @@ class TestNormalizeWdfwStocking:
         assert len(result) == 1
         assert result[0]["water_name"] == "Lake X"
         assert result[0]["count"] == 500
-        assert result[0]["source_record_id"] == "row-abc123"
+        assert result[0]["source_record_id"].endswith("-1")
+
+    def test_record_id_stable_across_republish(self):
+        """Socrata :id changes on every republish; our key must not (TODO-12)."""
+        rec = {"release_location": "Lake X", "release_start_date": "2026-03-01T00:00:00.000",
+               "species": "Rainbow Trout", "number_released": "500"}
+        a = normalize_wdfw_stocking([{**rec, ":id": "row-aaa"}], datetime.now(tz=timezone.utc))
+        b = normalize_wdfw_stocking([{**rec, ":id": "row-bbb"}], datetime.now(tz=timezone.utc))
+        assert a[0]["source_record_id"] == b[0]["source_record_id"]
+
+    def test_identical_records_get_distinct_ids(self):
+        rec = {"release_location": "Lake X", "species": "Rainbow Trout", "number_released": "500"}
+        result = normalize_wdfw_stocking([dict(rec), dict(rec), {**rec, "number_released": "501"}],
+                                         datetime.now(tz=timezone.utc))
+        ids = [r["source_record_id"] for r in result]
+        assert len(set(ids)) == 3
+        assert ids[0].rsplit("-", 1)[0] == ids[1].rsplit("-", 1)[0]
+        assert [i.rsplit("-", 1)[1] for i in ids[:2]] == ["1", "2"]
 
     def test_missing_count_returns_none(self):
         raw = [{"release_location": "Lake Y", "release_start_date": "2026-03-01T00:00:00.000",

@@ -286,10 +286,10 @@ def normalize_wdfw_stocking(records: list, fetched_at: datetime) -> list[dict]:
       species           → species
       number_released   → count
       lifestage         → size_description
-      geo_code          → source_record_id
+      (whole record)    → source_record_id, see _stocking_record_ids
     """
     normalized = []
-    for r in records:
+    for r, record_id in zip(records, _stocking_record_ids(records)):
         normalized.append({
             "source": "wdfw_stocking",
             "fetched_at": fetched_at.isoformat(),
@@ -299,9 +299,32 @@ def normalize_wdfw_stocking(records: list, fetched_at: datetime) -> list[dict]:
             "species": r.get("species"),
             "count": _safe_int(r.get("number_released")),
             "size_description": r.get("lifestage"),
-            "source_record_id": r.get(":id"),
+            "source_record_id": record_id,
         })
     return normalized
+
+
+def _stocking_record_ids(records: list) -> list[str]:
+    """
+    Stable dedupe key per stocking record: a hash of the record's content plus
+    an occurrence number among identical records ("<sha1[:24]>-<n>").
+
+    Socrata's `:id` can't be used: it changes every time WDFW republishes the
+    dataset, so the unique constraint never matched and each daily run
+    re-inserted everything (~100x duplicates by 2026-10). No subset of fields is
+    unique either, and the source contains genuinely identical rows, so hash the
+    full record and number repeats to keep them distinct but stable.
+    """
+    seen: dict[str, int] = {}
+    ids = []
+    for r in records:
+        content = {k: v for k, v in r.items() if not k.startswith(":")}
+        digest = hashlib.sha1(
+            json.dumps(content, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()[:24]
+        seen[digest] = seen.get(digest, 0) + 1
+        ids.append(f"{digest}-{seen[digest]}")
+    return ids
 
 
 # ---------------------------------------------------------------------------

@@ -29,6 +29,7 @@ from sqlalchemy import select, text
 
 from chat.response_cache import compute_intake_hash, get_cached_response
 from conditions.airnow import fetch_airnow
+from conditions.cache import write_conditions_cache
 from conditions.normalizer import INTERVAL_REALTIME, compute_conditions_hash
 from conditions.noaa_nws import fetch_noaa_nws
 from conditions import here_budget
@@ -319,11 +320,9 @@ def _cfs_out_of_range(
 async def _fetch_and_cache_realtime(fishing_spots: list, water_bodies: list[WaterBody]) -> None:
     """
     Fetch USGS, NOAA NWS, and AirNow data for candidate spots in parallel.
-    Writes fresh rows to conditions_cache keyed by water_body_id.
+    Writes fresh rows to conditions_cache keyed by water_body_id (pruned per
+    source TTL — see conditions/cache.py).
     """
-    import hashlib
-    import json
-
     wb_by_id = {str(wb.id): wb for wb in water_bodies}
 
     usgs_pairs = [
@@ -382,18 +381,7 @@ async def _fetch_and_cache_realtime(fishing_spots: list, water_bodies: list[Wate
     async with AsyncSessionLocal() as session:
         async with session.begin():
             for water_body_id, source, data in to_write:
-                data_hash = hashlib.md5(
-                    json.dumps(
-                        data, sort_keys=True, separators=(",", ":"), default=str
-                    ).encode()
-                ).hexdigest()
-                session.add(ConditionsCache(
-                    water_body_id=water_body_id,
-                    source=source,
-                    data=data,
-                    data_hash=data_hash,
-                    fetched_at=datetime.now(tz=timezone.utc),
-                ))
+                await write_conditions_cache(session, water_body_id, source, data)
 
     log.info(
         "realtime_conditions_fetched",
