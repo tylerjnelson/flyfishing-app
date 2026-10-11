@@ -35,12 +35,29 @@ Backups are written next to each live file as `<file>.bak_synctool_<timestamp>`.
 | `systemd/flyfish-drift-check.{service,timer}` | `/etc/systemd/system/…` |
 | `llama-chat.service`, `llama-util.service`, `flyfish-llama-prewarm.service` | `/etc/systemd/system/…` |
 | `logrotate.flyfish` | `/etc/logrotate.d/flyfish` |
+| `letsencrypt/reload-nginx.sh` (0755) | `/etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh` |
+
+## TLS renewal
+Certbot renews via the `dns-cloudflare` authenticator, which has no nginx
+installer, so nothing reloads nginx on its own: nginx keeps serving the old
+cert from memory. (This is how the site served an expired cert from 2026-09-02
+until 2026-10-11 despite a successful renewal on 2026-10-02.)
+`letsencrypt/reload-nginx.sh` is a certbot **deploy hook**. Certbot runs it only
+after a cert is actually renewed, and it runs `nginx -t` + `systemctl reload nginx`.
+
+`sync.sh check` (and so the hourly timer) also checks the **served** cert and
+fails if it differs from certbot's current cert (renewed, not reloaded) or has
+fewer than `TLS_MIN_DAYS` (14) days left (renewal itself failing).
+
+Test end-to-end (staging, no real cert change; certbot adds a random delay of up to ~8 min):
+`sudo certbot renew --dry-run --run-deploy-hooks --cert-name waflyfish.com`
 
 ## Not managed here (on purpose)
 - **`/etc/flyfish/app.env`** — secrets; stays out of git. `app.env.example`
   tracks the required *keys* so the env can be rebuilt. Update it when a key
   is added/removed.
-- **TLS certs** (`/etc/letsencrypt/…`) — managed by certbot, never in git.
+- **TLS certs** (`/etc/letsencrypt/…`) — managed by certbot, never in git
+  (only the deploy hook above is tracked).
 - **App code / frontend** — deployed separately (`/opt/flyfish/backend`,
   `/var/www/flyfish/dist`). This dir is host/systemd/nginx config only.
 

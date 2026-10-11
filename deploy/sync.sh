@@ -20,7 +20,8 @@ DEPLOY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TS="$(date +%Y%m%d_%H%M%S)"
 
 # Managed files: "<repo-relative path>|<live path>|<kind>"
-# kind ∈ nginx | systemd | plain  (drives the post-deploy reload action)
+# kind ∈ nginx | systemd | plain | exec  (drives the post-deploy action;
+# exec = installed 0755 and checked for the executable bit)
 MANIFEST=(
   "nginx/flyfish.conf|/etc/nginx/sites-available/flyfish|nginx"
   "nginx/conf.d/flyfish-ratelimit.conf|/etc/nginx/conf.d/flyfish-ratelimit.conf|nginx"
@@ -31,7 +32,15 @@ MANIFEST=(
   "llama-util.service|/etc/systemd/system/llama-util.service|systemd"
   "flyfish-llama-prewarm.service|/etc/systemd/system/flyfish-llama-prewarm.service|systemd"
   "logrotate.flyfish|/etc/logrotate.d/flyfish|plain"
+  "letsencrypt/reload-nginx.sh|/etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh|exec"
 )
+
+# TLS: `check` also verifies the cert nginx is actually serving. Fails if it
+# differs from certbot's current cert (renewed but nginx not reloaded) or is
+# within TLS_MIN_DAYS of expiry (renewal itself is failing).
+TLS_DOMAIN="waflyfish.com"
+TLS_LIVE_CERT="/etc/letsencrypt/live/${TLS_DOMAIN}/cert.pem"
+TLS_MIN_DAYS=14
 
 RED=$'\033[31m'; GRN=$'\033[32m'; YEL=$'\033[33m'; RST=$'\033[0m'
 
@@ -54,7 +63,10 @@ cmd_check() {
     if [[ ! -f "$live" ]]; then
       echo "${YEL}!! not-on-live${RST}  $live  (repo has it; never deployed?)"; drift=1; continue
     fi
-    if diff -q "$repo" "$live" >/dev/null 2>&1; then
+    if [[ "$kind" == exec && ! -x "$live" ]]; then
+      echo "${RED}DRIFT${RST}         $live  <-- not executable (needs 0755)"
+      drift=1
+    elif diff -q "$repo" "$live" >/dev/null 2>&1; then
       echo "${GRN}ok${RST}            $live"
     else
       echo "${RED}DRIFT${RST}         $live  <-- differs from deploy/$rel"
@@ -62,11 +74,38 @@ cmd_check() {
       drift=1
     fi
   done
+  check_tls || drift=1
   if [[ $drift -ne 0 ]]; then
     echo "${RED}drift detected — reconcile with 'sync.sh deploy' (git wins) or 'sync.sh pull' (live wins).${RST}" >&2
     return 1
   fi
   echo "${GRN}no drift — live matches git.${RST}"
+}
+
+# ---------------------------------------------------------------------------
+check_tls() {
+  if [[ ! -f "$TLS_LIVE_CERT" ]]; then
+    echo "${YEL}?? no-cert${RST}      $TLS_LIVE_CERT (certbot not provisioned?)"; return 1
+  fi
+  local served served_fp live_fp end_epoch days
+  served="$(echo | timeout 10 openssl s_client -connect 127.0.0.1:443 \
+            -servername "$TLS_DOMAIN" 2>/dev/null | openssl x509 2>/dev/null)" || true
+  if [[ -z "$served" ]]; then
+    echo "${RED}TLS${RST}           could not fetch served cert from 127.0.0.1:443"; return 1
+  fi
+  served_fp="$(openssl x509 -noout -fingerprint -sha256 <<<"$served")"
+  live_fp="$(openssl x509 -noout -fingerprint -sha256 -in "$TLS_LIVE_CERT")"
+  end_epoch="$(date -d "$(openssl x509 -noout -enddate <<<"$served" | cut -d= -f2)" +%s)"
+  days=$(( (end_epoch - $(date +%s)) / 86400 ))
+  if [[ "$served_fp" != "$live_fp" ]]; then
+    echo "${RED}TLS STALE${RST}     nginx serves an old cert (${days}d left) — certbot renewed but nginx not reloaded"
+    return 1
+  fi
+  if (( days < TLS_MIN_DAYS )); then
+    echo "${RED}TLS EXPIRING${RST}  served cert has ${days}d left (< ${TLS_MIN_DAYS}) — certbot renewal failing?"
+    return 1
+  fi
+  echo "${GRN}ok${RST}            TLS ${TLS_DOMAIN}: served = certbot current, ${days}d left"
 }
 
 # ---------------------------------------------------------------------------
@@ -78,14 +117,16 @@ cmd_deploy() {
     IFS='|' read -r rel live kind <<<"$entry"
     repo="$DEPLOY_DIR/$rel"
     [[ -f "$repo" ]] || { echo "${YEL}skip${RST} (repo missing) $rel"; continue; }
-    if [[ -f "$live" ]] && diff -q "$repo" "$live" >/dev/null 2>&1; then
+    if [[ -f "$live" ]] && diff -q "$repo" "$live" >/dev/null 2>&1 \
+       && [[ "$kind" != exec || -x "$live" ]]; then
       continue  # already in sync
     fi
     if [[ -f "$live" ]]; then
       cp -a "$live" "${live}.bak_synctool_${TS}"
       [[ "$kind" == nginx ]] && nginx_backups+=("$live")
     fi
-    install -m 0644 "$repo" "$live"
+    mkdir -p "$(dirname "$live")"
+    if [[ "$kind" == exec ]]; then install -m 0755 "$repo" "$live"; else install -m 0644 "$repo" "$live"; fi
     echo "${GRN}deployed${RST}     $rel -> $live"
     [[ "$kind" == nginx ]] && nginx_changed=1
     [[ "$kind" == systemd ]] && systemd_changed=1
