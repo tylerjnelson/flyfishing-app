@@ -291,3 +291,75 @@ async def test_usgs_request_includes_period_for_trend(monkeypatch):
     await usgs._fetch("12134500")
     assert seen["period"] == "PT2H"
     assert seen["sites"] == "12134500"
+
+
+# ---------------------------------------------------------------------------
+# NWPS observed-flow fallback for dead USGS gauges (2026-10-11 audit)
+# ---------------------------------------------------------------------------
+
+def _nwps(points):
+    return {"observed": {"data": [
+        {"validTime": t.strftime("%Y-%m-%dT%H:%M:%SZ"), "primary": stage, "secondary": kcfs}
+        for t, stage, kcfs in points
+    ]}}
+
+
+class TestNormalizeNwpsObserved:
+    def test_latest_flow_in_cfs_with_trend(self):
+        from conditions.normalizer import normalize_nwps_observed
+        now = datetime.now(tz=timezone.utc)
+        raw = _nwps([(now - timedelta(minutes=75), 14.5, 1.60),
+                     (now - timedelta(minutes=60), 14.6, 1.60),
+                     (now - timedelta(minutes=10), 14.7, 1.77)])
+        r = normalize_nwps_observed(raw, "NACW1", now)
+        assert r["cfs"] == 1770.0 and r["gauge_height_ft"] == 14.7
+        assert r["trend"] == "rising"
+        assert r["provider"] == "noaa_nwps_observed" and r["nwps_gauge_id"] == "NACW1"
+
+    def test_negative_missing_markers_skipped(self):
+        from conditions.normalizer import normalize_nwps_observed
+        now = datetime.now(tz=timezone.utc)
+        raw = _nwps([(now - timedelta(minutes=30), 0.24, 0.495), (now - timedelta(minutes=15), -999, -999)])
+        assert normalize_nwps_observed(raw, "ARLW1", now)["cfs"] == 495.0
+
+    def test_stale_or_empty_returns_none(self):
+        from conditions.normalizer import normalize_nwps_observed
+        now = datetime.now(tz=timezone.utc)
+        assert normalize_nwps_observed(_nwps([(now - timedelta(days=3), 1, 1)]), "X", now) is None
+        assert normalize_nwps_observed({}, "X", now) is None
+
+
+class TestUsgsNwpsFallback:
+    async def test_dead_usgs_gauge_falls_back_to_nwps(self):
+        from unittest.mock import AsyncMock, patch
+        import conditions.usgs as usgs
+        nwps = {"cfs": 1770.0, "temp_f": None, "provider": "noaa_nwps_observed"}
+        with patch.object(usgs, "_fetch_usgs_reading", AsyncMock(return_value=None)), \
+             patch.object(usgs, "fetch_nwps_observed", AsyncMock(return_value=nwps)) as nw:
+            r = await usgs.fetch_usgs_gauge("12494000")  # Naches → NACW1
+        nw.assert_awaited_once_with("NACW1")
+        assert r["cfs"] == 1770.0
+
+    async def test_live_usgs_never_calls_nwps(self):
+        from unittest.mock import AsyncMock, patch
+        import conditions.usgs as usgs
+        with patch.object(usgs, "_fetch_usgs_reading", AsyncMock(return_value={"cfs": 500.0})), \
+             patch.object(usgs, "fetch_nwps_observed", AsyncMock()) as nw:
+            assert (await usgs.fetch_usgs_gauge("12494000"))["cfs"] == 500.0
+        nw.assert_not_awaited()
+
+    async def test_stage_only_usgs_keeps_temp_on_fallback(self):
+        from unittest.mock import AsyncMock, patch
+        import conditions.usgs as usgs
+        with patch.object(usgs, "_fetch_usgs_reading", AsyncMock(return_value={"cfs": None, "temp_f": 52.0})), \
+             patch.object(usgs, "fetch_nwps_observed", AsyncMock(return_value={"cfs": 495.0, "temp_f": None})):
+            r = await usgs.fetch_usgs_gauge("12167400")  # Stillaguamish → ARLW1
+        assert r["cfs"] == 495.0 and r["temp_f"] == 52.0
+
+    async def test_no_lid_returns_usgs_result(self):
+        from unittest.mock import AsyncMock, patch
+        import conditions.usgs as usgs
+        with patch.object(usgs, "_fetch_usgs_reading", AsyncMock(return_value=None)), \
+             patch.object(usgs, "fetch_nwps_observed", AsyncMock()) as nw:
+            assert await usgs.fetch_usgs_gauge("00000000") is None
+        nw.assert_not_awaited()

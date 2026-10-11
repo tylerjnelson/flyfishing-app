@@ -128,7 +128,8 @@ class TestLogFetchFailure:
 
 _FETCHERS = [
     # (module, inner fn to break, public fn, args, source)
-    ("conditions.usgs", "_fetch", "fetch_usgs_gauge", ("12505000",), "usgs"),
+    # site with no NWPS mapping, so the NWPS fallback (and its network call) never triggers
+    ("conditions.usgs", "_fetch", "fetch_usgs_gauge", ("00000000",), "usgs"),
     ("conditions.airnow", "_fetch", "fetch_airnow", (46.6, -120.5), "airnow"),
     ("conditions.noaa_nws", "_fetch", "fetch_noaa_nws", (46.6, -120.5), "noaa_nws"),
     ("conditions.noaa_nwrfc", "_fetch_stageflow", "fetch_noaa_nwrfc", ("PARW1",), "noaa_nwrfc"),

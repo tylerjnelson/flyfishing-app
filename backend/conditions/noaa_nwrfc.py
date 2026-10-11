@@ -17,7 +17,7 @@ import pybreaker
 
 from conditions.circuit_breaker import noaa_nwrfc_breaker
 from conditions.fetch_errors import log_fetch_failure
-from conditions.normalizer import normalize_noaa_nwrfc
+from conditions.normalizer import normalize_noaa_nwrfc, normalize_nwps_observed
 
 log = logging.getLogger(__name__)
 
@@ -77,6 +77,26 @@ async def fetch_noaa_nwrfc(gauge_id: str) -> dict | None:
         return None
     except Exception as exc:
         log_fetch_failure("noaa_nwrfc", exc, gauge_id=gauge_id)
+        return None
+
+
+async def fetch_nwps_observed(gauge_id: str) -> dict | None:
+    """
+    Latest observed flow at an NWPS gauge, in the USGS reading shape (see
+    normalize_nwps_observed). Used by fetch_usgs_gauge as a fallback when the
+    USGS gauge itself has stopped reporting. None on failure or no recent data.
+    """
+    try:
+        raw = await _fetch_stageflow(gauge_id)
+        result = normalize_nwps_observed(raw, gauge_id=gauge_id, fetched_at=datetime.now(tz=timezone.utc))
+        if result is None:
+            log.warning("nwps_observed_empty", extra={"source": "noaa_nwps", "gauge_id": gauge_id})
+        return result
+    except pybreaker.CircuitBreakerError:
+        log.warning("circuit_open", extra={"source": "noaa_nwps", "gauge_id": gauge_id})
+        return None
+    except Exception as exc:
+        log_fetch_failure("noaa_nwps", exc, gauge_id=gauge_id)
         return None
 
 

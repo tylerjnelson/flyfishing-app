@@ -144,18 +144,7 @@ def normalize_usgs(raw: dict, fetched_at: datetime) -> dict:
     # Compute flow trend by comparing latest reading to ~1hr prior (4 steps back at 15-min intervals)
     trend = None
     if cfs is not None and len(cfs_records) >= 5:
-        try:
-            prior_cfs = float(cfs_records[-5]["value"])
-            if prior_cfs > 0:
-                pct_change = (cfs - prior_cfs) / prior_cfs
-                if pct_change >= 0.05:
-                    trend = "rising"
-                elif pct_change <= -0.05:
-                    trend = "dropping"
-                else:
-                    trend = "stable"
-        except (ValueError, KeyError, ZeroDivisionError):
-            trend = None
+        trend = _flow_trend(cfs, cfs_records[-5]["value"])
 
     return {
         "source": "usgs",
@@ -222,6 +211,65 @@ def normalize_airnow(raw: list, fetched_at: datetime) -> dict:
         "aqi": aqi,
         "category": category,
         "pollutant": pollutant,
+        "stale": False,
+    }
+
+
+def _flow_trend(cfs: float, prior_cfs) -> str | None:
+    """rising / dropping (>=5% change vs ~1h prior) or stable; None if unknown."""
+    try:
+        prior = float(prior_cfs)
+    except (TypeError, ValueError):
+        return None
+    if prior <= 0:
+        return None
+    pct_change = (cfs - prior) / prior
+    if pct_change >= 0.05:
+        return "rising"
+    if pct_change <= -0.05:
+        return "dropping"
+    return "stable"
+
+
+def normalize_nwps_observed(raw: dict, gauge_id: str, fetched_at: datetime) -> dict | None:
+    """
+    USGS-shaped flow reading from a NOAA NWPS stageflow *observed* series.
+
+    Fallback for rivers whose USGS gauge is discontinued but whose NWPS gauge
+    still reports (Naches NACW1, Stillaguamish ARLW1, Yakima PARW1, as of
+    2026-10). primary = stage (ft), secondary = flow (kcfs). Negative values
+    are NWPS's missing-data markers (ARLW1 had 535 of them). Returns None
+    when there's no usable reading within USGS_MAX_READING_AGE.
+    """
+    points = []
+    for p in (raw.get("observed") or {}).get("data") or []:
+        try:
+            flow_kcfs = float(p["secondary"])
+            observed = datetime.fromisoformat(p["validTime"].replace("Z", "+00:00"))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if flow_kcfs < 0:
+            continue
+        stage = p.get("primary")
+        points.append((observed, flow_kcfs * 1000, stage if isinstance(stage, (int, float)) and stage >= 0 else None))
+    if not points:
+        return None
+    points.sort(key=lambda x: x[0])
+    observed, cfs, stage = points[-1]
+    if fetched_at - observed > USGS_MAX_READING_AGE:
+        return None
+    hour_ago = [p for p in points if p[0] <= observed - timedelta(minutes=45)]
+    return {
+        "source": "usgs",  # same slot/shape consumers read; provider says where it came from
+        "provider": "noaa_nwps_observed",
+        "nwps_gauge_id": gauge_id,
+        "fetched_at": fetched_at.isoformat(),
+        "observed_at": observed.isoformat(),
+        "cfs": round(cfs, 1),
+        "gauge_height_ft": stage,
+        "temp_f": None,
+        "turbidity_fnu": None,
+        "trend": _flow_trend(cfs, hour_ago[-1][1]) if hour_ago else None,
         "stale": False,
     }
 

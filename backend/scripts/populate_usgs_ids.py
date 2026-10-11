@@ -44,7 +44,9 @@ _RIVER_USGS_IDS: dict[str, list[str]] = {
     # Tier B = USGS real-time only; no NWRFC forecast coverage
 
     # --- Yakima drainage (Kittitas / Yakima) ---
-    "yakima":        ["12505000"],   # Tier A  — PARW1, near Parker
+    # 12505000 (Parker) stopped reporting to USGS, and it's below the Sunnyside
+    # diversion (392 vs 1,490 cfs at Union Gap on 2026-10-11). Union Gap is at the spot.
+    "yakima":        ["12500450"],   # Yakima above Ahtanum Cr at Union Gap (live)
 
     # --- Snoqualmie (King) ---
     "snoqualmie":    ["12149000"],   # Tier A  — CRNW1, near Carnation
@@ -65,6 +67,9 @@ _RIVER_USGS_IDS: dict[str, list[str]] = {
 
     # --- Wenatchee / Icicle drainage (Chelan) ---
     "wenatchee":     ["12462500"],   # Tier A  — MONW1, at Monitor
+    # The Wenatchee-at-Monitor gauge is 50 km downstream on the mainstem; USGS
+    # has no Little Wenatchee gauge. Explicitly none (2026-10-11 audit).
+    "little wenatchee": [],
 
     # --- Methow drainage (Okanogan) ---
     "methow":        ["12449950"],   # Tier A  — PATW1, near Pateros
@@ -73,12 +78,19 @@ _RIVER_USGS_IDS: dict[str, list[str]] = {
     # NWPS LID ARLW1 tracks USGS 12167400 (at Arlington).
     # Using 12167400 so NWRFC forecast coverage works for both main stem
     # and North Fork Stillaguamish spots (NF joins above Arlington).
+    # 12167400 no longer reports to USGS (2026-10); kept for the NWRFC forecast and
+    # the NWPS observed fallback (ARLW1). The NF has its own live gauge.
     "stillaguamish": ["12167400"],   # Tier A* — ARLW1, at Arlington
+    "north fork stillaguamish": ["12167000"],   # NF Stillaguamish nr Arlington (live)
 
     # --- Sol Duc (Clallam) ---
-    # No NWPS LID — NOAA does not forecast the Sol Duc. USGS real-time only.
-    "sol duc":       ["12044900"],   # Tier B  — near Forks, WA
-    "solduc":        ["12044900"],   # Tier B  — same gauge, alt name match
+    # 12044900 was the ELWHA above Lake Mills (discontinued 2011). USGS has no
+    # active Sol Duc ("Soleduck") gauge: explicitly none (2026-10-11 audit).
+    "sol duc":       [],
+    "solduc":        [],
+
+    # --- Elwha (Clallam) ---
+    "elwha":         ["12045500"],   # Elwha River at McDonald Bridge (live)
 
     # --- Green River (King) ---
     # Fragment "green river" (two words) avoids matching unrelated "green" spots.
@@ -97,12 +109,13 @@ _RIVER_USGS_IDS: dict[str, list[str]] = {
     "nisqually":     ["12082500"],   # Tier A* — NISW1, near National
 
     # --- Kalama (Cowlitz) ---
-    # No NWPS LID for Kalama River (KLMW1 is the Columbia at Kalama — different).
-    # USGS real-time only.
-    "kalama":        ["14221500"],   # Tier B  — near Kalama, WA
+    # 14221500 is CEDAR CREEK near Ariel, not the Kalama. USGS has no active
+    # Kalama gauge: explicitly none (2026-10-11 audit).
+    "kalama":        [],
 
     # --- Naches (Yakima) ---
-    # NWPS LID NACW1 tracks USGS 12494000 (near Naches).
+    # NWPS LID NACW1 tracks USGS 12494000 (near Naches). The USGS gauge stopped
+    # reporting; flow now comes from the NWPS observed fallback (NACW1).
     "naches":        ["12494000"],   # Tier A* — NACW1, near Naches
 
     # --- Klickitat (Klickitat) ---
@@ -160,6 +173,17 @@ async def main(dry_run: bool) -> None:
                     matched_usgs = _RIVER_USGS_IDS[fragment]
                     matched_key = fragment
                     break
+
+            if matched_key is not None and not matched_usgs:
+                # Explicit "no gauge": clear a previously wrong mapping.
+                if spot.usgs_site_ids:
+                    log.info(f"  {'[DRY] ' if dry_run else ''}usgs_site_ids cleared for '{spot.name}' "
+                             f"(fragment: '{matched_key}' has no valid gauge)")
+                    if not dry_run:
+                        spot.usgs_site_ids = []
+                        spot.has_realtime_conditions = False
+                    usgs_updated += 1
+                continue
 
             if matched_usgs:
                 if spot.usgs_site_ids != matched_usgs:

@@ -13,6 +13,7 @@ import pybreaker
 
 from conditions.circuit_breaker import usgs_breaker
 from conditions.fetch_errors import log_fetch_failure
+from conditions.noaa_nwrfc import fetch_nwps_observed, resolve_gauge_id
 from conditions.normalizer import normalize_usgs
 
 log = logging.getLogger(__name__)
@@ -26,17 +27,38 @@ _TIMEOUT = httpx.Timeout(connect=5.0, read=15.0, write=5.0, pool=5.0)
 
 async def fetch_usgs_gauge(site_id: str) -> dict | None:
     """
-    Fetch instantaneous values for one USGS gauge site.
+    Fetch the current flow reading for one USGS gauge site.
 
-    Returns normalised data dict, or None on any fetch failure (logged as
-    fetch_failed; caller falls back to the last conditions_cache entry).
+    If USGS has no usable discharge (discontinued gauge, outage) and the site
+    has an NWPS gauge (noaa_nwrfc._USGS_TO_NWRFC_LID), fall back to NWPS
+    observed flow. The result has the same shape, with provider=
+    "noaa_nwps_observed". Returns None when neither source has data (logged).
     """
+    result = await _fetch_usgs_reading(site_id)
+    if result is not None and result["cfs"] is not None:
+        return result
+
+    lid = resolve_gauge_id(site_id)
+    if lid:
+        fallback = await fetch_nwps_observed(lid)
+        if fallback is not None:
+            if result is not None and result.get("temp_f") is not None:
+                fallback["temp_f"] = result["temp_f"]  # keep USGS temp if only Q was missing
+            log.info("usgs_fallback_nwps", extra={"source": "usgs", "site_id": site_id, "nwps_gauge_id": lid})
+            return fallback
+    return result
+
+
+async def _fetch_usgs_reading(site_id: str) -> dict | None:
+    """USGS only. None on failure or when neither discharge nor stage is usable."""
     try:
         raw = await _fetch(site_id)
         result = normalize_usgs(raw, fetched_at=datetime.now(tz=timezone.utc))
         dropped = result.pop("dropped", {})
         if result["cfs"] is None and result["gauge_height_ft"] is None:
-            log.warning("usgs_empty_response", extra={"source": "usgs", "site_id": site_id, "dropped": dropped})
+            # Expected (INFO) for discontinued gauges that have an NWPS fallback.
+            level = logging.INFO if resolve_gauge_id(site_id) else logging.WARNING
+            log.log(level, "usgs_empty_response", extra={"source": "usgs", "site_id": site_id, "dropped": dropped})
             return None
         if dropped:
             log.info("usgs_values_dropped", extra={"source": "usgs", "site_id": site_id, "dropped": dropped})
