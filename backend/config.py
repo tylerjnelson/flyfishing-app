@@ -46,6 +46,9 @@ class Settings:
         # NPS Developer API key — free at https://www.nps.gov/subjects/developer/get-started.htm
         # Falls back to DEMO_KEY (50 req/hr) if not set; real key allows 1000 req/hr.
         self.nps_api_key = os.environ.get("NPS_API_KEY", "DEMO_KEY")
+        # USGS Water Data API key — optional, free at https://api.waterdata.usgs.gov/signup/
+        # Raises the per-IP rate limit; requests work without it.
+        self.usgs_api_key = os.environ.get("USGS_API_KEY", "")
 
 
 settings = Settings()

@@ -77,82 +77,93 @@ def compute_conditions_hash(
 # Readings older than this are treated as missing. A discontinued gauge keeps
 # returning its last value forever (Elwha 12044900's latest is from 2011).
 USGS_MAX_READING_AGE = timedelta(hours=24)
-_USGS_NO_DATA = -999999.0  # documented default; series also carry noDataValue
+_USGS_NO_DATA = -999999.0  # legacy WaterServices sentinel; the OGC API sends null
+_USGS_INSTANTANEOUS = "00011"  # statistic_id for continuous (instantaneous) values
+_USGS_PARAMS = ("00060", "00065", "00010")
 
 
-def _usgs_valid_records(ts: dict) -> list[dict]:
-    """Records with a numeric value that isn't the series' no-data sentinel."""
-    no_data = ts.get("variable", {}).get("noDataValue", _USGS_NO_DATA)
-    valid = []
-    for rec in ts.get("values", [{}])[0].get("value", []):
+def _usgs_series(raw: dict) -> dict[str, list[tuple[datetime, float | None]]]:
+    """
+    Group OGC `continuous` features by parameter code, oldest→newest.
+    Value is None for a null/sentinel/unparseable reading. The API does not
+    guarantee result order, so this sorts by time.
+    """
+    series: dict[str, list[tuple[datetime, float | None]]] = {}
+    for feature in raw.get("features") or []:
+        props = feature.get("properties") or {}
+        code = props.get("parameter_code")
+        if code not in _USGS_PARAMS or props.get("statistic_id", _USGS_INSTANTANEOUS) != _USGS_INSTANTANEOUS:
+            continue
         try:
-            value = float(rec["value"])
-        except (TypeError, ValueError, KeyError):
+            observed = datetime.fromisoformat(props["time"])
+        except (KeyError, TypeError, ValueError):
             continue
-        if value in (no_data, _USGS_NO_DATA):
-            continue
-        valid.append({**rec, "value": value})
-    return valid
-
-
-def _usgs_reading_time(rec: dict) -> datetime | None:
-    try:
-        dt = datetime.fromisoformat(rec["dateTime"])
-    except (KeyError, TypeError, ValueError):
-        return None
-    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        if observed.tzinfo is None:
+            observed = observed.replace(tzinfo=timezone.utc)
+        try:
+            value = float(props.get("value"))
+        except (TypeError, ValueError):
+            value = None
+        if value == _USGS_NO_DATA:
+            value = None
+        series.setdefault(code, []).append((observed, value))
+    for points in series.values():
+        points.sort(key=lambda p: p[0])
+    return series
 
 
 def normalize_usgs(raw: dict, fetched_at: datetime) -> dict:
     """
-    Normalizes a single USGS instantaneous-values API response for one gauge.
+    Normalizes a USGS Water Data API (OGC) `continuous` items response for one
+    gauge (GeoJSON FeatureCollection, one feature per reading).
 
-    Expected raw keys (parameterCd):
+    Parameter codes:
       00060 — discharge (CFS)
       00065 — gauge height (ft)
       00010 — water temperature (°C)
 
     A parameter is reported as None, and listed in `dropped` with the reason,
-    when its only values are the no-data sentinel or its latest reading is
-    older than USGS_MAX_READING_AGE. The caller pops `dropped` for logging.
+    when its only values are null (no data) or its latest reading is older
+    than USGS_MAX_READING_AGE. The caller pops `dropped` for logging.
     """
-    values = raw.get("value", {}).get("timeSeries", [])
-    by_param: dict[str, float | None] = {}
+    by_param: dict[str, float] = {}
     dropped: dict[str, str] = {}
-    cfs_records: list = []
-    for ts in values:
-        code = ts.get("variable", {}).get("variableCode", [{}])[0].get("value")
-        if not ts.get("values", [{}])[0].get("value"):
-            continue
-        records = _usgs_valid_records(ts)
-        if not records:
+    cfs_points: list[tuple[datetime, float]] = []
+    observed_at = None
+    for code, points in _usgs_series(raw).items():
+        valid = [(t, v) for t, v in points if v is not None]
+        if not valid:
             dropped[code] = "no_data_sentinel"
             continue
-        observed = _usgs_reading_time(records[-1])
-        if observed is None or fetched_at - observed > USGS_MAX_READING_AGE:
-            dropped[code] = f"stale:{records[-1].get('dateTime')}"
+        observed, value = valid[-1]
+        if fetched_at - observed > USGS_MAX_READING_AGE:
+            dropped[code] = f"stale:{observed.isoformat()}"
             continue
-        by_param[code] = records[-1]["value"]
+        by_param[code] = value
         if code == "00060":
-            cfs_records = records
+            cfs_points, observed_at = valid, observed
 
     cfs = by_param.get("00060")
-    gauge_height_ft = by_param.get("00065")
     temp_c = by_param.get("00010")
     temp_f = round(temp_c * 9 / 5 + 32, 1) if temp_c is not None else None
 
-    # Compute flow trend by comparing latest reading to ~1hr prior (4 steps back at 15-min intervals)
+    # Trend: latest vs the newest reading at least 45 min older (~1h back).
+    # By time, not record count: USGS posts in hourly batches about an hour
+    # late, so a fixed-length window often holds only 4 readings.
     trend = None
-    if cfs is not None and len(cfs_records) >= 5:
-        trend = _flow_trend(cfs, cfs_records[-5]["value"])
+    if cfs is not None:
+        hour_ago = [v for t, v in cfs_points if t <= observed_at - timedelta(minutes=45)]
+        if hour_ago:
+            trend = _flow_trend(cfs, hour_ago[-1])
 
     return {
         "source": "usgs",
         "fetched_at": fetched_at.isoformat(),
+        "observed_at": observed_at.isoformat() if observed_at else None,
         "cfs": cfs,
-        "gauge_height_ft": gauge_height_ft,
+        "gauge_height_ft": by_param.get("00065"),
         "temp_f": temp_f,
-        "turbidity_fnu": None,  # USGS turbidity requires separate parameterCd 63680
+        "turbidity_fnu": None,  # USGS turbidity is parameter 63680, not requested
         "trend": trend,
         "stale": False,
         "dropped": dropped,

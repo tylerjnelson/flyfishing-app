@@ -7,7 +7,8 @@ Sets has_realtime_conditions=True on every spot that receives a USGS gauge ID.
 USGS site IDs sourced from two tiers:
   Tier A — validated against NOAA NWPS API 2026-04-10 (see noaa_nwrfc.py).
   Tier B — well-known USGS gauge IDs from USGS Water Resources; spot-checked
-            against https://waterservices.usgs.gov/nwis/iv/?sites={id}&format=json.
+            against https://api.waterdata.usgs.gov/ogcapi/v1/collections/latest-continuous/items?monitoring_location_id=USGS-{id}
+            (legacy waterservices.usgs.gov until 2026-10-11).
 
 Name matching is case-insensitive substring — e.g. "skagit" matches both
 "SKAGIT R  03.0176" (WDFW stocking name) and any future curated "Skagit River" entry.

@@ -106,46 +106,78 @@ class TestComputeConditionsHash:
 
 class TestNormalizeUsgs:
     @staticmethod
-    def _ts(code, values, age=timedelta(minutes=30), step=timedelta(minutes=15)):
-        """One USGS series; `values` oldest→newest, the newest `age` old."""
+    def _ts(code, values, age=timedelta(minutes=30), step=timedelta(minutes=15), stat="00011"):
+        """OGC `continuous` features for one parameter; `values` oldest→newest, newest `age` old."""
         newest = datetime.now(tz=timezone.utc) - age
         n = len(values)
-        return {
-            "variable": {"variableCode": [{"value": code}], "noDataValue": -999999.0},
-            "values": [{"value": [
-                {"value": str(v), "dateTime": (newest - step * (n - 1 - i)).isoformat()}
-                for i, v in enumerate(values)
-            ]}],
-        }
+        return [
+            {"type": "Feature", "properties": {
+                "monitoring_location_id": "USGS-12134500", "parameter_code": code,
+                "statistic_id": stat, "time": (newest - step * (n - 1 - i)).isoformat(),
+                "value": None if v is None else str(v),
+            }}
+            for i, v in enumerate(values)
+        ]
+
+    @staticmethod
+    def _raw(*series):
+        return {"type": "FeatureCollection", "features": [f for s in series for f in s]}
 
     def _make_raw(self, cfs=450.0, gauge_ht=3.5, temp_c=10.0):
         ts = self._ts
-        return {"value": {"timeSeries": [ts("00060", [cfs]), ts("00065", [gauge_ht]), ts("00010", [temp_c])]}}
+        return self._raw(ts("00060", [cfs]), ts("00065", [gauge_ht]), ts("00010", [temp_c]))
 
-    def test_no_data_sentinel_dropped(self):
-        """Klickitat 14113000 reports water temp as -999999 (TODO-11)."""
-        raw = {"value": {"timeSeries": [self._ts("00060", [610]), self._ts("00010", [-999999])]}}
+    def test_null_value_dropped(self):
+        """Klickitat 14113000 reports water temp as null (-999999 on the legacy API)."""
+        raw = self._raw(self._ts("00060", [610]), self._ts("00010", [None]))
         result = normalize_usgs(raw, datetime.now(tz=timezone.utc))
         assert result["cfs"] == 610.0
         assert result["temp_f"] is None
         assert result["dropped"] == {"00010": "no_data_sentinel"}
 
+    def test_legacy_sentinel_still_dropped(self):
+        raw = self._raw(self._ts("00010", [-999999]))
+        assert normalize_usgs(raw, datetime.now(tz=timezone.utc))["dropped"] == {"00010": "no_data_sentinel"}
+
     def test_stale_reading_dropped(self):
-        """Elwha 12044900's latest discharge is from 2011 (TODO-11)."""
-        raw = {"value": {"timeSeries": [self._ts("00060", [725], age=timedelta(days=5000))]}}
+        """Yakima 12500450's latest water temp is from 2023 (still served by both APIs)."""
+        raw = self._raw(self._ts("00060", [725], age=timedelta(days=5000)))
         result = normalize_usgs(raw, datetime.now(tz=timezone.utc))
         assert result["cfs"] is None
         assert result["dropped"]["00060"].startswith("stale:")
 
     def test_reading_just_inside_window_kept(self):
-        raw = {"value": {"timeSeries": [self._ts("00060", [300], age=timedelta(hours=23))]}}
+        raw = self._raw(self._ts("00060", [300], age=timedelta(hours=23)))
         assert normalize_usgs(raw, datetime.now(tz=timezone.utc))["cfs"] == 300.0
 
-    def test_trend_ignores_sentinel_values(self):
-        raw = {"value": {"timeSeries": [self._ts("00060", [100, -999999, 100, 100, 100, 120])]}}
+    def test_trend_ignores_null_values(self):
+        raw = self._raw(self._ts("00060", [100, None, 100, 100, 100, 120]))
         result = normalize_usgs(raw, datetime.now(tz=timezone.utc))
         assert result["cfs"] == 120.0
         assert result["trend"] == "rising"
+
+    def test_trend_from_four_readings(self):
+        """USGS posts ~1h late in hourly batches; a 2h window held only 4 readings,
+        which the old count-based trend (needed 5) always reported as None."""
+        raw = self._raw(self._ts("00060", [100, 100, 100, 90]))
+        assert normalize_usgs(raw, datetime.now(tz=timezone.utc))["trend"] == "dropping"
+
+    def test_no_trend_without_reading_an_hour_back(self):
+        raw = self._raw(self._ts("00060", [100, 120]))
+        assert normalize_usgs(raw, datetime.now(tz=timezone.utc))["trend"] is None
+
+    def test_unordered_features_sorted_by_time(self):
+        """The API doesn't guarantee result order."""
+        feats = self._ts("00060", [100, 100, 100, 100, 130])
+        raw = self._raw(list(reversed(feats)))
+        result = normalize_usgs(raw, datetime.now(tz=timezone.utc))
+        assert result["cfs"] == 130.0
+        assert result["trend"] == "rising"
+        assert result["observed_at"] == feats[-1]["properties"]["time"]
+
+    def test_non_instantaneous_statistic_ignored(self):
+        raw = self._raw(self._ts("00060", [999], stat="00003"), self._ts("00060", [450]))
+        assert normalize_usgs(raw, datetime.now(tz=timezone.utc))["cfs"] == 450.0
 
     def test_cfs_extracted(self):
         result = normalize_usgs(self._make_raw(cfs=450.0), datetime.now(tz=timezone.utc))
@@ -164,7 +196,7 @@ class TestNormalizeUsgs:
         assert result["stale"] is False
 
     def test_missing_param_returns_none(self):
-        raw = {"value": {"timeSeries": []}}
+        raw = {"type": "FeatureCollection", "features": []}
         result = normalize_usgs(raw, datetime.now(tz=timezone.utc))
         assert result["cfs"] is None
         assert result["temp_f"] is None
@@ -267,30 +299,47 @@ class TestNormalizeWdfwStocking:
         assert normalize_wdfw_stocking([], datetime.now(tz=timezone.utc)) == []
 
 
-def test_usgs_base_url_host():
-    """Was api.waterservices.usgs.gov (nonexistent) until 2026-10-11 (TODO-11)."""
+def test_usgs_uses_water_data_api():
+    """Legacy waterservices.usgs.gov is being decommissioned (early 2027)."""
     from urllib.parse import urlparse
     from conditions.usgs import _BASE_URL
-    assert urlparse(_BASE_URL).hostname == "waterservices.usgs.gov"
+    url = urlparse(_BASE_URL)
+    assert url.hostname == "api.waterdata.usgs.gov"
+    assert url.path == "/ogcapi/v1/collections/continuous/items"
 
 
-async def test_usgs_request_includes_period_for_trend(monkeypatch):
-    """Without `period` USGS returns only the latest value, so trend is always None."""
+async def _capture_usgs_request(monkeypatch, api_key=""):
     import httpx
     import conditions.usgs as usgs
 
     seen = {}
 
     def handler(request):
-        seen.update(request.url.params)
-        return httpx.Response(200, json={"value": {"timeSeries": []}})
+        seen["params"] = dict(request.url.params)
+        seen["headers"] = request.headers
+        return httpx.Response(200, json={"type": "FeatureCollection", "features": []})
 
     real = httpx.AsyncClient
     monkeypatch.setattr(usgs.httpx, "AsyncClient",
                         lambda *a, **k: real(*a, transport=httpx.MockTransport(handler), **k))
+    monkeypatch.setattr(usgs.settings, "usgs_api_key", api_key)
     await usgs._fetch("12134500")
-    assert seen["period"] == "PT2H"
-    assert seen["sites"] == "12134500"
+    return seen
+
+
+async def test_usgs_request_params(monkeypatch):
+    seen = await _capture_usgs_request(monkeypatch)
+    assert seen["params"]["monitoring_location_id"] == "USGS-12134500"
+    assert seen["params"]["parameter_code"] == "00060,00065,00010"
+    assert seen["params"]["time"] == "PT3H"  # room for a reading ~1h before the latest
+    assert int(seen["params"]["limit"]) >= 36
+    assert "x-api-key" not in seen["headers"]
+
+
+async def test_usgs_api_key_sent_as_header_not_query(monkeypatch):
+    seen = await _capture_usgs_request(monkeypatch, api_key="k123")
+    assert seen["headers"]["x-api-key"] == "k123"
+    assert "api_key" not in seen["params"]
 
 
 # ---------------------------------------------------------------------------

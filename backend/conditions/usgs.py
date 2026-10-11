@@ -1,8 +1,9 @@
 """
-USGS Water Services fetcher — real-time, triggered at session open.
+USGS Water Data API fetcher — real-time, triggered at session open.
 
 Fetches CFS (discharge), gauge height, and water temperature for a single
-USGS gauge site.  Wrapped with the usgs_breaker circuit breaker.
+USGS gauge site from the OGC `continuous` collection. Wrapped with the
+usgs_breaker circuit breaker.
 """
 
 import logging
@@ -11,6 +12,8 @@ from datetime import datetime, timezone
 import httpx
 import pybreaker
 
+from config import settings
+
 from conditions.circuit_breaker import usgs_breaker
 from conditions.fetch_errors import log_fetch_failure
 from conditions.noaa_nwrfc import fetch_nwps_observed, resolve_gauge_id
@@ -18,9 +21,10 @@ from conditions.normalizer import normalize_usgs
 
 log = logging.getLogger(__name__)
 
-# Was "api.waterservices.usgs.gov" — a host that doesn't exist — from the first
-# commit until 2026-10-11, so this fetcher had never returned data.
-_BASE_URL = "https://waterservices.usgs.gov/nwis/iv/"
+# Legacy WaterServices (waterservices.usgs.gov/nwis/iv/) is being decommissioned
+# (early 2027), so this uses its replacement. Identical values for all 18 gauges
+# we use (checked 2026-10-11). See https://api.waterdata.usgs.gov/docs/ogcapi/
+_BASE_URL = "https://api.waterdata.usgs.gov/ogcapi/v1/collections/continuous/items"
 _PARAMS = "00060,00065,00010"  # discharge (CFS), gauge height, water temp
 _TIMEOUT = httpx.Timeout(connect=5.0, read=15.0, write=5.0, pool=5.0)
 
@@ -74,14 +78,18 @@ async def _fetch_usgs_reading(site_id: str) -> dict | None:
 @usgs_breaker
 async def _fetch(site_id: str) -> dict:
     params = {
-        "sites": site_id,
-        "format": "json",
-        "parameterCd": _PARAMS,
-        # Without a period the service returns only the latest value, and the
-        # normalizer's trend (latest vs ~1h prior) needs >=5 readings.
-        "period": "PT2H",
+        "monitoring_location_id": f"USGS-{site_id}",
+        "parameter_code": _PARAMS,
+        # Readings post in hourly batches about an hour late, so 3h keeps a
+        # reading ~1h before the latest for the normalizer's trend.
+        "time": "PT3H",
+        "limit": 500,  # 3 params x 12 readings; the default page is smaller
+        "f": "json",
     }
+    # Optional: without a key, requests share a lower per-IP rate limit. A
+    # header (not the api_key query param) keeps the key out of logged URLs.
+    headers = {"X-Api-Key": settings.usgs_api_key} if settings.usgs_api_key else {}
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-        resp = await client.get(_BASE_URL, params=params)
+        resp = await client.get(_BASE_URL, params=params, headers=headers)
         resp.raise_for_status()
         return resp.json()
