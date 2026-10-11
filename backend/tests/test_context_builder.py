@@ -3,7 +3,7 @@ Context builder unit tests — Phase 5 Chunk 5.
 
 Tests cover the pure helper functions extracted from build_context():
   - _has_active_closure     → emergency closure filter
-  - _cfs_out_of_range       → CFS hard filter (only hard conditions filter)
+  - _cfs_range_status       → out-of-range flow (soft penalty since 2026-10-11)
   - _apply_variety_rotation → 60-day fresh-spot rule
   - _wildfire_near_spot     → 25 km proximity gate (used as soft penalty)
 
@@ -25,7 +25,8 @@ import pytest
 
 from chat.context_builder import (
     _apply_variety_rotation,
-    _cfs_out_of_range,
+    _cfs_range_status,
+    _compute_volatile_delta,
     _filter_excluded,
     _has_active_closure,
     _wildfire_near_spot,
@@ -146,53 +147,54 @@ class TestHasActiveClosure:
 
 
 # ---------------------------------------------------------------------------
-# _cfs_out_of_range
+# _cfs_range_status + out-of-range flow as a soft penalty (2026-10-11)
 # ---------------------------------------------------------------------------
 
-class TestCfsOutOfRange:
-    """
-    _cfs_out_of_range returns True when CFS is outside min/max (hard filter).
-    Temperature, turbidity, and other signals are now soft penalties.
-    """
+class TestCfsRangeStatus:
+    def test_within_range(self):
+        assert _cfs_range_status(make_spot(type="river", min_cfs=50, max_cfs=500), 200) is None
 
-    def test_river_within_cfs_range_not_blocked(self):
-        spot = make_spot(type="river", min_cfs=50, max_cfs=500)
-        assert _cfs_out_of_range(spot, {"cfs": 200}) is False
-
-    def test_river_below_min_cfs_blocked(self):
+    def test_low_and_high(self):
         spot = make_spot(type="river", min_cfs=100, max_cfs=500)
-        assert _cfs_out_of_range(spot, {"cfs": 40}) is True
+        assert _cfs_range_status(spot, 40) == "low"
+        assert _cfs_range_status(spot, 600) == "high"
 
-    def test_river_above_max_cfs_blocked(self):
-        spot = make_spot(type="river", min_cfs=50, max_cfs=300)
-        assert _cfs_out_of_range(spot, {"cfs": 600}) is True
+    def test_one_sided_thresholds(self):
+        assert _cfs_range_status(make_spot(type="river", min_cfs=80, max_cfs=None), 65) == "low"
+        assert _cfs_range_status(make_spot(type="river", min_cfs=None, max_cfs=300), 400) == "high"
 
-    def test_high_temp_not_a_hard_filter(self):
-        # Temp above species ceiling is now a soft penalty, not a hard filter
-        spot = make_spot(type="river", min_cfs=None, max_cfs=None, min_temp_f=None)
-        assert _cfs_out_of_range(spot, {"temp_f": 65.0}) is False
+    def test_lake_and_missing_cfs_never_flagged(self):
+        assert _cfs_range_status(make_spot(type="lake", min_cfs=100, max_cfs=500), 0) is None
+        assert _cfs_range_status(make_spot(type="river", min_cfs=100, max_cfs=500), None) is None
 
-    def test_high_turbidity_not_a_hard_filter(self):
-        # Turbidity is now a soft penalty
-        spot = make_spot(type="river", min_cfs=None, max_cfs=None, min_temp_f=None)
-        assert _cfs_out_of_range(spot, {"turbidity_fnu": 150.0}) is False
 
-    def test_lake_never_cfs_blocked(self):
-        spot = make_spot(type="lake")
-        assert _cfs_out_of_range(spot, {"cfs": 0}) is False
+class TestOutOfRangeFlowIsSoft:
+    """Pilchuck at 65 cfs (min 80) used to be dropped from recommendations."""
 
-    def test_no_realtime_data_not_blocked(self):
-        spot = make_spot(type="river")
-        assert _cfs_out_of_range(spot, None) is False
+    def _delta(self, spot, cfs):
+        return _compute_volatile_delta(spot, {"cfs": cfs}, None, None, [])
 
-    def test_has_realtime_false_not_blocked(self):
-        spot = make_spot(type="river", has_realtime_conditions=False)
-        assert _cfs_out_of_range(spot, None) is False
+    def test_low_flow_penalized_and_explained(self):
+        spot = make_spot(type="river", min_cfs=80, max_cfs=600, min_temp_f=None, is_alpine=False)
+        delta, warnings = self._delta(spot, 65)
+        in_range, _ = self._delta(spot, 300)
+        assert delta < in_range
+        assert any("Low flow: 65 cfs" in w and "80–600 cfs" in w for w in warnings)
 
-    def test_cfs_none_in_data_not_blocked(self):
-        spot = make_spot(type="river", min_cfs=100, max_cfs=500)
-        assert _cfs_out_of_range(spot, {"cfs": None}) is False
+    def test_high_flow_penalized_more_than_low(self):
+        spot = make_spot(type="river", min_cfs=80, max_cfs=600, min_temp_f=None, is_alpine=False)
+        low, _ = self._delta(spot, 65)
+        high, warnings = self._delta(spot, 900)
+        assert high < low
+        assert any("High flow: 900 cfs" in w and "blown out" in w for w in warnings)
 
+    def test_build_no_longer_hard_filters_on_cfs(self):
+        import inspect
+        import chat.context_builder as cb
+        assert "_cfs_out_of_range" not in inspect.getsource(cb)
+
+
+# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # _wildfire_near_spot

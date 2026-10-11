@@ -6,7 +6,7 @@ chat message. Returns a BuildResult containing the assembled Ollama messages
 and session metadata.
 
 Pipeline (§6.3):
-  [1] Hard pre-LLM filters — drive time, closures, out-of-range CFS
+  [1] Hard pre-LLM filters — drive time, active closures
   [2] Tier 2 volatile delta overlay → session_score per candidate (§7.5)
   [3] Variety rotation — 60-day rule (§7.6)
   [4] Response cache check
@@ -298,27 +298,30 @@ def _species_temp_ceiling(target_species: list[str]) -> float | None:
     return min(ceilings) if ceilings else None
 
 
-def _cfs_out_of_range(
-    water_body: WaterBody,
-    usgs_data: dict | None,
-) -> bool:
+def _cfs_range_status(water_body: WaterBody, cfs: float | None) -> str | None:
     """
-    True when live CFS is outside min/max and realtime conditions are available.
-    This is the only hard conditions filter for rivers/creeks; temperature,
-    turbidity, and other signals are soft penalties in _compute_volatile_delta.
+    "low" / "high" when flow is outside the water body's min/max fishable CFS,
+    else None. Rivers/creeks only.
+
+    A soft penalty since 2026-10-11, no longer a hard filter: most min/max
+    values are hand-entered, not sourced (only 6 rivers come from spec §7.7),
+    and once USGS data started flowing, normal fall low flows hid Pilchuck,
+    Queets and South Fork Hoh from recommendations entirely.
     """
-    if water_body.type not in ("river", "creek"):
-        return False
-    if not water_body.has_realtime_conditions or usgs_data is None:
-        return False
-    cfs = usgs_data.get("cfs")
-    if cfs is None:
-        return False
+    if water_body.type not in ("river", "creek") or cfs is None:
+        return None
     if water_body.min_cfs and cfs < float(water_body.min_cfs):
-        return True
+        return "low"
     if water_body.max_cfs and cfs > float(water_body.max_cfs):
-        return True
-    return False
+        return "high"
+    return None
+
+
+def _cfs_range_text(water_body: WaterBody) -> str:
+    lo, hi = water_body.min_cfs, water_body.max_cfs
+    if lo and hi:
+        return f"{int(lo):,}–{int(hi):,} cfs"
+    return f"{int(lo):,}+ cfs" if lo else f"up to {int(hi):,} cfs"
 
 
 # ---------------------------------------------------------------------------
@@ -478,8 +481,8 @@ def _compute_volatile_delta(
     delta is added to water_body.score to produce session_score (never written back).
     warnings are surfaced in the conditions block for the LLM.
 
-    Hard filters (closures, CFS out-of-range) are handled separately.
-    Everything else — wildfire, alpine access, AQI, turbidity, temp — is a
+    Hard filters (active closures) are handled separately. Everything else —
+    out-of-range flow, wildfire, alpine access, AQI, turbidity, temp — is a
     scored penalty here so the LLM can communicate the issue to the angler.
     """
     delta = 0.0
@@ -530,6 +533,19 @@ def _compute_volatile_delta(
             cfs = _nwrfc_cfs_at(nwrfc_data, departure_time)
         elif usgs_data:
             cfs = usgs_data.get("cfs")
+
+        range_status = _cfs_range_status(water_body, cfs)
+        if range_status == "low":
+            delta -= 2.0
+            warnings.append(
+                f"Low flow: {cfs:,.0f} cfs, below the typical fishable range ({_cfs_range_text(water_body)})"
+            )
+        elif range_status == "high":
+            delta -= 2.5
+            warnings.append(
+                f"High flow: {cfs:,.0f} cfs, above the typical fishable range "
+                f"({_cfs_range_text(water_body)}) — likely blown out"
+            )
 
         if cfs is not None and water_body.min_cfs and water_body.max_cfs:
             ideal = (float(water_body.min_cfs) + float(water_body.max_cfs)) / 2
@@ -1472,15 +1488,14 @@ async def build_context(
         for c in cond_result.all():
             cond_by[(str(c.water_body_id), c.source)] = c.data
 
-        # Apply hard filters — only closure and out-of-range CFS
+        # Apply hard filters — only active closures. (Out-of-range CFS became a
+        # soft penalty in _compute_volatile_delta on 2026-10-11.)
         # permit_required is NOT a hard filter; it surfaces as an LLM advisory
         # (wildfire, alpine, AQI, turbidity, temp are also soft penalties)
         filtered_pairs: list[tuple] = []
         for fs, wb in pairs:
             wb_id = str(wb.id)
             if _has_active_closure(wb.name, active_closures, water_body_id=wb.id):
-                continue
-            if _cfs_out_of_range(wb, cond_by.get((wb_id, "usgs"))):
                 continue
             filtered_pairs.append((fs, wb))
 
