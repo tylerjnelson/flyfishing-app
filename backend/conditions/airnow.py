@@ -12,6 +12,7 @@ import httpx
 import pybreaker
 
 from conditions.circuit_breaker import airnow_breaker
+from conditions.fetch_errors import log_fetch_failure
 from conditions.normalizer import normalize_airnow
 from config import settings
 
@@ -25,13 +26,16 @@ async def fetch_airnow(lat: float, lon: float) -> dict | None:
     """
     Fetch current AQI observation for a lat/lon.
 
-    Returns normalised data dict, or None when the circuit is open.
+    Returns normalised data dict, or None on any fetch failure (logged as fetch_failed).
     """
     try:
         raw = await _fetch(lat, lon)
         return normalize_airnow(raw, fetched_at=datetime.now(tz=timezone.utc))
     except pybreaker.CircuitBreakerError:
         log.warning("circuit_open", extra={"source": "airnow", "lat": lat, "lon": lon})
+        return None
+    except Exception as exc:
+        log_fetch_failure("airnow", exc, lat=lat, lon=lon)
         return None
 
 

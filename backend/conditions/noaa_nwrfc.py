@@ -16,6 +16,7 @@ import httpx
 import pybreaker
 
 from conditions.circuit_breaker import noaa_nwrfc_breaker
+from conditions.fetch_errors import log_fetch_failure
 from conditions.normalizer import normalize_noaa_nwrfc
 
 log = logging.getLogger(__name__)
@@ -60,7 +61,7 @@ async def fetch_noaa_nwrfc(gauge_id: str) -> dict | None:
     """
     Fetch river flow forecast for a single NWPS gauge ID.
 
-    Returns normalised data dict, or None when the circuit is open.
+    Returns normalised data dict, or None on any fetch failure (logged as fetch_failed).
     """
     try:
         raw = await _fetch_stageflow(gauge_id)
@@ -73,6 +74,9 @@ async def fetch_noaa_nwrfc(gauge_id: str) -> dict | None:
         return result
     except pybreaker.CircuitBreakerError:
         log.warning("circuit_open", extra={"source": "noaa_nwrfc", "gauge_id": gauge_id})
+        return None
+    except Exception as exc:
+        log_fetch_failure("noaa_nwrfc", exc, gauge_id=gauge_id)
         return None
 
 

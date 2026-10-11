@@ -15,6 +15,7 @@ import httpx
 import pybreaker
 
 from conditions.circuit_breaker import noaa_nws_breaker
+from conditions.fetch_errors import log_fetch_failure
 from conditions.normalizer import normalize_noaa_nws
 
 log = logging.getLogger(__name__)
@@ -28,13 +29,16 @@ async def fetch_noaa_nws(lat: float, lon: float) -> dict | None:
     """
     Fetch current conditions and 7-day forecast for a lat/lon.
 
-    Returns normalised data dict, or None when the circuit is open.
+    Returns normalised data dict, or None on any fetch failure (logged as fetch_failed).
     """
     try:
         raw = await _fetch(lat, lon)
         return normalize_noaa_nws(raw, fetched_at=datetime.now(tz=timezone.utc))
     except pybreaker.CircuitBreakerError:
         log.warning("circuit_open", extra={"source": "noaa_nws", "lat": lat, "lon": lon})
+        return None
+    except Exception as exc:
+        log_fetch_failure("noaa_nws", exc, lat=lat, lon=lon)
         return None
 
 
@@ -68,6 +72,11 @@ async def _fetch(lat: float, lon: float) -> dict:
             obs_resp = await client.get(obs_url)
             if obs_resp.is_success:
                 current_obs = obs_resp.json().get("properties", {})
+            else:
+                # Forecast still usable; only current observation is missing.
+                log.warning("noaa_nws_obs_unavailable", extra={
+                    "source": "noaa_nws", "url": obs_url, "status_code": obs_resp.status_code,
+                })
 
     return {
         "current_obs": current_obs,

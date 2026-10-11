@@ -33,6 +33,7 @@ from sqlalchemy import delete, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from config import settings
+from conditions.fetch_errors import log_fetch_failure
 from conditions.noaa_nwrfc import fetch_noaa_nwrfc, resolve_gauge_id
 from conditions.inciweb import fetch_inciweb
 from conditions.nps_alerts import fetch_nps_alerts
@@ -50,6 +51,16 @@ log = logging.getLogger(__name__)
 _INTERVAL_SCHEDULED = 120  # minutes — used for conditions_hash boundary rounding
 
 scheduler: AsyncIOScheduler | None = None
+
+
+def _log_job_done(job: str, failed: int = 0, **counts) -> None:
+    """One summary line per run. APScheduler reports "executed successfully"
+    even when a job swallowed failures, so this line is the source of truth:
+    `job_degraded` (WARNING) if anything failed, else `job_done`."""
+    if failed:
+        log.warning("job_degraded", extra={"job": job, "failed": failed, **counts})
+    else:
+        log.info("job_done", extra={"job": job, **counts})
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +151,9 @@ async def job_wdfw_emergency() -> None:
         )
         return
     except Exception as exc:
-        log.warning("wdfw_emergency_fetch_failed", extra={"error": str(exc)})
+        # Existing rows are kept (served stale) — never silently go dark.
+        log_fetch_failure("wdfw_emergency", exc, job="wdfw_emergency")
+        _log_job_done("wdfw_emergency", failed=1, serving="stale_rows")
         return
 
     if not rules:
@@ -183,9 +196,12 @@ async def job_wdfw_emergency() -> None:
                     fetched_at=datetime.now(tz=timezone.utc),
                 ))
 
-    log.info(
-        "job_done",
-        extra={"job": "wdfw_emergency", "rules_stored": len(rules), "water_body_matched": matched},
+    _log_job_done(
+        "wdfw_emergency",
+        rules_stored=len(rules),
+        water_body_matched=matched,
+        # No parsed expiry ⇒ treated as active indefinitely; watch this number.
+        rules_without_expiry=sum(1 for r in rules if not r.get("expires")),
     )
 
 
@@ -197,7 +213,7 @@ async def job_inciweb() -> None:
     log.info("job_start", extra={"job": "inciweb"})
     data = await fetch_inciweb()
     if data is None:
-        log.warning("job_stale_fallback", extra={"job": "inciweb"})
+        _log_job_done("inciweb", failed=1, serving="stale_cache")
         return
 
     async with AsyncSessionLocal() as session:
@@ -206,10 +222,7 @@ async def job_inciweb() -> None:
                 session, water_body_id=None, source="inciweb", data=data
             )
 
-    log.info("job_done", extra={
-        "job": "inciweb",
-        "wa_fires": len(data.get("active_wa_fires", [])),
-    })
+    _log_job_done("inciweb", wa_fires=len(data.get("active_wa_fires", [])))
 
 
 # ---------------------------------------------------------------------------
@@ -220,7 +233,7 @@ async def job_nps_alerts() -> None:
     log.info("job_start", extra={"job": "nps_alerts"})
     data = await fetch_nps_alerts()
     if data is None:
-        log.warning("job_stale_fallback", extra={"job": "nps_alerts"})
+        _log_job_done("nps_alerts", failed=1, serving="stale_cache")
         return
 
     async with AsyncSessionLocal() as session:
@@ -230,7 +243,7 @@ async def job_nps_alerts() -> None:
             )
 
     total = sum(p["alert_count"] for p in data.get("parks", {}).values())
-    log.info("job_done", extra={"job": "nps_alerts", "total_alerts": total})
+    _log_job_done("nps_alerts", total_alerts=total)
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +254,7 @@ async def job_noaa_nwrfc() -> None:
     log.info("job_start", extra={"job": "noaa_nwrfc"})
     water_bodies = await _water_bodies_with_usgs_ids()
     wrote = 0
+    stale: list[str] = []
 
     for wb in water_bodies:
         for usgs_id in (wb.usgs_site_ids or []):
@@ -249,7 +263,10 @@ async def job_noaa_nwrfc() -> None:
                 continue
             data = await fetch_noaa_nwrfc(gauge_id)
             if data is None:
-                log.warning("job_stale_fallback", extra={"job": "noaa_nwrfc", "water_body_id": str(wb.id)})
+                log.warning("job_stale_fallback", extra={
+                    "job": "noaa_nwrfc", "water_body": wb.name, "water_body_id": str(wb.id), "gauge_id": gauge_id,
+                })
+                stale.append(gauge_id)
                 continue
             async with AsyncSessionLocal() as session:
                 async with session.begin():
@@ -258,7 +275,7 @@ async def job_noaa_nwrfc() -> None:
                     )
             wrote += 1
 
-    log.info("job_done", extra={"job": "noaa_nwrfc", "records_written": wrote})
+    _log_job_done("noaa_nwrfc", failed=len(stale), records_written=wrote, stale_gauges=stale)
 
 
 # ---------------------------------------------------------------------------
@@ -269,7 +286,7 @@ async def job_wdfw_stocking() -> None:
     log.info("job_start", extra={"job": "wdfw_stocking"})
     records = await fetch_wdfw_stocking()
     if records is None:
-        log.warning("job_stale_fallback", extra={"job": "wdfw_stocking"})
+        _log_job_done("wdfw_stocking", failed=1, serving="stale_cache")
         return
 
     # Build name→water_body_id map for linking stocking events
@@ -322,10 +339,7 @@ async def job_wdfw_stocking() -> None:
                     )
                     water_bodies_updated += result.rowcount
 
-    log.info(
-        "job_done",
-        extra={"job": "wdfw_stocking", "records_stored": len(records), "water_bodies_updated": water_bodies_updated},
-    )
+    _log_job_done("wdfw_stocking", records_fetched=len(records), water_bodies_updated=water_bodies_updated)
 
 
 # ---------------------------------------------------------------------------
@@ -336,6 +350,7 @@ async def job_wta() -> None:
     log.info("job_start", extra={"job": "wta"})
     water_bodies = await _water_bodies_with_wta_url()
     wrote = 0
+    failed = 0
 
     for wb in water_bodies:
         try:
@@ -345,9 +360,13 @@ async def job_wta() -> None:
                 "scraper_structure_failure",
                 extra={"source": exc.source, "url": exc.url, "detail": exc.detail},
             )
+            failed += 1
             continue
         if result is None:
-            log.warning("job_stale_fallback", extra={"job": "wta", "water_body_id": str(wb.id)})
+            log.warning("job_stale_fallback", extra={
+                "job": "wta", "water_body": wb.name, "water_body_id": str(wb.id),
+            })
+            failed += 1
             continue
 
         fishing_reports = result["fishing_reports"]
@@ -372,7 +391,7 @@ async def job_wta() -> None:
                 )
         wrote += len(fishing_reports)
 
-    log.info("job_done", extra={"job": "wta", "fishing_reports_stored": wrote})
+    _log_job_done("wta", failed=failed, trails=len(water_bodies), fishing_reports_stored=wrote)
 
 
 # ---------------------------------------------------------------------------
@@ -383,6 +402,7 @@ async def job_snotel() -> None:
     log.info("job_start", extra={"job": "snotel"})
     water_bodies = await _water_bodies_with_snotel()
     wrote = 0
+    failed = 0
 
     # Cache per station triplet — multiple water bodies can share one station.
     station_cache: dict[str, dict | None] = {}
@@ -392,8 +412,11 @@ async def job_snotel() -> None:
             station_cache[triplet] = await fetch_snotel(triplet)
         data = station_cache[triplet]
         if data is None:
-            log.warning("job_stale_fallback", extra={"job": "snotel", "water_body_id": str(wb.id)})
+            log.warning("job_stale_fallback", extra={
+                "job": "snotel", "water_body": wb.name, "water_body_id": str(wb.id), "station": triplet,
+            })
             await _mark_stale(wb.id, source="snotel")
+            failed += 1
             continue
         async with AsyncSessionLocal() as session:
             async with session.begin():
@@ -402,7 +425,7 @@ async def job_snotel() -> None:
                 )
         wrote += 1
 
-    log.info("job_done", extra={"job": "snotel", "records_written": wrote})
+    _log_job_done("snotel", failed=failed, records_written=wrote)
 
 
 # ---------------------------------------------------------------------------
@@ -431,7 +454,7 @@ async def job_score_all_water_bodies() -> None:
             )
             failed += 1
 
-    log.info("job_done", extra={"job": "score_all_water_bodies", "scored": scored, "failed": failed})
+    _log_job_done("score_all_water_bodies", failed=failed, scored=scored)
 
 
 # ---------------------------------------------------------------------------
@@ -444,9 +467,9 @@ async def job_wdfw_regulations() -> None:
         async with AsyncSessionLocal() as session:
             async with session.begin():
                 await fetch_and_update_regulations(session)
-        log.info("job_done", extra={"job": "wdfw_regulations"})
-    except Exception as exc:
-        log.warning("wdfw_regulations_job_failed", extra={"error": str(exc)})
+        _log_job_done("wdfw_regulations")
+    except Exception:
+        log.exception("wdfw_regulations_job_failed", extra={"job": "wdfw_regulations"})
 
 
 # ---------------------------------------------------------------------------

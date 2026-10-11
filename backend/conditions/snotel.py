@@ -14,6 +14,7 @@ import httpx
 import pybreaker
 
 from conditions.circuit_breaker import snotel_breaker
+from conditions.fetch_errors import log_fetch_failure
 from conditions.normalizer import normalize_snotel
 
 log = logging.getLogger(__name__)
@@ -26,7 +27,7 @@ async def fetch_snotel(station_triplet: str) -> dict | None:
     """
     Fetch current snowpack data for a SNOTEL station triplet.
 
-    Returns normalised data dict, or None when the circuit is open.
+    Returns normalised data dict, or None on any fetch failure (logged as fetch_failed).
     """
     try:
         raw = await _fetch(station_triplet)
@@ -49,6 +50,9 @@ async def fetch_snotel(station_triplet: str) -> dict | None:
             "circuit_open",
             extra={"source": "snotel", "station": station_triplet},
         )
+        return None
+    except Exception as exc:
+        log_fetch_failure("snotel", exc, station=station_triplet)
         return None
 
 

@@ -15,6 +15,7 @@ import httpx
 import pybreaker
 
 from conditions.circuit_breaker import wdfw_stocking_breaker
+from conditions.fetch_errors import log_fetch_failure
 from conditions.normalizer import normalize_wdfw_stocking
 
 log = logging.getLogger(__name__)
@@ -30,7 +31,7 @@ async def fetch_wdfw_stocking(year: int | None = None) -> list[dict] | None:
     Fetch all stocking records for the given year (defaults to current year).
 
     Returns a flat list of normalised stocking dicts for upsert into
-    stocking_events, or None when the circuit is open.
+    stocking_events, or None on any fetch failure (logged as fetch_failed).
     """
     if year is None:
         year = datetime.now(tz=timezone.utc).year
@@ -39,6 +40,9 @@ async def fetch_wdfw_stocking(year: int | None = None) -> list[dict] | None:
         return normalize_wdfw_stocking(raw, fetched_at=datetime.now(tz=timezone.utc))
     except pybreaker.CircuitBreakerError:
         log.warning("circuit_open", extra={"source": "wdfw_stocking", "year": year})
+        return None
+    except Exception as exc:
+        log_fetch_failure("wdfw_stocking", exc, year=year)
         return None
 
 

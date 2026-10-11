@@ -367,6 +367,15 @@ async def _fetch_and_cache_realtime(fishing_spots: list, water_bodies: list[Wate
         elif isinstance(data, BaseException):
             log.warning("realtime_fetch_error", extra={"source": "airnow", "err": str(data)})
 
+    # Fetchers log their own failures (fetch_failed) and return None; count them
+    # here so one summary line shows how degraded this session's conditions are.
+    failed = {
+        src: sum(1 for r in results if r is None or isinstance(r, BaseException))
+        for src, results in (("usgs", usgs_results), ("noaa_nws", nws_results), ("airnow", airnow_results))
+    }
+    if any(failed.values()):
+        log.warning("realtime_conditions_degraded", extra={"failed": failed, "written": len(to_write)})
+
     if not to_write:
         return
 

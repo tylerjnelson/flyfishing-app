@@ -74,7 +74,8 @@ async def request_magic_link(email: str, db: AsyncSession, base_url: str) -> Non
     result = await db.execute(select(User).where(User.email == email))
     user = result.scalar_one_or_none()
     if not user:
-        log.info("magic_link_unknown_email", extra={"email": email})
+        # Domain only: don't write arbitrary submitted addresses (PII) to logs.
+        log.info("magic_link_unknown_email", extra={"email_domain": email.rpartition("@")[2]})
         return
 
     raw = secrets.token_urlsafe(32)

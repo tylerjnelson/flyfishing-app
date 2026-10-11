@@ -21,6 +21,7 @@ import httpx
 import pybreaker
 
 from conditions.circuit_breaker import nps_breaker
+from conditions.fetch_errors import log_fetch_failure
 from config import settings
 
 log = logging.getLogger(__name__)
@@ -34,13 +35,16 @@ async def fetch_nps_alerts() -> dict | None:
     """
     Fetch active NPS alerts for NOCA and OLYM parks.
 
-    Returns normalised data dict, or None when the circuit is open.
+    Returns normalised data dict, or None on any fetch failure (logged as fetch_failed).
     """
     try:
         alerts = await _fetch()
         return _normalize(alerts)
     except pybreaker.CircuitBreakerError:
         log.warning("circuit_open", extra={"source": "nps_alerts"})
+        return None
+    except Exception as exc:
+        log_fetch_failure("nps_alerts", exc)
         return None
 
 

@@ -37,11 +37,9 @@ LOGGING_CONFIG = {
     "version": 1,
     "disable_existing_loggers": False,
     "formatters": {
-        "json": {
-            "()": "logging.Formatter",
-            "fmt": '{"time":"%(asctime)s","level":"%(levelname)s","logger":"%(name)s","request_id":"%(request_id)s","message":"%(message)s"}',
-            "datefmt": "%Y-%m-%dT%H:%M:%S",
-        }
+        # Real JSON (not a printf template): emits every `extra={...}` field,
+        # tracebacks, and scrubs API keys. See log_format.py.
+        "json": {"()": "log_format.JsonFormatter"}
     },
     "handlers": {
         "stdout": {

@@ -12,6 +12,7 @@ import httpx
 import pybreaker
 
 from conditions.circuit_breaker import usgs_breaker
+from conditions.fetch_errors import log_fetch_failure
 from conditions.normalizer import normalize_usgs
 
 log = logging.getLogger(__name__)
@@ -25,8 +26,8 @@ async def fetch_usgs_gauge(site_id: str) -> dict | None:
     """
     Fetch instantaneous values for one USGS gauge site.
 
-    Returns normalised data dict, or None when the circuit is open (caller
-    should fall back to the last conditions_cache entry and set stale=True).
+    Returns normalised data dict, or None on any fetch failure (logged as
+    fetch_failed; caller falls back to the last conditions_cache entry).
     """
     try:
         raw = await _fetch(site_id)
@@ -37,6 +38,9 @@ async def fetch_usgs_gauge(site_id: str) -> dict | None:
         return result
     except pybreaker.CircuitBreakerError:
         log.warning("circuit_open", extra={"source": "usgs", "site_id": site_id})
+        return None
+    except Exception as exc:
+        log_fetch_failure("usgs", exc, site_id=site_id)
         return None
 
 

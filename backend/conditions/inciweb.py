@@ -24,6 +24,7 @@ import httpx
 import pybreaker
 
 from conditions.circuit_breaker import inciweb_breaker
+from conditions.fetch_errors import log_fetch_failure
 from conditions.normalizer import normalize_inciweb
 
 log = logging.getLogger(__name__)
@@ -36,13 +37,16 @@ async def fetch_inciweb() -> dict | None:
     """
     Fetch active WA wildfire incidents.
 
-    Returns normalised data dict, or None when the circuit is open.
+    Returns normalised data dict, or None on any fetch failure (logged as fetch_failed).
     """
     try:
         incidents = await _fetch()
         return normalize_inciweb(incidents, fetched_at=datetime.now(tz=timezone.utc))
     except pybreaker.CircuitBreakerError:
         log.warning("circuit_open", extra={"source": "inciweb"})
+        return None
+    except Exception as exc:
+        log_fetch_failure("inciweb", exc)
         return None
 
 

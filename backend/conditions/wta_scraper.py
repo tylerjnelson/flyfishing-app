@@ -30,6 +30,7 @@ import pybreaker
 from bs4 import BeautifulSoup
 
 from conditions.circuit_breaker import wta_breaker
+from conditions.fetch_errors import log_fetch_failure
 from exceptions import ScraperStructureError
 
 log = logging.getLogger(__name__)
@@ -123,13 +124,18 @@ async def fetch_wta_reports(wta_trail_url: str) -> dict | None:
                              "total_reports": N},
       }
 
-    Returns None when the circuit is open.
+    Returns None on any fetch failure (logged as fetch_failed).
     Raises ScraperStructureError if the page structure has changed.
     """
     try:
         raw_reports, trail_conditions = await _scrape_reports(wta_trail_url)
     except pybreaker.CircuitBreakerError:
         log.warning("circuit_open", extra={"source": "wta", "url": wta_trail_url})
+        return None
+    except ScraperStructureError:
+        raise  # job logs it as CRITICAL — the scraper needs fixing, not a retry
+    except Exception as exc:
+        log_fetch_failure("wta", exc, trail_url=wta_trail_url)
         return None
 
     fishing_reports = []
@@ -198,7 +204,7 @@ async def _scrape_reports(url: str) -> tuple[list[dict], dict]:
                 if body_text:
                     reports.append({"text": body_text, "date": item["date"]})
             except Exception as exc:
-                log.debug("wta_detail_fetch_failed", extra={"href": item["href"], "error": str(exc)})
+                log.warning("wta_detail_fetch_failed", extra={"href": item["href"], "error": str(exc) or repr(exc)})
                 continue
 
     return reports, trail_conditions
