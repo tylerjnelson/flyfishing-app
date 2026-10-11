@@ -425,8 +425,12 @@ def _nwrfc_cfs_at(nwrfc_data: dict, departure_time: datetime) -> float | None:
     best_diff: float | None = None
     for entry in forecasts:
         valid_str = entry.get("validTime")
-        secondary = entry.get("secondary")
-        if valid_str is None or secondary is None:
+        # flow_cfs is set by normalize_noaa_nwrfc from the series metadata.
+        # Raw "secondary" is stage, not flow, at some gauges (AUBW1/TOLW1/NISW1),
+        # so never fall back to it; rows cached before 2026-10-11 lack flow_cfs
+        # and are simply ignored until the 2-hourly refresh.
+        flow_cfs = entry.get("flow_cfs")
+        if valid_str is None or flow_cfs is None:
             continue
         try:
             valid_dt = datetime.fromisoformat(valid_str.replace("Z", "+00:00"))
@@ -435,7 +439,7 @@ def _nwrfc_cfs_at(nwrfc_data: dict, departure_time: datetime) -> float | None:
             diff = abs((valid_dt - departure_time).total_seconds())
             if best_diff is None or diff < best_diff:
                 best_diff = diff
-                best_cfs = float(secondary) * 1000.0
+                best_cfs = float(flow_cfs)
         except (ValueError, TypeError):
             continue
     # Reject if nearest forecast entry is >6h from departure — data is too stale to use

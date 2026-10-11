@@ -231,27 +231,56 @@ def _flow_trend(cfs: float, prior_cfs) -> str | None:
     return "stable"
 
 
+def nwps_series_fields(series: dict) -> tuple[str, float, str | None] | None:
+    """
+    For an NWPS stageflow series ("observed" / "forecast"), return
+    (flow_key, multiplier_to_cfs, stage_key). None if the series has no flow.
+
+    Field order is NOT fixed: most WA gauges are primary=Stage(ft) /
+    secondary=Flow(kcfs), but AUBW1 (Green), TOLW1 (Tolt) and NISW1
+    (Nisqually) are primary=River Discharge(kcfs) / secondary=Stage(ft).
+    Reading "secondary" as kcfs turned Green River's 57 ft stage into a
+    57,000 cfs forecast (found 2026-10-11).
+    """
+    flow = stage = None
+    mult = 0.0
+    for key in ("primary", "secondary"):
+        name = (series.get(f"{key}Name") or "").lower()
+        units = (series.get(f"{key}Units") or "").lower()
+        if ("flow" in name or "discharge" in name) and units in ("kcfs", "cfs"):
+            flow, mult = key, (1000.0 if units == "kcfs" else 1.0)
+        elif "stage" in name:
+            stage = key
+    return (flow, mult, stage) if flow else None
+
+
 def normalize_nwps_observed(raw: dict, gauge_id: str, fetched_at: datetime) -> dict | None:
     """
     USGS-shaped flow reading from a NOAA NWPS stageflow *observed* series.
 
     Fallback for rivers whose USGS gauge is discontinued but whose NWPS gauge
     still reports (Naches NACW1, Stillaguamish ARLW1, Yakima PARW1, as of
-    2026-10). primary = stage (ft), secondary = flow (kcfs). Negative values
+    2026-10). Which field is flow comes from the series metadata
+    (nwps_series_fields), not position. Negative values
     are NWPS's missing-data markers (ARLW1 had 535 of them). Returns None
     when there's no usable reading within USGS_MAX_READING_AGE.
     """
+    series = raw.get("observed") or {}
+    fields = nwps_series_fields(series)
+    if fields is None:
+        return None
+    flow_key, mult, stage_key = fields
     points = []
-    for p in (raw.get("observed") or {}).get("data") or []:
+    for p in series.get("data") or []:
         try:
-            flow_kcfs = float(p["secondary"])
+            flow = float(p[flow_key])
             observed = datetime.fromisoformat(p["validTime"].replace("Z", "+00:00"))
         except (KeyError, TypeError, ValueError):
             continue
-        if flow_kcfs < 0:
+        if flow < 0:
             continue
-        stage = p.get("primary")
-        points.append((observed, flow_kcfs * 1000, stage if isinstance(stage, (int, float)) and stage >= 0 else None))
+        stage = p.get(stage_key) if stage_key else None
+        points.append((observed, flow * mult, stage if isinstance(stage, (int, float)) and stage >= 0 else None))
     if not points:
         return None
     points.sort(key=lambda x: x[0])
@@ -278,15 +307,29 @@ def normalize_noaa_nwrfc(raw: dict, gauge_id: str, fetched_at: datetime) -> dict
     """
     Normalizes a NOAA NWPS stageflow forecast for a single gauge.
 
-    Stageflow response shape: {observed: {...}, forecast: {data: [{validTime, primary, secondary}]}}
-    primary = stage (ft), secondary = flow (kcfs).
+    Stageflow response shape: {observed: {...}, forecast: {primaryName, primaryUnits,
+    secondaryName, secondaryUnits, data: [{validTime, primary, secondary}]}}.
+    Each entry gets `flow_cfs` from whichever field the metadata says is flow
+    (field order varies by gauge; see nwps_series_fields). Entries whose flow
+    can't be determined get flow_cfs=None, and consumers must not guess.
     """
-    forecasts = raw.get("forecast", {}).get("data", [])
+    series = raw.get("forecast") or {}
+    fields = nwps_series_fields(series)
+    forecasts = []
+    for entry in series.get("data") or []:
+        flow_cfs = None
+        if fields:
+            try:
+                value = float(entry[fields[0]])
+                flow_cfs = round(value * fields[1], 1) if value >= 0 else None
+            except (KeyError, TypeError, ValueError):
+                flow_cfs = None
+        forecasts.append({**entry, "flow_cfs": flow_cfs})
     return {
         "source": "noaa_nwrfc",
         "fetched_at": fetched_at.isoformat(),
         "gauge_id": gauge_id,
-        "forecast": forecasts,  # list of {validTime, primary (stage ft), secondary (flow kcfs)}
+        "forecast": forecasts,  # [{validTime, primary, secondary, flow_cfs}]
         "stale": False,
     }
 

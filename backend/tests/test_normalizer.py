@@ -297,9 +297,18 @@ async def test_usgs_request_includes_period_for_trend(monkeypatch):
 # NWPS observed-flow fallback for dead USGS gauges (2026-10-11 audit)
 # ---------------------------------------------------------------------------
 
-def _nwps(points):
-    return {"observed": {"data": [
-        {"validTime": t.strftime("%Y-%m-%dT%H:%M:%SZ"), "primary": stage, "secondary": kcfs}
+_STAGE_FLOW = {"primaryName": "Stage", "primaryUnits": "ft", "secondaryName": "Flow", "secondaryUnits": "kcfs"}
+# AUBW1 / TOLW1 / NISW1 list discharge first (verified 2026-10-11)
+_DISCHARGE_STAGE = {"primaryName": "River Discharge", "primaryUnits": "kcfs",
+                    "secondaryName": "Stage", "secondaryUnits": "ft"}
+
+
+def _nwps(points, meta=_STAGE_FLOW, series="observed"):
+    """points: (time, stage_ft, flow_kcfs), laid out per `meta`'s field order."""
+    stage_first = meta["primaryName"] == "Stage"
+    return {series: {**meta, "data": [
+        {"validTime": t.strftime("%Y-%m-%dT%H:%M:%SZ"),
+         "primary": stage if stage_first else kcfs, "secondary": kcfs if stage_first else stage}
         for t, stage, kcfs in points
     ]}}
 
@@ -321,6 +330,21 @@ class TestNormalizeNwpsObserved:
         now = datetime.now(tz=timezone.utc)
         raw = _nwps([(now - timedelta(minutes=30), 0.24, 0.495), (now - timedelta(minutes=15), -999, -999)])
         assert normalize_nwps_observed(raw, "ARLW1", now)["cfs"] == 495.0
+
+    def test_discharge_first_field_order(self):
+        """Green (AUBW1): primary is discharge, secondary is stage (57.25 ft)."""
+        from conditions.normalizer import normalize_nwps_observed
+        now = datetime.now(tz=timezone.utc)
+        raw = _nwps([(now - timedelta(minutes=15), 57.25, 0.476)], meta=_DISCHARGE_STAGE)
+        r = normalize_nwps_observed(raw, "AUBW1", now)
+        assert r["cfs"] == 476.0          # not 57,250
+        assert r["gauge_height_ft"] == 57.25
+
+    def test_series_without_flow_returns_none(self):
+        from conditions.normalizer import normalize_nwps_observed
+        now = datetime.now(tz=timezone.utc)
+        meta = {"primaryName": "Stage", "primaryUnits": "ft"}
+        assert normalize_nwps_observed(_nwps([(now, 1.0, 1.0)], meta=meta), "X", now) is None
 
     def test_stale_or_empty_returns_none(self):
         from conditions.normalizer import normalize_nwps_observed
@@ -363,3 +387,24 @@ class TestUsgsNwpsFallback:
              patch.object(usgs, "fetch_nwps_observed", AsyncMock()) as nw:
             assert await usgs.fetch_usgs_gauge("00000000") is None
         nw.assert_not_awaited()
+
+
+class TestNwrfcForecastFlowField:
+    """normalize_noaa_nwrfc sets flow_cfs from metadata; _nwrfc_cfs_at uses only that."""
+
+    def test_forecast_flow_cfs_both_orders(self):
+        from conditions.normalizer import normalize_noaa_nwrfc
+        t = datetime.now(tz=timezone.utc) + timedelta(days=2)
+        a = normalize_noaa_nwrfc(_nwps([(t, 14.6, 1.6)], series="forecast"), "NACW1", t)
+        b = normalize_noaa_nwrfc(_nwps([(t, 57.25, 0.476)], meta=_DISCHARGE_STAGE, series="forecast"), "AUBW1", t)
+        assert a["forecast"][0]["flow_cfs"] == 1600.0
+        assert b["forecast"][0]["flow_cfs"] == 476.0
+
+    def test_cfs_at_departure_uses_flow_cfs_and_ignores_legacy_rows(self):
+        from chat.context_builder import _nwrfc_cfs_at
+        dep = datetime.now(tz=timezone.utc) + timedelta(days=2)
+        vt = dep.strftime("%Y-%m-%dT%H:%M:%SZ")
+        assert _nwrfc_cfs_at({"forecast": [{"validTime": vt, "primary": 0.476, "secondary": 57.25,
+                                            "flow_cfs": 476.0}]}, dep) == 476.0
+        # pre-fix cached row: no flow_cfs → not guessed from "secondary"
+        assert _nwrfc_cfs_at({"forecast": [{"validTime": vt, "primary": 0.476, "secondary": 57.25}]}, dep) is None
