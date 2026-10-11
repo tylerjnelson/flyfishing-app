@@ -120,8 +120,12 @@ async def startup() -> None:
 async def shutdown() -> None:
     global _scheduler_lock_conn
 
-    from conditions.scheduler import stop_scheduler
-    stop_scheduler()
+    # Only the elected worker imported the scheduler. Importing it here on the
+    # others loads whatever is on disk mid-deploy: new modules against old ones
+    # already in memory, which raised ImportError at shutdown (2026-10-11).
+    scheduler_module = sys.modules.get("conditions.scheduler")
+    if scheduler_module is not None:
+        scheduler_module.stop_scheduler()
 
     if _scheduler_lock_conn is not None:
         await _scheduler_lock_conn.close()
