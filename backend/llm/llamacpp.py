@@ -106,6 +106,12 @@ def _to_openai_messages(messages: list[dict]) -> list[dict]:
     return out
 
 
+def _log_malformed_args(tool: str, raw: str) -> None:
+    """The model emitted tool-call arguments that aren't valid JSON. The call
+    still runs with empty args, so log it: it's a model-quality signal."""
+    log.warning("tool_args_malformed", extra={"tool": tool, "args_snippet": str(raw)[:200]})
+
+
 def _parse_tool_calls(msg: dict) -> list[dict]:
     """Map OpenAI ``message.tool_calls`` back to the ollama shape callers expect:
     ``[{"function": {"name": str, "arguments": dict}}]``."""
@@ -117,6 +123,7 @@ def _parse_tool_calls(msg: dict) -> list[dict]:
             try:
                 args = json.loads(args)
             except json.JSONDecodeError:
+                _log_malformed_args(fn.get("name", ""), args)
                 args = {}
         calls.append({"function": {"name": fn.get("name", ""), "arguments": args or {}}})
     return calls
@@ -143,6 +150,7 @@ def _assemble_streamed_tool_calls(acc: dict[int, dict]) -> list[dict]:
         try:
             args = json.loads(raw)
         except json.JSONDecodeError:
+            _log_malformed_args(name, raw)
             args = raw
         calls.append({"id": slot.get("id"), "function": {"name": name, "arguments": args}})
     return calls

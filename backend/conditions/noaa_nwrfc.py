@@ -28,6 +28,12 @@ _TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=5.0, pool=5.0)
 # Sourced from GET /nwps/v1/gauges/{lid} → usgsId field (2026-04-10).
 # The NWPS list endpoint's ?usgsId= filter is unreliable (silently ignored or
 # returns Not Found depending on ID).  Hardcoded mapping is faster and stable.
+# Mapped gauges that NWPS publishes observations for but no forecast
+# ("Forecasts are not available. Only observed stages are available for this
+# point." in the gauge metadata, checked 2026-10-12). The forecast job skips
+# them; they still serve the observed-flow fallback.
+NO_FORECAST_GAUGES = frozenset({"QUEW1", "MONW1"})
+
 _USGS_TO_NWRFC_LID: dict[str, str] = {
     # --- Validated 2026-04-10 against NWPS API ---
     "12505000": "PARW1",   # Yakima River near Parker

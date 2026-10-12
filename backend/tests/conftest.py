@@ -7,6 +7,7 @@ runs first and patches os.environ before the test session begins.
 """
 
 import os
+import tempfile
 import sys
 
 # Ensure backend/ is on the path (pytest runs from backend/)
@@ -21,3 +22,5 @@ os.environ.setdefault("RESEND_API_KEY", "re_test")
 os.environ.setdefault("MAIL_FROM", "test@example.com")
 os.environ.setdefault("AIRNOW_API_KEY", "test-airnow-key")
 os.environ.setdefault("HERE_API_KEY", "test-here-key")
+# main.py logs to a file; keep tests out of /var/log/flyfish/app.log.
+os.environ.setdefault("FLYFISH_LOG_FILE", os.path.join(tempfile.gettempdir(), "flyfish-test-app.log"))

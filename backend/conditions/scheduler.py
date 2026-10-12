@@ -19,8 +19,10 @@ Real-time fetchers (USGS, NOAA NWS, AirNow) are triggered at session open
 by the chat context builder — they are NOT scheduled here.
 """
 
+import functools
 import logging
 import re
+import time
 
 
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
@@ -34,7 +36,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from config import settings
 from conditions.cache import write_conditions_cache
 from conditions.fetch_errors import log_fetch_failure
-from conditions.noaa_nwrfc import fetch_noaa_nwrfc, resolve_gauge_id
+from conditions.noaa_nwrfc import NO_FORECAST_GAUGES, fetch_noaa_nwrfc, resolve_gauge_id
 from conditions.inciweb import fetch_inciweb
 from conditions.nps_alerts import fetch_nps_alerts
 from conditions.snotel import fetch_snotel
@@ -53,10 +55,40 @@ _INTERVAL_SCHEDULED = 120  # minutes — used for conditions_hash boundary round
 scheduler: AsyncIOScheduler | None = None
 
 
+_job_started: dict[str, float] = {}
+
+
+def _scheduled_job(name: str):
+    """
+    Wrap a job so every run logs `job_start` and ends with exactly one outcome
+    line: `job_done` / `job_degraded` (from _log_job_done, with duration_s), or
+    `job_failed` (ERROR, with traceback) if the job raised. APScheduler's own
+    "executed successfully" lines are silenced (main.LOGGING_CONFIG).
+    """
+    def decorate(fn):
+        @functools.wraps(fn)
+        async def run() -> None:
+            _job_started[name] = time.monotonic()
+            log.info("job_start", extra={"job": name})
+            try:
+                await fn()
+            except Exception as exc:
+                started = _job_started.pop(name, None)
+                log.exception("job_failed", extra={
+                    "job": name, "error_type": type(exc).__name__,
+                    "duration_s": round(time.monotonic() - started, 1) if started else None,
+                })
+        return run
+    return decorate
+
+
 def _log_job_done(job: str, failed: int = 0, **counts) -> None:
     """One summary line per run. APScheduler reports "executed successfully"
     even when a job swallowed failures, so this line is the source of truth:
     `job_degraded` (WARNING) if anything failed, else `job_done`."""
+    started = _job_started.pop(job, None)
+    if started is not None:
+        counts["duration_s"] = round(time.monotonic() - started, 1)
     if failed:
         log.warning("job_degraded", extra={"job": job, "failed": failed, **counts})
     else:
@@ -140,8 +172,8 @@ def stop_scheduler() -> None:
 # WDFW emergency closures — 2-hour, exempt from circuit breaker
 # ---------------------------------------------------------------------------
 
+@_scheduled_job("wdfw_emergency")
 async def job_wdfw_emergency() -> None:
-    log.info("job_start", extra={"job": "wdfw_emergency"})
     try:
         rules = await fetch_wdfw_emergency()
     except ScraperStructureError as exc:
@@ -149,6 +181,7 @@ async def job_wdfw_emergency() -> None:
             "scraper_structure_failure",
             extra={"source": exc.source, "url": exc.url, "detail": exc.detail},
         )
+        _log_job_done("wdfw_emergency", failed=1, serving="stale_rows")
         return
     except Exception as exc:
         # Existing rows are kept (served stale) — never silently go dark.
@@ -158,6 +191,7 @@ async def job_wdfw_emergency() -> None:
 
     if not rules:
         log.warning("wdfw_emergency_empty_rules", extra={"job": "wdfw_emergency"})
+        _log_job_done("wdfw_emergency", failed=1, serving="stale_rows")
         return
 
     # Build name→water_body_id lookup (names + aliases) for FK resolution
@@ -245,17 +279,15 @@ def _apply_supersession(rules: list[dict]) -> list[str]:
                 closure["closes_fishing"] = False
                 superseded.append(closure.get("title"))
                 break
-    if superseded:
-        log.info("wdfw_emergency_closures_superseded", extra={"titles": superseded})
-    return superseded
+    return superseded  # reported in the job's job_done line
 
 
 # ---------------------------------------------------------------------------
 # InciWeb wildfires — 2-hour
 # ---------------------------------------------------------------------------
 
+@_scheduled_job("inciweb")
 async def job_inciweb() -> None:
-    log.info("job_start", extra={"job": "inciweb"})
     data = await fetch_inciweb()
     if data is None:
         _log_job_done("inciweb", failed=1, serving="stale_cache")
@@ -274,8 +306,8 @@ async def job_inciweb() -> None:
 # NPS park alerts — 2-hour (NOCA + OLYM)
 # ---------------------------------------------------------------------------
 
+@_scheduled_job("nps_alerts")
 async def job_nps_alerts() -> None:
-    log.info("job_start", extra={"job": "nps_alerts"})
     data = await fetch_nps_alerts()
     if data is None:
         _log_job_done("nps_alerts", failed=1, serving="stale_cache")
@@ -295,16 +327,20 @@ async def job_nps_alerts() -> None:
 # NOAA NWRFC river forecasts — 2-hour, per water body
 # ---------------------------------------------------------------------------
 
+@_scheduled_job("noaa_nwrfc")
 async def job_noaa_nwrfc() -> None:
-    log.info("job_start", extra={"job": "noaa_nwrfc"})
     water_bodies = await _water_bodies_with_usgs_ids()
     wrote = 0
     stale: list[str] = []
+    no_forecast: list[str] = []
 
     for wb in water_bodies:
         for usgs_id in (wb.usgs_site_ids or []):
             gauge_id = resolve_gauge_id(usgs_id)
             if not gauge_id:
+                continue
+            if gauge_id in NO_FORECAST_GAUGES:
+                no_forecast.append(gauge_id)
                 continue
             data = await fetch_noaa_nwrfc(gauge_id)
             if data is None:
@@ -320,15 +356,16 @@ async def job_noaa_nwrfc() -> None:
                     )
             wrote += 1
 
-    _log_job_done("noaa_nwrfc", failed=len(stale), records_written=wrote, stale_gauges=stale)
+    _log_job_done("noaa_nwrfc", failed=len(stale), records_written=wrote, stale_gauges=stale,
+                  no_forecast_product=no_forecast)
 
 
 # ---------------------------------------------------------------------------
 # WDFW stocking — daily 3 AM
 # ---------------------------------------------------------------------------
 
+@_scheduled_job("wdfw_stocking")
 async def job_wdfw_stocking() -> None:
-    log.info("job_start", extra={"job": "wdfw_stocking"})
     year = datetime.now(tz=timezone.utc).year
     records = await fetch_wdfw_stocking(year)
     if records is None:
@@ -411,8 +448,8 @@ async def job_wdfw_stocking() -> None:
 # WTA trail reports — daily 3 AM, per water body
 # ---------------------------------------------------------------------------
 
+@_scheduled_job("wta")
 async def job_wta() -> None:
-    log.info("job_start", extra={"job": "wta"})
     water_bodies = await _water_bodies_with_wta_url()
     wrote = 0
     failed = 0
@@ -463,8 +500,8 @@ async def job_wta() -> None:
 # SNOTEL snowpack — daily 3 AM, per water body
 # ---------------------------------------------------------------------------
 
+@_scheduled_job("snotel")
 async def job_snotel() -> None:
-    log.info("job_start", extra={"job": "snotel"})
     water_bodies = await _water_bodies_with_snotel()
     wrote = 0
     failed = 0
@@ -497,8 +534,8 @@ async def job_snotel() -> None:
 # Nightly Tier 1 scorer — 3:30 AM Pacific, all water bodies
 # ---------------------------------------------------------------------------
 
+@_scheduled_job("score_all_water_bodies")
 async def job_score_all_water_bodies() -> None:
-    log.info("job_start", extra={"job": "score_all_water_bodies"})
     from spots.scorer import compute_and_store_score
 
     async with AsyncSessionLocal() as session:
@@ -526,15 +563,12 @@ async def job_score_all_water_bodies() -> None:
 # Annual WDFW regulations re-scrape — December 1, 4 AM Pacific
 # ---------------------------------------------------------------------------
 
+@_scheduled_job("wdfw_regulations")
 async def job_wdfw_regulations() -> None:
-    log.info("job_start", extra={"job": "wdfw_regulations"})
-    try:
-        async with AsyncSessionLocal() as session:
-            async with session.begin():
-                await fetch_and_update_regulations(session)
-        _log_job_done("wdfw_regulations")
-    except Exception:
-        log.exception("wdfw_regulations_job_failed", extra={"job": "wdfw_regulations"})
+    async with AsyncSessionLocal() as session:
+        async with session.begin():
+            await fetch_and_update_regulations(session)
+    _log_job_done("wdfw_regulations")
 
 
 # ---------------------------------------------------------------------------

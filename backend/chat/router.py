@@ -399,8 +399,7 @@ async def _run_agentic_loop(*, messages, handler, conversation, trip, db, candid
     generation_ms = round((time.monotonic() - t_start) * 1000)
     ttft_ms = round((t_first_token - t_start) * 1000) if t_first_token else None
     log.info(
-        f"agentic_loop_complete hops={hops_used} num_tools={len(tools_used)} "
-        f"gen_ms={generation_ms} ttft_ms={ttft_ms} tokens={total_tokens}",
+        "agentic_loop_complete",
         extra={
             "ttft_ms": ttft_ms,
             "hops": hops_used,
@@ -509,7 +508,7 @@ async def chat_endpoint(
     conversation.last_active = datetime.now(tz=timezone.utc)
     await db.commit()
 
-    async def event_stream():
+    async def _turn_events():
         # Drive-time unavailable banner
         if build_result.drive_time_unavailable:
             yield _sse({"type": "drive_time_unavailable"})
@@ -589,13 +588,8 @@ async def chat_endpoint(
                     token_count = chunk.get("token_count", 0)
                     generation_ms = round((time.monotonic() - t_start) * 1000)
                     ttft_ms = round((t_first_token - t_start) * 1000) if t_first_token else None
-                    # Timings are embedded in the message string because the JSON log
-                    # formatter only renders `message` (extra fields are dropped) —
-                    # this keeps the Phase 5 planning/tools/generation split visible.
                     log.info(
-                        f"llm_stream_complete planning_ms={planning_ms} tools_ms={tools_ms} "
-                        f"num_tools={num_tools} gen_ms={generation_ms} ttft_ms={ttft_ms} "
-                        f"tokens={token_count}",
+                        "llm_stream_complete",
                         extra={
                             "ttft_ms": ttft_ms,
                             "planning_ms": planning_ms,
@@ -696,6 +690,18 @@ async def chat_endpoint(
 
         # All turn state durably committed above — safe to signal completion.
         yield _sse({"type": "done"})
+
+    async def event_stream():
+        # The stream outlives the request middleware, so an error mid-turn
+        # would otherwise reach only gunicorn's stderr (not app.log).
+        try:
+            async for evt in _turn_events():
+                yield evt
+        except Exception:
+            log.exception("chat_turn_failed", extra={
+                "trip_id": str(trip.id), "conversation_id": str(conversation.id),
+            })
+            raise
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 

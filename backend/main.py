@@ -3,11 +3,13 @@ import logging.config
 import logging.handlers
 import os
 import sys
+import time
 import uuid
 from contextvars import ContextVar
 
 import pillow_heif
 from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse
 
 # Add the repo root (/opt/flyfish) to sys.path so that `prompts/` is importable
 # as a top-level package from any module under backend/.
@@ -31,7 +33,8 @@ class _RequestIdFilter(logging.Filter):
         return True
 
 
-_LOG_FILE = "/var/log/flyfish/app.log"
+# Overridable so tests (which run as root) never write to the prod log.
+_LOG_FILE = os.environ.get("FLYFISH_LOG_FILE", "/var/log/flyfish/app.log")
 
 LOGGING_CONFIG = {
     "version": 1,
@@ -56,6 +59,15 @@ LOGGING_CONFIG = {
         },
     },
     "root": {"level": "INFO", "handlers": ["stdout", "file"]},
+    "loggers": {
+        # One INFO line per outbound request (~200 per WDFW scrape) and per
+        # scheduler run. Failures are still logged: fetchers emit fetch_failed,
+        # jobs emit job_done / job_degraded, and both libraries log problems at
+        # WARNING or above.
+        "httpx": {"level": "WARNING"},
+        "httpcore": {"level": "WARNING"},
+        "apscheduler": {"level": "WARNING"},
+    },
 }
 
 logging.config.dictConfig(LOGGING_CONFIG)
@@ -92,7 +104,7 @@ async def startup() -> None:
 
     # Register pillow-heif so Pillow can open HEIC/HEIF images natively
     pillow_heif.register_heif_opener()
-    log.info("pillow_heif_registered")
+    log.debug("pillow_heif_registered")
 
     # Elect exactly one gunicorn worker to run the scheduler.
     # pg_try_advisory_lock is non-blocking: the first worker that calls it wins
@@ -142,8 +154,28 @@ async def correlation_id_middleware(request: Request, call_next) -> Response:
     request.state.request_id = request_id
 
     token = _request_id_var.set(request_id)
+    started = time.monotonic()
     try:
-        response = await call_next(request)
+        try:
+            response = await call_next(request)
+        except Exception:
+            # Without this, unhandled errors reached only gunicorn's stderr
+            # (journal, plain text, no request_id) and never app.log.
+            log.exception("request_failed", extra={"method": request.method, "path": request.url.path})
+            response = JSONResponse({"detail": "Internal Server Error"}, status_code=500)
+        # Path only: query strings can carry tokens (magic-link verify).
+        # For streaming responses (chat) this is time to first byte; turn
+        # timing is logged by the chat loop.
+        log.log(
+            logging.WARNING if response.status_code >= 500 else logging.INFO,
+            "request_done",
+            extra={
+                "method": request.method,
+                "path": request.url.path,
+                "status": response.status_code,
+                "response_ms": round((time.monotonic() - started) * 1000),
+            },
+        )
     finally:
         _request_id_var.reset(token)
 
