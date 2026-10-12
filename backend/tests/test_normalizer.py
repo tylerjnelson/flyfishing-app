@@ -207,14 +207,61 @@ class TestNormalizeUsgs:
 # ---------------------------------------------------------------------------
 
 class TestNormalizeAirnow:
+    @staticmethod
+    def _obs(aqi, param="PM2.5", category="Good", age=timedelta(minutes=40), site="Yakima-S 9th St"):
+        """One ziplatlong record, observed `age` ago (reported in PDT like the live API)."""
+        local = datetime.now(tz=timezone.utc).astimezone(timezone(timedelta(hours=-7))) - age
+        return {
+            "dateObserved": local.strftime("%Y-%m-%d"), "hourObserved": local.strftime("%H:00"),
+            "localTimeZone": "PDT", "reportingAreaName": "Yakima", "siteID": "840530779994",
+            "siteName": site, "parameterName": param, "nowcastAQI": aqi,
+            "aqiCategoryName": category, "reportingAgency": "Washington Department of Ecology",
+            "lookupBehavior": "Closest Reading By Pollutant", "consideredMonitors": "All",
+            "lookupBoundary": "50 Miles",
+        }
+
     def test_picks_highest_aqi(self):
-        raw = [
-            {"AQI": 42, "ParameterName": "PM2.5", "Category": {"Name": "Good"}},
-            {"AQI": 85, "ParameterName": "O3", "Category": {"Name": "Moderate"}},
-        ]
+        raw = [self._obs(42), self._obs(85, "OZONE", "Moderate", site="Cheeka Peak")]
         result = normalize_airnow(raw, datetime.now(tz=timezone.utc))
         assert result["aqi"] == 85
-        assert result["pollutant"] == "O3"
+        assert result["category"] == "Moderate"
+        assert result["pollutant"] == "ozone"
+        assert result["site"] == "Cheeka Peak"
+        assert result["observed_at"] is not None
+
+    def test_pipeline_shape(self):
+        """context_builder reads aqi (int), category, pollutant."""
+        result = normalize_airnow([self._obs(160, category="Unhealthy")], datetime.now(tz=timezone.utc))
+        assert {"source", "fetched_at", "aqi", "category", "pollutant", "stale"} <= result.keys()
+        assert result["aqi"] == 160 and isinstance(result["aqi"], int)
+        assert result["category"] == "Unhealthy"
+        assert result["pollutant"] == "PM2.5"
+        assert result["source"] == "airnow" and result["stale"] is False
+
+    def test_no_monitors_envelope_is_no_data(self):
+        raw = {"WebServiceError": [{"Message": "There are no observations available for the requested "
+                                               "latitude/longitude: No observations were found for all "
+                                               "monitors within 50 miles."}]}
+        result = normalize_airnow(raw, datetime.now(tz=timezone.utc))
+        assert result["aqi"] is None and result["category"] is None
+
+    def test_other_error_envelope_raises(self):
+        with pytest.raises(ValueError, match="Invalid API key"):
+            normalize_airnow({"WebServiceError": [{"Message": "Invalid API key"}]}, datetime.now(tz=timezone.utc))
+
+    def test_stale_reading_ignored(self):
+        raw = [self._obs(180, age=timedelta(hours=5)), self._obs(30, "OZONE")]
+        assert normalize_airnow(raw, datetime.now(tz=timezone.utc))["aqi"] == 30
+
+    def test_negative_or_missing_aqi_ignored(self):
+        raw = [self._obs(-1), self._obs(None), self._obs(12)]
+        assert normalize_airnow(raw, datetime.now(tz=timezone.utc))["aqi"] == 12
+
+    def test_observed_at_converts_local_time(self):
+        obs = self._obs(5)
+        obs.update(dateObserved="2026-10-11", hourObserved="19:00", localTimeZone="PDT")
+        fetched = datetime(2026, 10, 12, 2, 40, tzinfo=timezone.utc)
+        assert normalize_airnow([obs], fetched)["observed_at"] == "2026-10-11T19:00:00-07:00"
 
     def test_empty_list(self):
         result = normalize_airnow([], datetime.now(tz=timezone.utc))
@@ -223,6 +270,7 @@ class TestNormalizeAirnow:
     def test_source_field(self):
         result = normalize_airnow([], datetime.now(tz=timezone.utc))
         assert result["source"] == "airnow"
+
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +373,26 @@ async def _capture_usgs_request(monkeypatch, api_key=""):
     monkeypatch.setattr(usgs.settings, "usgs_api_key", api_key)
     await usgs._fetch("12134500")
     return seen
+
+
+async def test_airnow_uses_replacement_endpoint(monkeypatch):
+    """latLong/current/ was retired 2026-10-01 (410); distance is no longer a parameter."""
+    import httpx
+    import conditions.airnow as airnow
+
+    seen = {}
+
+    def handler(request):
+        seen["url"] = request.url
+        return httpx.Response(200, json=[])
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(airnow.httpx, "AsyncClient",
+                        lambda *a, **k: real(*a, transport=httpx.MockTransport(handler), **k))
+    await airnow._fetch(46.6, -120.5)
+    assert seen["url"].path == "/aq/observation/current/ziplatlong/"
+    assert seen["url"].params["latitude"] == "46.6"
+    assert "distance" not in seen["url"].params
 
 
 async def test_usgs_request_params(monkeypatch):

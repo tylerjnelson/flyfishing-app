@@ -1,7 +1,8 @@
 """
 AirNow (EPA) fetcher — real-time, triggered at session open.
 
-Fetches current AQI for a lat/lon within a 25-mile radius.
+Fetches current AQI for a lat/lon: per pollutant, the closest monitor within
+50 miles (AirNow picks the radius; there's no distance parameter).
 Wrapped with the airnow_breaker circuit breaker.
 """
 
@@ -18,7 +19,8 @@ from config import settings
 
 log = logging.getLogger(__name__)
 
-_OBS_URL = "https://www.airnowapi.org/aq/observation/latLong/current/"
+# Replaced /aq/observation/latLong/current/, retired 2026-10-01 (410 Gone).
+_OBS_URL = "https://www.airnowapi.org/aq/observation/current/ziplatlong/"
 _TIMEOUT = httpx.Timeout(connect=5.0, read=15.0, write=5.0, pool=5.0)
 
 
@@ -40,12 +42,11 @@ async def fetch_airnow(lat: float, lon: float) -> dict | None:
 
 
 @airnow_breaker
-async def _fetch(lat: float, lon: float) -> list:
+async def _fetch(lat: float, lon: float) -> list | dict:
     params = {
         "format": "application/json",
         "latitude": lat,
         "longitude": lon,
-        "distance": 25,
         "API_KEY": settings.airnow_api_key,
     }
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:

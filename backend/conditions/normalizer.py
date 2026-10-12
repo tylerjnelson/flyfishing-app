@@ -201,27 +201,64 @@ def normalize_noaa_nws(raw: dict, fetched_at: datetime) -> dict:
     }
 
 
-def normalize_airnow(raw: list, fetched_at: datetime) -> dict:
-    """
-    Normalizes AirNow observation list.  raw is the JSON array from the API.
-    Uses the highest AQI value across all reported pollutants.
-    """
-    aqi = None
-    category = None
-    pollutant = None
-    for obs in raw:
-        val = obs.get("AQI")
-        if val is not None and (aqi is None or val > aqi):
-            aqi = val
-            category = obs.get("Category", {}).get("Name")
-            pollutant = obs.get("ParameterName")
+AIRNOW_MAX_READING_AGE = timedelta(hours=3)
+# AirNow reports local wall-clock time plus a zone abbreviation.
+_AIRNOW_TZ_OFFSETS = {"PST": -8, "PDT": -7, "MST": -7, "MDT": -6, "CST": -6, "CDT": -5,
+                      "EST": -5, "EDT": -4, "AKST": -9, "AKDT": -8, "HST": -10}
+_AIRNOW_POLLUTANTS = {"OZONE": "ozone", "PM2.5": "PM2.5", "PM10": "PM10"}
 
+
+def _airnow_observed_at(obs: dict) -> datetime | None:
+    offset = _AIRNOW_TZ_OFFSETS.get((obs.get("localTimeZone") or "").upper())
+    if offset is None:
+        return None
+    try:
+        local = datetime.strptime(f"{obs['dateObserved']} {obs['hourObserved']}", "%Y-%m-%d %H:%M")
+    except (KeyError, TypeError, ValueError):
+        return None
+    return local.replace(tzinfo=timezone(timedelta(hours=offset)))
+
+
+def normalize_airnow(raw, fetched_at: datetime) -> dict:
+    """
+    Normalizes an AirNow "current observations by lat/long" response
+    (/aq/observation/current/ziplatlong/, which replaced the latLong/current
+    service retired 2026-10-01). raw is one record per pollutant: the closest
+    monitor reporting it within 50 miles. Uses the highest NowCast AQI.
+
+    "No monitors within 50 miles" arrives as HTTP 200 with a WebServiceError
+    envelope; that's a normal no-data result (aqi None). Any other envelope
+    raises ValueError so the fetcher logs it as a failure. Readings older than
+    AIRNOW_MAX_READING_AGE are ignored.
+    """
+    if isinstance(raw, dict):
+        errors = raw.get("WebServiceError") or [{}]
+        message = errors[0].get("Message") or str(raw)
+        if "no observations" not in message.lower():
+            raise ValueError(f"AirNow error: {message}")
+        raw = []
+
+    best = None
+    for obs in raw:
+        aqi = obs.get("nowcastAQI")
+        if not isinstance(aqi, (int, float)) or aqi < 0:
+            continue
+        observed = _airnow_observed_at(obs)
+        if observed is not None and fetched_at - observed > AIRNOW_MAX_READING_AGE:
+            continue
+        if best is None or aqi > best[0]:
+            best = (aqi, obs, observed)
+
+    aqi, obs, observed = best if best else (None, {}, None)
+    pollutant = obs.get("parameterName")
     return {
         "source": "airnow",
         "fetched_at": fetched_at.isoformat(),
-        "aqi": aqi,
-        "category": category,
-        "pollutant": pollutant,
+        "observed_at": observed.isoformat() if observed else None,
+        "aqi": int(aqi) if aqi is not None else None,
+        "category": obs.get("aqiCategoryName"),
+        "pollutant": _AIRNOW_POLLUTANTS.get(pollutant, pollutant),
+        "site": obs.get("siteName"),
         "stale": False,
     }
 
