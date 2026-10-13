@@ -130,6 +130,10 @@ class TestSpotDetail:
                     "min_cfs", "max_cfs", "fishing_regs", "emergency_closures"):
             assert key in d
 
+    def test_legacy_cfs_range_not_exposed(self):
+        d = _spot_detail(_make_spot(min_cfs=700, max_cfs=1500), closures=[])
+        assert d["min_cfs"] is None and d["max_cfs"] is None
+
     def test_closures_serialised(self):
         spot = _make_spot()
         closure = _make_closure(rule_text="Closed", expires=date(2026, 6, 1))

@@ -6,7 +6,7 @@ chat message. Returns a BuildResult containing the assembled Ollama messages
 and session metadata.
 
 Pipeline (§6.3):
-  [1] Hard pre-LLM filters — drive time, active closures
+  [1] Hard pre-LLM filters — drive time, active closures, flood stage
   [2] Tier 2 volatile delta overlay → session_score per candidate (§7.5)
   [3] Variety rotation — 60-day rule (§7.6)
   [4] Response cache check
@@ -31,6 +31,7 @@ from sqlalchemy import select, text
 from chat.response_cache import compute_intake_hash, get_cached_response
 from conditions.airnow import fetch_airnow
 from conditions.cache import write_conditions_cache
+from conditions import flow_reference
 from conditions.normalizer import INTERVAL_REALTIME, compute_conditions_hash
 from conditions.noaa_nws import fetch_noaa_nws
 from conditions import here_budget
@@ -49,6 +50,9 @@ from db.models import (
     Conversation,
     EmergencyClosure,
     FishingSpot,
+    FlowBand,
+    GaugeFloodStage,
+    GaugeFlowNormal,
     Message,
     Note,
     Trip,
@@ -298,41 +302,166 @@ def _species_temp_ceiling(target_species: list[str]) -> float | None:
     return min(ceilings) if ceilings else None
 
 
-def _cfs_range_status(water_body: WaterBody, cfs: float | None) -> str | None:
+async def _load_flow_refs(db, water_bodies: list[WaterBody], target: date) -> dict[str, dict]:
     """
-    "low" / "high" when flow is outside the water body's min/max fishable CFS,
-    else None. Rivers/creeks only.
-
-    A soft penalty since 2026-10-11, no longer a hard filter: most min/max
-    values are hand-entered, not sourced (only 6 rivers come from spec §7.7),
-    and once USGS data started flowing, normal fall low flows hid Pilchuck,
-    Queets and South Fork Hoh from recommendations entirely.
+    Per-gauge flow references for river/creek water bodies (TODO-18), keyed by
+    water body id: {site, bands, normals: {site: smoothed percentiles for
+    target ±7 days}, flood: {site: stages}}. One query per table.
     """
-    if water_body.type not in ("river", "creek") or cfs is None:
-        return None
-    if water_body.min_cfs and cfs < float(water_body.min_cfs):
-        return "low"
-    if water_body.max_cfs and cfs > float(water_body.max_cfs):
-        return "high"
-    return None
+    rivers = [wb for wb in water_bodies if wb.type in ("river", "creek")]
+    if not rivers:
+        return {}
+    ids = list({wb.id for wb in rivers})
+    band_rows = (await db.execute(select(FlowBand).where(FlowBand.water_body_id.in_(ids)))).scalars().all()
+    bands_by_wb: dict[str, list[dict]] = {}
+    for b in band_rows:
+        bands_by_wb.setdefault(str(b.water_body_id), []).append(b.as_dict())
+    sites = {wb.usgs_site_ids[0] for wb in rivers if wb.usgs_site_ids} | {b.gauge_site_id for b in band_rows}
+    if not sites:
+        return {}
+
+    normal_rows = (await db.execute(
+        select(GaugeFlowNormal)
+        .where(GaugeFlowNormal.site_id.in_(sites))
+        .where(GaugeFlowNormal.time_of_year.in_(flow_reference.window_keys(target)))
+    )).scalars().all()
+    by_site: dict[str, dict[str, list[float]]] = {}
+    for r in normal_rows:
+        by_site.setdefault(r.site_id, {})[r.time_of_year] = r.values()
+    normals = {site: flow_reference.smooth_normals(rows, target) for site, rows in by_site.items()}
+
+    flood_rows = (await db.execute(
+        select(GaugeFloodStage).where(GaugeFloodStage.site_id.in_(sites))
+    )).scalars().all()
+    flood = {r.site_id: {"action_ft": r.action_ft, "minor_ft": r.minor_ft} for r in flood_rows}
+
+    refs = {}
+    for wb in rivers:
+        site = wb.usgs_site_ids[0] if wb.usgs_site_ids else None
+        bands = bands_by_wb.get(str(wb.id), [])
+        wb_sites = ({site} if site else set()) | {b["gauge_site_id"] for b in bands}
+        refs[str(wb.id)] = {
+            "site": site,
+            "bands": bands,
+            "normals": {s_: normals[s_] for s_ in wb_sites if normals.get(s_)},
+            "flood": {s_: flood[s_] for s_ in wb_sites if s_ in flood},
+        }
+    return refs
 
 
-def _cfs_range_text(water_body: WaterBody) -> str:
-    lo, hi = water_body.min_cfs, water_body.max_cfs
-    if lo and hi:
-        return f"{int(lo):,}–{int(hi):,} cfs"
-    return f"{int(lo):,}+ cfs" if lo else f"up to {int(hi):,} cfs"
+def _band_sites(flow_refs: dict[str, dict]) -> dict[str, set[str]]:
+    """Band gauges that aren't the water body's own gauge, by water body id."""
+    out = {}
+    for wb_id, ref in flow_refs.items():
+        extra = {b["gauge_site_id"] for b in ref["bands"]} - {ref["site"]}
+        if extra:
+            out[wb_id] = extra
+    return out
+
+
+def _candidate_flow(
+    water_body: WaterBody,
+    usgs_data: dict | None,
+    nwrfc_data: dict | None,
+    departure_time: datetime | None,
+    flow_ref: dict | None,
+    usgs_bands: dict | None = None,
+    nwrfc_bands: dict | None = None,
+) -> dict:
+    """
+    Flow assessment for one river/creek candidate against the references for
+    each gauge it touches (see conditions/flow_reference.py).
+
+    A future trip (>24h out) uses NWRFC forecasts at departure, at the water
+    body's gauge and at band gauges; otherwise current readings. Returns
+    {cfs, delta, warnings, context, flood, flood_text}. flood is "flood"
+    (at/above NWS minor flood stage at any of its gauges: the build drops the
+    spot) or "action" (penalized), else None.
+    """
+    out = {"cfs": None, "delta": 0.0, "warnings": [], "context": [], "flood": None, "flood_text": None}
+    if water_body.type not in ("river", "creek"):
+        return out
+    now = datetime.now(tz=timezone.utc)
+    future = (
+        departure_time is not None
+        and (departure_time - now).total_seconds() > _FUTURE_TRIP_HOURS * 3600
+    )
+    ref = flow_ref or {"site": None, "bands": [], "normals": {}, "flood": {}}
+    site = ref["site"]
+    band_usgs = (usgs_bands or {}).get("gauges") or {}
+    band_fc = (nwrfc_bands or {}).get("gauges") or {}
+
+    # (cfs, stage_ft) per gauge, current or forecast.
+    readings: dict[str, tuple[float | None, float | None]] = {}
+    if future:
+        if nwrfc_data and site:
+            readings[site] = (_nwrfc_cfs_at(nwrfc_data, departure_time),
+                              _nwrfc_value_at(nwrfc_data, departure_time, "stage_ft"))
+        for s_, fc in band_fc.items():
+            readings[s_] = (_nwrfc_cfs_at(fc, departure_time), _nwrfc_value_at(fc, departure_time, "stage_ft"))
+    else:
+        if usgs_data and site:
+            readings[site] = (usgs_data.get("cfs"), usgs_data.get("gauge_height_ft"))
+        for s_, r in band_usgs.items():
+            readings[s_] = ((r or {}).get("cfs"), (r or {}).get("gauge_height_ft"))
+    cfs = readings.get(site, (None, None))[0] if site else None
+    if cfs is None and not future and usgs_data:
+        cfs = usgs_data.get("cfs")
+    out["cfs"] = cfs
+
+    for s_, (_, stage) in readings.items():
+        status = flow_reference.flood_status(stage, ref["flood"].get(s_))
+        if status == "flood" or (status == "action" and out["flood"] is None):
+            stages = ref["flood"][s_]
+            level = stages["minor_ft"] if status == "flood" else stages["action_ft"]
+            when = "forecast at departure" if future else "now"
+            out["flood"] = status
+            out["flood_text"] = (
+                f"{'Flood' if status == 'flood' else 'Near flood'}: gauge {s_} at {stage:.1f} ft {when} "
+                f"(NWS {'flood' if status == 'flood' else 'action'} stage {level:.1f} ft)"
+            )
+    if out["flood"] == "action":
+        out["delta"] += flow_reference.FLOOD_ACTION_PENALTY
+        out["warnings"].append(out["flood_text"] + " — dangerous wading, likely blown out")
+
+    # Normals describe the USGS gauge's own record. When its reading came from
+    # the NWPS fallback the USGS gauge is discontinued, and its record can be
+    # from another era: Naches 12494000 ended in 1979, before today's
+    # reservoir operations, so 1,490 cfs read as the 97th percentile.
+    own_normals = ref["normals"].get(site) if site else None
+    if (usgs_data or {}).get("provider") == "noaa_nwps_observed":
+        own_normals = None
+    target = (departure_time or now).date()
+    delta, warnings, context = flow_reference.assess_flow(
+        cfs=cfs,
+        normals=own_normals,
+        target=target,
+        bands=ref["bands"],
+        band_cfs={s_: r[0] for s_, r in readings.items()},
+    )
+    out["delta"] += delta
+    out["warnings"] += warnings
+    out["context"] = context
+    return out
 
 
 # ---------------------------------------------------------------------------
 # [1.5] Real-time conditions fetch — session open (§4.1)
 # ---------------------------------------------------------------------------
 
-async def _fetch_and_cache_realtime(fishing_spots: list, water_bodies: list[WaterBody]) -> None:
+async def _fetch_and_cache_realtime(
+    fishing_spots: list,
+    water_bodies: list[WaterBody],
+    band_sites: dict[str, set[str]] | None = None,
+) -> None:
     """
     Fetch USGS, NOAA NWS, and AirNow data for candidate spots in parallel.
     Writes fresh rows to conditions_cache keyed by water_body_id (pruned per
     source TTL — see conditions/cache.py).
+
+    band_sites ({water_body_id: {site}}) are the gauges published fishable
+    ranges were written for, when not the water body's own gauge. Each is
+    fetched once and cached per water body as source "usgs_bands".
     """
     wb_by_id = {str(wb.id): wb for wb in water_bodies}
 
@@ -344,13 +473,25 @@ async def _fetch_and_cache_realtime(fishing_spots: list, water_bodies: list[Wate
     ]
     geo_spots = [fs for fs in fishing_spots if fs.latitude is not None and fs.longitude is not None]
 
-    if not usgs_pairs and not geo_spots:
+    candidate_wb_ids = {str(fs.water_body_id) for fs in fishing_spots}
+    band_sites = {k: v for k, v in (band_sites or {}).items() if k in candidate_wb_ids}
+    band_site_list = sorted(set().union(*band_sites.values())) if band_sites else []
+
+    if not usgs_pairs and not geo_spots and not band_site_list:
         return
 
     usgs_results = await asyncio.gather(
         *[fetch_usgs_gauge(wb.usgs_site_ids[0]) for _, wb in usgs_pairs],
         return_exceptions=True,
     )
+    band_results = await asyncio.gather(
+        *[fetch_usgs_gauge(site) for site in band_site_list],
+        return_exceptions=True,
+    )
+    band_by_site = {
+        site: r for site, r in zip(band_site_list, band_results)
+        if r is not None and not isinstance(r, BaseException)
+    }
     nws_results = await asyncio.gather(
         *[fetch_noaa_nws(float(fs.latitude), float(fs.longitude)) for fs in geo_spots],
         return_exceptions=True,
@@ -366,6 +507,10 @@ async def _fetch_and_cache_realtime(fishing_spots: list, water_bodies: list[Wate
             to_write.append((wb.id, "usgs", data))
         elif isinstance(data, BaseException):
             log.warning("realtime_fetch_error", extra={"source": "usgs", "wb": wb.name, "err": str(data)})
+    for wb_id, sites in band_sites.items():
+        gauges = {site: band_by_site[site] for site in sites if site in band_by_site}
+        if gauges:
+            to_write.append((uuid.UUID(wb_id), "usgs_bands", {"gauges": gauges}))
     for fs, data in zip(geo_spots, nws_results):
         if data is not None and not isinstance(data, BaseException):
             to_write.append((fs.water_body_id, "noaa_nws", data))
@@ -381,7 +526,8 @@ async def _fetch_and_cache_realtime(fishing_spots: list, water_bodies: list[Wate
     # here so one summary line shows how degraded this session's conditions are.
     failed = {
         src: sum(1 for r in results if r is None or isinstance(r, BaseException))
-        for src, results in (("usgs", usgs_results), ("noaa_nws", nws_results), ("airnow", airnow_results))
+        for src, results in (("usgs", usgs_results), ("usgs_bands", band_results),
+                             ("noaa_nws", nws_results), ("airnow", airnow_results))
     }
     if any(failed.values()):
         log.warning("realtime_conditions_degraded", extra={"failed": failed, "written": len(to_write)})
@@ -396,7 +542,7 @@ async def _fetch_and_cache_realtime(fishing_spots: list, water_bodies: list[Wate
 
     log.info(
         "realtime_conditions_fetched",
-        extra={"usgs_count": len(usgs_pairs), "nws_count": len(geo_spots),
+        extra={"usgs_count": len(usgs_pairs), "usgs_band_count": len(band_site_list), "nws_count": len(geo_spots),
                "airnow_count": len(geo_spots), "written": len(to_write)},
     )
 
@@ -420,16 +566,21 @@ def _sum_7day_precip_estimate(daily_periods: list[dict]) -> float:
 
 
 def _nwrfc_cfs_at(nwrfc_data: dict, departure_time: datetime) -> float | None:
+    return _nwrfc_value_at(nwrfc_data, departure_time, "flow_cfs")
+
+
+def _nwrfc_value_at(nwrfc_data: dict, departure_time: datetime, key: str) -> float | None:
+    """Forecast `key` (flow_cfs / stage_ft) at the entry nearest departure (within 6h)."""
     forecasts = (nwrfc_data or {}).get("forecast") or []
     best_cfs: float | None = None
     best_diff: float | None = None
     for entry in forecasts:
         valid_str = entry.get("validTime")
-        # flow_cfs is set by normalize_noaa_nwrfc from the series metadata.
-        # Raw "secondary" is stage, not flow, at some gauges (AUBW1/TOLW1/NISW1),
-        # so never fall back to it; rows cached before 2026-10-11 lack flow_cfs
-        # and are simply ignored until the 2-hourly refresh.
-        flow_cfs = entry.get("flow_cfs")
+        # flow_cfs / stage_ft are set by normalize_noaa_nwrfc from the series
+        # metadata. Raw "secondary" is stage, not flow, at some gauges
+        # (AUBW1/TOLW1/NISW1), so never fall back to it; rows cached before a
+        # field existed are simply ignored until the 2-hourly refresh.
+        flow_cfs = entry.get(key)
         if valid_str is None or flow_cfs is None:
             continue
         try:
@@ -479,15 +630,18 @@ def _compute_volatile_delta(
     wta_data: dict | None = None,
     spot_lat: float | None = None,
     spot_lon: float | None = None,
+    flow: dict | None = None,
 ) -> tuple[float, list[str]]:
     """
     Compute signed volatile delta per §7.5. Returns (delta, warnings).
     delta is added to water_body.score to produce session_score (never written back).
     warnings are surfaced in the conditions block for the LLM.
 
-    Hard filters (active closures) are handled separately. Everything else —
-    out-of-range flow, wildfire, alpine access, AQI, turbidity, temp — is a
-    scored penalty here so the LLM can communicate the issue to the angler.
+    Hard filters (active closures, flood stage) are handled separately.
+    Everything else — flow vs. its references, wildfire, alpine access, AQI,
+    turbidity, temp — is a scored penalty here so the LLM can communicate the
+    issue to the angler. flow is _candidate_flow()'s result; computed here
+    without references when the caller has none.
     """
     delta = 0.0
     warnings: list[str] = []
@@ -528,37 +682,10 @@ def _compute_volatile_delta(
             warnings.append(f"Early season at elevation ({elev:,} ft) — access uncertain")
 
     if water_body.type in ("river", "creek"):
-        cfs: float | None = None
-        if (
-            nwrfc_data
-            and departure_time is not None
-            and (departure_time - now).total_seconds() > _FUTURE_TRIP_HOURS * 3600
-        ):
-            cfs = _nwrfc_cfs_at(nwrfc_data, departure_time)
-        elif usgs_data:
-            cfs = usgs_data.get("cfs")
-
-        range_status = _cfs_range_status(water_body, cfs)
-        if range_status == "low":
-            delta -= 2.0
-            warnings.append(
-                f"Low flow: {cfs:,.0f} cfs, below the typical fishable range ({_cfs_range_text(water_body)})"
-            )
-        elif range_status == "high":
-            delta -= 2.5
-            warnings.append(
-                f"High flow: {cfs:,.0f} cfs, above the typical fishable range "
-                f"({_cfs_range_text(water_body)}) — likely blown out"
-            )
-
-        if cfs is not None and water_body.min_cfs and water_body.max_cfs:
-            ideal = (float(water_body.min_cfs) + float(water_body.max_cfs)) / 2
-            if ideal > 0:
-                pct_off = abs(cfs - ideal) / ideal
-                if pct_off <= 0.10:
-                    delta += 1.0
-                elif pct_off <= 0.25:
-                    delta += 0.5
+        if flow is None:
+            flow = _candidate_flow(water_body, usgs_data, nwrfc_data, departure_time, None)
+        delta += flow["delta"]
+        warnings.extend(flow["warnings"])
 
         if usgs_data:
             trend = usgs_data.get("trend")
@@ -825,6 +952,9 @@ def _render_spot_conditions_lines(
         forecast_cfs = _nwrfc_cfs_at(nwrfc, departure_time)
         if forecast_cfs is not None:
             lines.append(f"Forecast flow at departure: {forecast_cfs:.0f} CFS")
+    # Flow vs. this gauge's history and any published wade/float ranges, so the
+    # model can say e.g. "good for wading, too low to float" (TODO-18).
+    lines.extend(c.get("flow_context") or [])
     if temp is not None:
         lines.append(f"Water temp: {temp:.1f}°F")
     if turb is not None:
@@ -1436,8 +1566,11 @@ async def build_context(
         water_bodies = [wb for _, wb in pairs]
         water_body_ids = [wb.id for wb in water_bodies]
 
+        # Per-gauge flow references (normals, published ranges, flood stages)
+        flow_refs = await _load_flow_refs(db, water_bodies, departure_time.date())
+
         # Real-time conditions fetch
-        await _fetch_and_cache_realtime(fishing_spots, water_bodies)
+        await _fetch_and_cache_realtime(fishing_spots, water_bodies, _band_sites(flow_refs))
 
         # Active emergency closures
         today_date = date.today()
@@ -1492,16 +1625,37 @@ async def build_context(
         for c in cond_result.all():
             cond_by[(str(c.water_body_id), c.source)] = c.data
 
-        # Apply hard filters — only active closures. (Out-of-range CFS became a
-        # soft penalty in _compute_volatile_delta on 2026-10-11.)
-        # permit_required is NOT a hard filter; it surfaces as an LLM advisory
-        # (wildfire, alpine, AQI, turbidity, temp are also soft penalties)
+        # Flow assessment per river/creek water body (also decides the flood gate)
+        flow_by_wb: dict[str, dict] = {}
+        for wb in {wb.id: wb for wb in water_bodies}.values():
+            wb_id = str(wb.id)
+            if wb.type in ("river", "creek"):
+                flow_by_wb[wb_id] = _candidate_flow(
+                    wb,
+                    cond_by.get((wb_id, "usgs")),
+                    cond_by.get((wb_id, "noaa_nwrfc")),
+                    departure_time,
+                    flow_refs.get(wb_id),
+                    usgs_bands=cond_by.get((wb_id, "usgs_bands")),
+                    nwrfc_bands=cond_by.get((wb_id, "noaa_nwrfc_bands")),
+                )
+
+        # Apply hard filters — active closures, and rivers at/above NWS flood
+        # stage (now, or forecast at departure). Out-of-range CFS is a soft
+        # penalty (since 2026-10-11); so are permit_required (an LLM advisory),
+        # wildfire, alpine, AQI, turbidity and temp.
         filtered_pairs: list[tuple] = []
+        flooded: set[str] = set()
         for fs, wb in pairs:
             wb_id = str(wb.id)
             if _has_active_closure(wb.name, active_closures, water_body_id=wb.id):
                 continue
+            if (flow_by_wb.get(wb_id) or {}).get("flood") == "flood":
+                flooded.add(wb.name)
+                continue
             filtered_pairs.append((fs, wb))
+        if flooded:
+            log.info("flood_gated", extra={"water_bodies": sorted(flooded)})
 
         # Drive-time filter — parallel HERE calls
         drive_time_unavailable = False
@@ -1577,6 +1731,7 @@ async def build_context(
                     "wta": cond_by.get((wb_id, "wta")),
                     "airnow": cond_by.get((wb_id, "airnow")),
                     "snotel": cond_by.get((wb_id, "snotel")),
+                    "flow": flow_by_wb.get(wb_id),
                 })
         else:
             for fs, wb in filtered_pairs:
@@ -1593,6 +1748,7 @@ async def build_context(
                     "wta": cond_by.get((wb_id, "wta")),
                     "airnow": cond_by.get((wb_id, "airnow")),
                     "snotel": cond_by.get((wb_id, "snotel")),
+                    "flow": flow_by_wb.get(wb_id),
                 })
 
         # --------------------------------------------------------------
@@ -1610,6 +1766,7 @@ async def build_context(
                 wta_data=c.get("wta"),
                 spot_lat=float(fs.latitude) if fs.latitude is not None else None,
                 spot_lon=float(fs.longitude) if fs.longitude is not None else None,
+                flow=c.get("flow"),
             )
             if fs.permit_required:
                 permit_detail = fs.permit_notes or (fs.permit_url or "")
@@ -1644,6 +1801,7 @@ async def build_context(
                     if c["fishing_spot"].last_visited else None
                 ),
                 "warnings": c.get("warnings") or [],
+                "flow_context": (c.get("flow") or {}).get("context") or [],
                 "conditions": {
                     "usgs": c["usgs"],
                     "noaa_nws": c["nws"],

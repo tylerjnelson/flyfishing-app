@@ -137,12 +137,35 @@ async def test_nwrfc_skips_gauges_without_forecast_product(caplog):
     wbs = [SimpleNamespace(id=uuid.uuid4(), name="Queets River", usgs_site_ids=["12040500"])]  # QUEW1
     fetch = AsyncMock()
     with patch.object(sched, "_water_bodies_with_usgs_ids", AsyncMock(return_value=wbs)), \
+         patch.object(sched, "_flow_bands", AsyncMock(return_value=[])), \
          patch.object(sched, "fetch_noaa_nwrfc", fetch), caplog.at_level(logging.INFO):
         await sched.job_noaa_nwrfc()
     fetch.assert_not_called()
     (done,) = _msgs(caplog, "job_done")
     assert done.no_forecast_product == ["QUEW1"]
     assert not _msgs(caplog, "job_stale_fallback")
+
+
+async def test_nwrfc_fetches_band_gauge_forecasts(caplog):
+    """Yakima's published range is for Umtanum (UMTW1), not its own gauge (no LID)."""
+    import conditions.scheduler as sched
+    from types import SimpleNamespace
+    import uuid
+    wb = SimpleNamespace(id=uuid.uuid4(), name="Yakima Basin watershed", usgs_site_ids=["12500450"])
+    bands = [SimpleNamespace(water_body_id=wb.id, gauge_site_id="12484500")] * 2  # wade + float
+    fetch = AsyncMock(return_value={"forecast": [{"flow_cfs": 900.0}]})
+    write = AsyncMock()
+    with patch.object(sched, "_water_bodies_with_usgs_ids", AsyncMock(return_value=[wb])), \
+         patch.object(sched, "_flow_bands", AsyncMock(return_value=bands)), \
+         patch.object(sched, "fetch_noaa_nwrfc", fetch), \
+         patch.object(sched, "AsyncSessionLocal", _fake_session_factory()), \
+         patch.object(sched, "write_conditions_cache", write), caplog.at_level(logging.INFO):
+        await sched.job_noaa_nwrfc()
+    fetch.assert_awaited_once_with("UMTW1")
+    kwargs = write.await_args.kwargs
+    assert kwargs["source"] == "noaa_nwrfc_bands" and set(kwargs["data"]["gauges"]) == {"12484500"}
+    (done,) = _msgs(caplog, "job_done")
+    assert done.band_rows_written == 1
 
 
 # ---------------------------------------------------------------------------

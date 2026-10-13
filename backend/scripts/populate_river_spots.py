@@ -30,8 +30,8 @@ import psycopg2.extras
 # Each entry:
 #   name         — must match water_bodies.name exactly
 #   lat/lon      — representative point (also used for fishing_spot coords)
-#   min_cfs      — lower CFS hard filter (fly fishing viable floor)
-#   max_cfs      — upper CFS hard filter (blown out ceiling)
+#   min_cfs      — legacy hand-entered range; nothing scores on it since
+#   max_cfs        migration 0016 (sourced, per-gauge ranges live in flow_bands)
 #   spot_name    — named fishing_spot (primary public access)
 #   county       — set on water_body if currently null
 #   usgs_ids     — set usgs_site_ids if not already populated

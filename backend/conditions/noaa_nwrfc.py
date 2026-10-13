@@ -32,7 +32,7 @@ _TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=5.0, pool=5.0)
 # ("Forecasts are not available. Only observed stages are available for this
 # point." in the gauge metadata, checked 2026-10-12). The forecast job skips
 # them; they still serve the observed-flow fallback.
-NO_FORECAST_GAUGES = frozenset({"QUEW1", "MONW1"})
+NO_FORECAST_GAUGES = frozenset({"QUEW1", "MONW1", "HORW1"})
 
 _USGS_TO_NWRFC_LID: dict[str, str] = {
     # --- Validated 2026-04-10 against NWPS API ---
@@ -58,8 +58,18 @@ _USGS_TO_NWRFC_LID: dict[str, str] = {
     "12494000": "NACW1",   # Naches River near Naches
     "14113000": "PITW1",   # Klickitat River near Pitt
     "12040500": "QUEW1",   # Queets River near Clearwater
-    # Note: Sauk (12189500), Hoh (12041200), Sol Duc (12044900) have no NWPS LID —
-    # NOAA does not issue forecasts for these rivers. USGS real-time still works.
+    # --- Validated 2026-10-13 (NWPS gauges listing, WA bbox; usgsId from
+    # gauge metadata). The 04-13 note that Sauk and Hoh had no LID was wrong:
+    # the ?usgsId= filter missed them. HORW1 has flood metadata slots but no
+    # forecast. UMTW1 / WCHW1 are the gauges published fishable ranges were
+    # written for (flow_bands), not any water body's own gauge.
+    "12189500": "SAKW1",   # Sauk River near Sauk
+    "12186000": "WCHW1",   # Sauk River above White Chuck River
+    "12041200": "HORW1",   # Hoh River near Forks (US 101)
+    "12045500": "ELWW1",   # Elwha River at McDonald Bridge
+    "12167000": "ARGW1",   # North Fork Stillaguamish River near Arlington
+    "12484500": "UMTW1",   # Yakima River at Umtanum
+    # Sol Duc (12044900) has no NWPS gauge.
 }
 
 

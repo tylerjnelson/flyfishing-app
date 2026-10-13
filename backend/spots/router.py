@@ -63,8 +63,12 @@ def _spot_detail(wb, closures: list) -> dict:
         "permit_required": wb.permit_required,
         "permit_url": wb.permit_url,
         "species_primary": wb.species_primary or [],
-        "min_cfs": wb.min_cfs,
-        "max_cfs": wb.max_cfs,
+        # The legacy hand-entered range (water_bodies.min/max_cfs) is no longer
+        # used: sourced ranges are per gauge, with wade/float modes (flow_bands,
+        # TODO-18). Null hides the SpotDetail "X–Y CFS ideal" badge until the
+        # frontend shows flow_bands.
+        "min_cfs": None,
+        "max_cfs": None,
         "min_temp_f": float(wb.min_temp_f) if wb.min_temp_f is not None else None,
         "max_temp_f": float(wb.max_temp_f) if wb.max_temp_f is not None else None,
         "fishing_regs": wb.fishing_regs,

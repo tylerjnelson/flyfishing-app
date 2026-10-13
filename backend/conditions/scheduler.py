@@ -36,6 +36,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from config import settings
 from conditions.cache import write_conditions_cache
 from conditions.fetch_errors import log_fetch_failure
+from conditions.gauge_reference import REFRESH_AFTER, fetch_flood_stages, fetch_flow_normals
 from conditions.noaa_nwrfc import NO_FORECAST_GAUGES, fetch_noaa_nwrfc, resolve_gauge_id
 from conditions.inciweb import fetch_inciweb
 from conditions.nps_alerts import fetch_nps_alerts
@@ -45,7 +46,15 @@ from conditions.wdfw_regulations import fetch_and_update_regulations
 from conditions.wdfw_stocking import fetch_wdfw_stocking
 from conditions.wta_scraper import fetch_wta_reports
 from db.connection import AsyncSessionLocal
-from db.models import ConditionsCache, EmergencyClosure, StockingEvent, WaterBody
+from db.models import (
+    ConditionsCache,
+    EmergencyClosure,
+    FlowBand,
+    GaugeFloodStage,
+    GaugeFlowNormal,
+    StockingEvent,
+    WaterBody,
+)
 from exceptions import ScraperStructureError
 
 log = logging.getLogger(__name__)
@@ -148,6 +157,15 @@ def start_scheduler() -> None:
         trigger=CronTrigger(hour=3, minute=30, timezone="America/Los_Angeles"),
         id="score_all_spots",
         replace_existing=True,
+    )
+
+    # --- Weekly Sunday 4 AM Pacific + startup — gauge flow normals / flood stages ---
+    scheduler.add_job(
+        job_gauge_reference,
+        trigger=CronTrigger(day_of_week="sun", hour=4, minute=0, timezone="America/Los_Angeles"),
+        id="gauge_reference",
+        replace_existing=True,
+        next_run_time=datetime.now(tz=timezone.utc),  # gauges refreshed <6 days ago are skipped
     )
 
     # --- Annual December 1 — WDFW regulations re-scrape ---
@@ -356,8 +374,114 @@ async def job_noaa_nwrfc() -> None:
                     )
             wrote += 1
 
-    _log_job_done("noaa_nwrfc", failed=len(stale), records_written=wrote, stale_gauges=stale,
-                  no_forecast_product=no_forecast)
+    # Forecasts at the gauges published fishable ranges were written for
+    # (flow_bands), when that isn't the water body's own gauge, so a future
+    # trip is checked on the right gauge. One row per water body.
+    band_gauges: dict = {}
+    bands = await _flow_bands()
+    own = {str(wb.id): set(wb.usgs_site_ids or []) for wb in water_bodies}
+    for band in bands:
+        if band.gauge_site_id not in own.get(str(band.water_body_id), set()):
+            band_gauges.setdefault(band.water_body_id, set()).add(band.gauge_site_id)
+    fetched: dict[str, dict | None] = {}
+    band_rows = 0
+    for wb_id, sites in band_gauges.items():
+        gauges = {}
+        for site in sorted(sites):
+            gauge_id = resolve_gauge_id(site)
+            if not gauge_id or gauge_id in NO_FORECAST_GAUGES:
+                continue
+            if gauge_id not in fetched:
+                fetched[gauge_id] = await fetch_noaa_nwrfc(gauge_id)
+                if fetched[gauge_id] is None:
+                    stale.append(gauge_id)
+            if fetched[gauge_id] is not None:
+                gauges[site] = fetched[gauge_id]
+        if gauges:
+            async with AsyncSessionLocal() as session:
+                async with session.begin():
+                    await write_conditions_cache(
+                        session, water_body_id=wb_id, source="noaa_nwrfc_bands", data={"gauges": gauges}
+                    )
+            band_rows += 1
+
+    _log_job_done("noaa_nwrfc", failed=len(stale), records_written=wrote, band_rows_written=band_rows,
+                  stale_gauges=stale, no_forecast_product=no_forecast)
+
+
+# ---------------------------------------------------------------------------
+# Gauge references (TODO-18) — weekly + startup: USGS flow normals, NWS flood
+# stages. Each gauge is refreshed at most every REFRESH_AFTER (6 days).
+# ---------------------------------------------------------------------------
+
+@_scheduled_job("gauge_reference")
+async def job_gauge_reference() -> None:
+    now = datetime.now(tz=timezone.utc)
+    async with AsyncSessionLocal() as session:
+        wbs = (await session.execute(
+            select(WaterBody.usgs_site_ids).where(WaterBody.type.in_(("river", "creek")))
+        )).scalars().all()
+        sites = {ids[0] for ids in wbs if ids}
+        sites |= set((await session.execute(select(FlowBand.gauge_site_id))).scalars().all())
+        fresh_normals = set((await session.execute(
+            select(GaugeFlowNormal.site_id)
+            .where(GaugeFlowNormal.loaded_at > now - REFRESH_AFTER)
+            .distinct()
+        )).scalars().all())
+        fresh_flood = set((await session.execute(
+            select(GaugeFloodStage.site_id).where(GaugeFloodStage.loaded_at > now - REFRESH_AFTER)
+        )).scalars().all())
+
+    loaded = skipped = 0
+    no_normals: list[str] = []
+    failed: list[str] = []
+    flood_loaded = 0
+    for site in sorted(sites):
+        if site in fresh_normals:
+            skipped += 1
+        else:
+            try:
+                rows = await fetch_flow_normals(site)
+            except Exception as exc:
+                log_fetch_failure("usgs_normals", exc, site_id=site)
+                failed.append(site)
+                rows = None
+            if rows == []:
+                no_normals.append(site)  # e.g. 12167400: discontinued, no stats
+            elif rows:
+                async with AsyncSessionLocal() as session:
+                    async with session.begin():
+                        await session.execute(delete(GaugeFlowNormal).where(GaugeFlowNormal.site_id == site))
+                        session.add_all([
+                            GaugeFlowNormal(
+                                site_id=site, time_of_year=r["time_of_year"],
+                                p05=r["values"][0], p10=r["values"][1], p25=r["values"][2],
+                                p50=r["values"][3], p75=r["values"][4], p90=r["values"][5],
+                                p95=r["values"][6], sample_count=r["sample_count"], loaded_at=now,
+                            )
+                            for r in rows
+                        ])
+                loaded += 1
+
+        lid = resolve_gauge_id(site)
+        if not lid or site in fresh_flood:
+            continue
+        try:
+            stages = await fetch_flood_stages(lid)
+        except Exception as exc:
+            log_fetch_failure("nwps_flood_stages", exc, gauge_id=lid)
+            failed.append(lid)
+            continue
+        async with AsyncSessionLocal() as session:
+            async with session.begin():
+                await session.execute(delete(GaugeFloodStage).where(GaugeFloodStage.site_id == site))
+                # A row even when NWS publishes no stages, so the gauge counts
+                # as fresh and isn't re-checked on every restart.
+                session.add(GaugeFloodStage(site_id=site, nwps_lid=lid, loaded_at=now, **(stages or {})))
+                flood_loaded += bool(stages)
+
+    _log_job_done("gauge_reference", failed=len(failed), normals_loaded=loaded, normals_fresh=skipped,
+                  no_normals=no_normals, flood_stages_loaded=flood_loaded, failed_ids=failed)
 
 
 # ---------------------------------------------------------------------------
@@ -589,6 +713,11 @@ async def _mark_stale(water_body_id, source: str) -> None:
             row = result.scalar_one_or_none()
             if row and isinstance(row.data, dict):
                 row.data = {**row.data, "stale": True}
+
+
+async def _flow_bands() -> list[FlowBand]:
+    async with AsyncSessionLocal() as session:
+        return list((await session.execute(select(FlowBand))).scalars().all())
 
 
 async def _water_bodies_with_usgs_ids() -> list[WaterBody]:

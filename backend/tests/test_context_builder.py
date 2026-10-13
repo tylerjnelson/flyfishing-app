@@ -3,7 +3,7 @@ Context builder unit tests — Phase 5 Chunk 5.
 
 Tests cover the pure helper functions extracted from build_context():
   - _has_active_closure     → emergency closure filter
-  - _cfs_range_status       → out-of-range flow (soft penalty since 2026-10-11)
+  - _candidate_flow         → flow vs. per-gauge references; flood-stage gate
   - _apply_variety_rotation → 60-day fresh-spot rule
   - _wildfire_near_spot     → 25 km proximity gate (used as soft penalty)
 
@@ -25,7 +25,8 @@ import pytest
 
 from chat.context_builder import (
     _apply_variety_rotation,
-    _cfs_range_status,
+    _band_sites,
+    _candidate_flow,
     _compute_volatile_delta,
     _filter_excluded,
     _has_active_closure,
@@ -147,51 +148,127 @@ class TestHasActiveClosure:
 
 
 # ---------------------------------------------------------------------------
-# _cfs_range_status + out-of-range flow as a soft penalty (2026-10-11)
+# _candidate_flow — flow vs. per-gauge references (TODO-18)
 # ---------------------------------------------------------------------------
 
-class TestCfsRangeStatus:
-    def test_within_range(self):
-        assert _cfs_range_status(make_spot(type="river", min_cfs=50, max_cfs=500), 200) is None
-
-    def test_low_and_high(self):
-        spot = make_spot(type="river", min_cfs=100, max_cfs=500)
-        assert _cfs_range_status(spot, 40) == "low"
-        assert _cfs_range_status(spot, 600) == "high"
-
-    def test_one_sided_thresholds(self):
-        assert _cfs_range_status(make_spot(type="river", min_cfs=80, max_cfs=None), 65) == "low"
-        assert _cfs_range_status(make_spot(type="river", min_cfs=None, max_cfs=300), 400) == "high"
-
-    def test_lake_and_missing_cfs_never_flagged(self):
-        assert _cfs_range_status(make_spot(type="lake", min_cfs=100, max_cfs=500), 0) is None
-        assert _cfs_range_status(make_spot(type="river", min_cfs=100, max_cfs=500), None) is None
+_NORMALS = {5: 100.0, 10: 150.0, 25: 300.0, 50: 500.0, 75: 800.0, 90: 1500.0, 95: 2500.0}
+_YAKIMA_BANDS = [
+    {"gauge_site_id": "12484500", "gauge_name": "Yakima River at Umtanum", "mode": "wade",
+     "min_cfs": 700, "max_cfs": 1500, "source": "Emerald Water Anglers"},
+    {"gauge_site_id": "12484500", "gauge_name": "Yakima River at Umtanum", "mode": "float",
+     "min_cfs": 1000, "max_cfs": 3500, "source": "Emerald Water Anglers"},
+]
 
 
-class TestOutOfRangeFlowIsSoft:
-    """Pilchuck at 65 cfs (min 80) used to be dropped from recommendations."""
+def _ref(bands=(), flood=None, normals=_NORMALS, site="12500450"):
+    return {"site": site, "bands": list(bands), "normals": {site: normals} if normals else {},
+            "flood": flood or {}}
 
-    def _delta(self, spot, cfs):
-        return _compute_volatile_delta(spot, {"cfs": cfs}, None, None, [])
 
-    def test_low_flow_penalized_and_explained(self):
-        spot = make_spot(type="river", min_cfs=80, max_cfs=600, min_temp_f=None, is_alpine=False)
-        delta, warnings = self._delta(spot, 65)
-        in_range, _ = self._delta(spot, 300)
-        assert delta < in_range
-        assert any("Low flow: 65 cfs" in w and "80–600 cfs" in w for w in warnings)
+def _bands_reading(cfs, stage=None):
+    return {"gauges": {"12484500": {"cfs": cfs, "gauge_height_ft": stage}}}
 
-    def test_high_flow_penalized_more_than_low(self):
-        spot = make_spot(type="river", min_cfs=80, max_cfs=600, min_temp_f=None, is_alpine=False)
-        low, _ = self._delta(spot, 65)
-        high, warnings = self._delta(spot, 900)
-        assert high < low
-        assert any("High flow: 900 cfs" in w and "blown out" in w for w in warnings)
 
-    def test_build_no_longer_hard_filters_on_cfs(self):
+class TestCandidateFlow:
+    RIVER = make_spot(type="river", min_temp_f=None, is_alpine=False)
+
+    def test_band_on_its_own_gauge_not_ours(self):
+        """Union Gap at 1,800 is normal; Umtanum at 913 is in the wading range."""
+        out = _candidate_flow(self.RIVER, {"cfs": 1800}, None, None, _ref(_YAKIMA_BANDS),
+                              usgs_bands=_bands_reading(913))
+        assert out["delta"] > 0 and out["warnings"] == []
+        text = "\n".join(out["context"])
+        assert "Wading 700–1,500 cfs: in range" in text
+        assert "Floating 1,000–3,500 cfs: below range" in text
+        assert "Yakima River at Umtanum (913 cfs)" in text
+
+    def test_best_mode_scores_not_worst(self):
+        """In the float range but above the wading range: no penalty (wade/float is the angler's call)."""
+        in_both = _candidate_flow(self.RIVER, {"cfs": 1800}, None, None, _ref(_YAKIMA_BANDS),
+                                  usgs_bands=_bands_reading(1200))
+        float_only = _candidate_flow(self.RIVER, {"cfs": 4000}, None, None, _ref(_YAKIMA_BANDS),
+                                     usgs_bands=_bands_reading(2500))
+        assert float_only["delta"] == in_both["delta"] > 0
+        assert "Wading 700–1,500 cfs: above range" in "\n".join(float_only["context"])
+
+    def test_outside_every_band_penalized_high_more_than_low(self):
+        low = _candidate_flow(self.RIVER, {"cfs": 400}, None, None, _ref(_YAKIMA_BANDS),
+                              usgs_bands=_bands_reading(300))
+        high = _candidate_flow(self.RIVER, {"cfs": 6000}, None, None, _ref(_YAKIMA_BANDS),
+                               usgs_bands=_bands_reading(5000))
+        assert high["delta"] < low["delta"] < 0
+        assert any("Low flow: 300 cfs at Yakima River at Umtanum" in w for w in low["warnings"])
+        assert any("blown out" in w for w in high["warnings"])
+
+    def test_band_gauge_without_reading_falls_back_to_normals(self):
+        out = _candidate_flow(self.RIVER, {"cfs": 2600}, None, None, _ref(_YAKIMA_BANDS))
+        assert out["delta"] < 0
+        assert any("Very high flow for" in w for w in out["warnings"])
+
+    def test_normals_only_tails_score_middle_does_not(self):
+        normal = _candidate_flow(self.RIVER, {"cfs": 500}, None, None, _ref())
+        very_low = _candidate_flow(self.RIVER, {"cfs": 120}, None, None, _ref())
+        assert normal["delta"] == 0 and normal["warnings"] == []
+        assert "normal for" in normal["context"][0] and "~50th percentile" in normal["context"][0]
+        assert very_low["delta"] < 0 and "Very low flow" in very_low["warnings"][0]
+
+    def test_normals_ignored_when_reading_is_the_nwps_fallback(self):
+        """A discontinued USGS gauge's record (Naches: 1909–1979) doesn't judge another gauge's reading."""
+        out = _candidate_flow(self.RIVER, {"cfs": 1490, "provider": "noaa_nwps_observed"}, None, None, _ref())
+        assert out["delta"] == 0 and out["context"] == []
+
+    def test_percentile_ordinals(self):
+        out = _candidate_flow(self.RIVER, {"cfs": 280}, None, None, _ref())  # p10 150, p25 300 → 23
+        assert "~23rd percentile" in out["context"][0]
+
+    def test_no_references_no_flow_scoring(self):
+        out = _candidate_flow(self.RIVER, {"cfs": 99999}, None, None, None)
+        assert out["delta"] == 0 and out["warnings"] == [] and out["context"] == []
+
+    def test_lakes_untouched(self):
+        lake = make_spot(type="lake")
+        assert _candidate_flow(lake, {"cfs": 5}, None, None, _ref())["delta"] == 0
+
+    def test_flood_stage_gate_and_action_penalty(self):
+        flood = {"12500450": {"action_ft": 10.0, "minor_ft": 12.0}}
+        at_flood = _candidate_flow(self.RIVER, {"cfs": 500, "gauge_height_ft": 12.3}, None, None, _ref(flood=flood))
+        near = _candidate_flow(self.RIVER, {"cfs": 500, "gauge_height_ft": 10.5}, None, None, _ref(flood=flood))
+        calm = _candidate_flow(self.RIVER, {"cfs": 500, "gauge_height_ft": 4.0}, None, None, _ref(flood=flood))
+        assert at_flood["flood"] == "flood"
+        assert near["flood"] == "action" and near["delta"] <= -3.0
+        assert any("Near flood" in w for w in near["warnings"])
+        assert calm["flood"] is None
+
+    def test_flood_at_band_gauge_counts(self):
+        flood = {"12484500": {"action_ft": 33.5, "minor_ft": 35.5}}
+        out = _candidate_flow(self.RIVER, {"cfs": 9000}, None, None, _ref(_YAKIMA_BANDS, flood=flood),
+                              usgs_bands=_bands_reading(9000, stage=36.0))
+        assert out["flood"] == "flood"
+
+    def test_future_trip_uses_forecast_flow_and_stage(self):
+        from datetime import datetime, timedelta, timezone
+        dep = datetime.now(tz=timezone.utc) + timedelta(days=3)
+        fc = {"forecast": [{"validTime": dep.isoformat(), "flow_cfs": 400.0, "stage_ft": 12.5}]}
+        flood = {"12500450": {"action_ft": 10.0, "minor_ft": 12.0}}
+        out = _candidate_flow(self.RIVER, {"cfs": 5000, "gauge_height_ft": 1.0}, fc, dep, _ref(flood=flood))
+        assert out["cfs"] == 400.0 and out["flood"] == "flood"
+
+    def test_volatile_delta_uses_flow(self):
+        flow = _candidate_flow(self.RIVER, {"cfs": 120}, None, None, _ref())
+        with_flow, warnings = _compute_volatile_delta(self.RIVER, {"cfs": 120}, None, None, [], flow=flow)
+        without, _ = _compute_volatile_delta(self.RIVER, {"cfs": 120}, None, None, [])
+        assert with_flow == without + flow["delta"]
+        assert any("Very low flow" in w for w in warnings)
+
+    def test_band_sites_excludes_own_gauge(self):
+        refs = {"a": _ref(_YAKIMA_BANDS), "b": _ref([dict(_YAKIMA_BANDS[0], gauge_site_id="12500450")])}
+        assert _band_sites(refs) == {"a": {"12484500"}}
+
+    def test_min_max_cfs_columns_no_longer_scored(self):
         import inspect
         import chat.context_builder as cb
-        assert "_cfs_out_of_range" not in inspect.getsource(cb)
+        src = inspect.getsource(cb)
+        assert "_cfs_out_of_range" not in src and ".min_cfs" not in src
 
 
 # ---------------------------------------------------------------------------

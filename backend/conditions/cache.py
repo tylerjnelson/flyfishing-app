@@ -22,8 +22,10 @@ CACHE_TTL_HOURS: dict[str, int] = {
     "nps_alerts": 6,
     "noaa_nws":   6,
     "usgs":       6,
+    "usgs_bands": 6,   # readings at flow_bands gauges other than the water body's own
     "airnow":     6,
     "noaa_nwrfc": 48,
+    "noaa_nwrfc_bands": 48,
     "snotel":     48,
     "wta":        48,
 }

@@ -357,27 +357,34 @@ def normalize_noaa_nwrfc(raw: dict, gauge_id: str, fetched_at: datetime) -> dict
 
     Stageflow response shape: {observed: {...}, forecast: {primaryName, primaryUnits,
     secondaryName, secondaryUnits, data: [{validTime, primary, secondary}]}}.
-    Each entry gets `flow_cfs` from whichever field the metadata says is flow
-    (field order varies by gauge; see nwps_series_fields). Entries whose flow
-    can't be determined get flow_cfs=None, and consumers must not guess.
+    Each entry gets `flow_cfs` and `stage_ft` from whichever fields the
+    metadata says are flow and stage (field order varies by gauge; see
+    nwps_series_fields). Values that can't be determined are None, and
+    consumers must not guess. stage_ft feeds the flood-stage gate.
     """
     series = raw.get("forecast") or {}
     fields = nwps_series_fields(series)
     forecasts = []
     for entry in series.get("data") or []:
-        flow_cfs = None
+        flow_cfs = stage_ft = None
         if fields:
             try:
                 value = float(entry[fields[0]])
                 flow_cfs = round(value * fields[1], 1) if value >= 0 else None
             except (KeyError, TypeError, ValueError):
                 flow_cfs = None
-        forecasts.append({**entry, "flow_cfs": flow_cfs})
+            if fields[2]:
+                try:
+                    value = float(entry[fields[2]])
+                    stage_ft = value if value > -999 else None
+                except (KeyError, TypeError, ValueError):
+                    stage_ft = None
+        forecasts.append({**entry, "flow_cfs": flow_cfs, "stage_ft": stage_ft})
     return {
         "source": "noaa_nwrfc",
         "fetched_at": fetched_at.isoformat(),
         "gauge_id": gauge_id,
-        "forecast": forecasts,  # [{validTime, primary, secondary, flow_cfs}]
+        "forecast": forecasts,  # [{validTime, primary, secondary, flow_cfs, stage_ft}]
         "stale": False,
     }
 

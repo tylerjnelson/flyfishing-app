@@ -7,6 +7,7 @@ from sqlalchemy import (
     Column,
     Date,
     DateTime,
+    Float,
     ForeignKey,
     Integer,
     JSON,
@@ -380,3 +381,68 @@ class HereUsageCounter(Base):
     period = Column(String(7), primary_key=True)  # "YYYY-MM" (UTC)
     used = Column(Integer, nullable=False, server_default="0")
     updated_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# ---------------------------------------------------------------------------
+# Flow references (TODO-18) — see conditions/flow_reference.py
+# ---------------------------------------------------------------------------
+
+class GaugeFlowNormal(Base):
+    """USGS day-of-year flow percentiles for one gauge (loaded by gauge_reference)."""
+    __tablename__ = "gauge_flow_normals"
+
+    site_id = Column(Text, primary_key=True)
+    time_of_year = Column(Text, primary_key=True)  # "MM-DD"
+    p05 = Column(Float, nullable=False)
+    p10 = Column(Float, nullable=False)
+    p25 = Column(Float, nullable=False)
+    p50 = Column(Float, nullable=False)
+    p75 = Column(Float, nullable=False)
+    p90 = Column(Float, nullable=False)
+    p95 = Column(Float, nullable=False)
+    sample_count = Column(Integer)
+    loaded_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    def values(self) -> list[float]:
+        return [self.p05, self.p10, self.p25, self.p50, self.p75, self.p90, self.p95]
+
+
+class GaugeFloodStage(Base):
+    """NWS action / flood stages for one gauge, in the USGS gauge-height datum."""
+    __tablename__ = "gauge_flood_stages"
+
+    site_id = Column(Text, primary_key=True)
+    nwps_lid = Column(Text, nullable=False)
+    action_ft = Column(Float)
+    minor_ft = Column(Float)
+    moderate_ft = Column(Float)
+    major_ft = Column(Float)
+    loaded_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class FlowBand(Base):
+    """A published fishable range, tied to the gauge its source wrote it for."""
+    __tablename__ = "flow_bands"
+
+    id = Column(Uuid(), primary_key=True, default=uuid.uuid4)
+    water_body_id = Column(Uuid(), ForeignKey("water_bodies.id", ondelete="CASCADE"), nullable=False)
+    gauge_site_id = Column(Text, nullable=False)
+    gauge_name = Column(Text)
+    mode = Column(Text, nullable=False)  # wade | float | fish
+    min_cfs = Column(Integer)
+    max_cfs = Column(Integer)
+    source = Column(Text, nullable=False)
+    source_url = Column(Text)
+    source_date = Column(Date)
+    note = Column(Text)
+
+    def as_dict(self) -> dict:
+        return {
+            "gauge_site_id": self.gauge_site_id,
+            "gauge_name": self.gauge_name,
+            "mode": self.mode,
+            "min_cfs": self.min_cfs,
+            "max_cfs": self.max_cfs,
+            "source": self.source,
+            "note": self.note,
+        }

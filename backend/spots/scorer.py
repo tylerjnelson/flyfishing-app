@@ -70,6 +70,11 @@ _LAKE_WEIGHTS_ZERO_DEBRIEF = {
     "data_coverage": 1.0,
 }
 
+# conditions_reliability for rivers/creeks with no published range (or no
+# normals for its gauge): unknown, so neutral — the scorer's convention for
+# unknown signals (note_sentiment, flow_trend).
+RELIABILITY_NEUTRAL = 0.5
+
 # Recency penalty: -0.5 per 14-day period, capped at -3.0
 _RECENCY_PENALTY_PER_PERIOD = -0.5
 _RECENCY_PERIOD_DAYS = 14
@@ -101,7 +106,11 @@ def _norm_flow_trend(trend: Literal["dropping", "stable", "rising"] | None) -> f
 
 
 def _norm_conditions_reliability(fraction: float | None) -> float:
-    """Fraction of time CFS in fishable range → [0.0, 1.0]."""
+    """
+    Chance flow is in a fishable range around this date → [0.0, 1.0].
+    compute_and_store_score passes the best published range's probability
+    from its gauge's normals, or RELIABILITY_NEUTRAL for rivers without one.
+    """
     if fraction is None:
         return 0.0
     return max(0.0, min(1.0, fraction))
@@ -415,6 +424,10 @@ async def compute_and_store_score(water_body_id: str, db) -> float:
         )
         last_visited = lv_result.scalar_one_or_none()
 
+    conditions_reliability = None
+    if water_body.type in ("river", "creek"):
+        conditions_reliability = await _conditions_reliability(db, water_body.id)
+
     if water_body.type in ("river", "creek", "coastal"):
         computed = score_river(
             seed_confidence=water_body.seed_confidence or "unvalidated",
@@ -424,7 +437,7 @@ async def compute_and_store_score(water_body_id: str, db) -> float:
             note_positive=sentiment_row.pos,
             note_neutral=sentiment_row.neu,
             note_negative=sentiment_row.neg,
-            conditions_reliability=None,
+            conditions_reliability=conditions_reliability,
             species_match=None,
             populated_sources=populated,
             total_sources=total,
@@ -452,3 +465,32 @@ async def compute_and_store_score(water_body_id: str, db) -> float:
 
     log.info("score_updated", extra={"water_body_id": water_body_id, "score": computed})
     return computed
+
+
+async def _conditions_reliability(db, water_body_id) -> float:
+    """
+    Best published range's chance of holding around today (TODO-18), from
+    the USGS normals at the gauge that range was written for. Neutral when
+    the river has no range or its gauge has no normals.
+    """
+    from sqlalchemy import select
+    from conditions import flow_reference
+    from db.models import FlowBand, GaugeFlowNormal
+
+    bands = (await db.execute(
+        select(FlowBand).where(FlowBand.water_body_id == water_body_id)
+    )).scalars().all()
+    if not bands:
+        return RELIABILITY_NEUTRAL
+    today = datetime.now(tz=timezone.utc).date()
+    rows = (await db.execute(
+        select(GaugeFlowNormal)
+        .where(GaugeFlowNormal.site_id.in_({b.gauge_site_id for b in bands}))
+        .where(GaugeFlowNormal.time_of_year.in_(flow_reference.window_keys(today)))
+    )).scalars().all()
+    by_site: dict[str, dict[str, list[float]]] = {}
+    for r in rows:
+        by_site.setdefault(r.site_id, {})[r.time_of_year] = r.values()
+    normals = {site: flow_reference.smooth_normals(v, today) for site, v in by_site.items()}
+    prob = flow_reference.best_band_reliability([b.as_dict() for b in bands], normals)
+    return RELIABILITY_NEUTRAL if prob is None else round(prob, 3)
