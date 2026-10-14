@@ -338,6 +338,10 @@ class EmergencyClosure(Base):
     # True only for rules that close fishing outright and aren't superseded by
     # a later reopening; only these are hard filters (see migration 0014).
     closes_fishing = Column(Boolean, nullable=False, server_default="false")
+    # Per-stretch rules [{"heading", "items"}] and "Additional information"
+    # text from the detail page; non-closure rules become advisories (TODO-21).
+    details = Column(JSONB)
+    notes = Column(Text)
     effective = Column(Date)
     expires = Column(Date)
     source_url = Column(Text)

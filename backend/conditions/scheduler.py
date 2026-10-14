@@ -41,7 +41,16 @@ from conditions.noaa_nwrfc import NO_FORECAST_GAUGES, fetch_noaa_nwrfc, resolve_
 from conditions.inciweb import fetch_inciweb
 from conditions.nps_alerts import fetch_nps_alerts
 from conditions.snotel import fetch_snotel
-from conditions.wdfw_emergency import fetch_wdfw_emergency, location_head, reopens_fishing
+from conditions.wdfw_emergency import (
+    county_conflicts,
+    fetch_wdfw_emergency,
+    location_head,
+    phrase_in,
+    reopens_fishing,
+    rule_county,
+    rule_match_texts,
+    water_phrases,
+)
 from conditions.wdfw_regulations import fetch_and_update_regulations
 from conditions.wdfw_stocking import fetch_wdfw_stocking
 from conditions.wta_scraper import fetch_wta_reports
@@ -212,32 +221,34 @@ async def job_wdfw_emergency() -> None:
         _log_job_done("wdfw_emergency", failed=1, serving="stale_rows")
         return
 
-    # Build name→water_body_id lookup (names + aliases) for FK resolution
-    name_to_wb_id: dict[str, object] = {}
+    # Name lookup for FK resolution: names, aliases, and the plain form of
+    # stocking codes ("SKAGIT R 03.0176" → "SKAGIT RIVER"), with county.
     async with AsyncSessionLocal() as session:
-        result = await session.execute(select(WaterBody.id, WaterBody.name, WaterBody.aliases))
-        for row in result.all():
-            for name in [row.name, *(row.aliases or [])]:
-                if name and "(" not in name:  # "MINERAL LK (LEWI)"-style stocking names never match prose
-                    name_to_wb_id.setdefault(" ".join(name.upper().split()), row.id)
+        result = await session.execute(
+            select(WaterBody.id, WaterBody.name, WaterBody.aliases, WaterBody.county)
+        )
+        water_rows = result.all()
     # Longest first, whole words: "Lake Washington" before "Washington", and
     # "Fish Lake" must not match inside "Spearfish Lake".
-    name_patterns = [
-        (re.compile(rf"\b{re.escape(n)}\b"), wb_id)
-        for n, wb_id in sorted(name_to_wb_id.items(), key=lambda kv: -len(kv[0]))
-    ]
+    phrases = sorted(
+        (
+            (phrase, row.id, getattr(row, "county", None))
+            for row in water_rows
+            for phrase in water_phrases(row.name, row.aliases)
+        ),
+        key=lambda t: -len(t[0]),
+    )
 
     def _resolve_water_body_id(rule: dict) -> object:
         """Match the rule's title, then the water named at the head of its
-        Location field. Never the full text: boundary landmarks ("...to the
-        confluence of Sol Duc and Bogachiel rivers") linked rules to the wrong
-        water (TODO-15)."""
-        for candidate in (rule.get("title"), location_head(rule.get("location"))):
-            text_upper = " ".join(re.sub(r"\([^)]*\)", " ", candidate or "").upper().split())
-            if not text_upper:
-                continue
-            for pattern, wb_id in name_patterns:
-                if pattern.search(text_upper):
+        Location field, then its stretch headings. Never the full text:
+        boundary landmarks ("...to the confluence of Sol Duc and Bogachiel
+        rivers") linked rules to the wrong water (TODO-15). A rule naming
+        another county never links ("Fish Lake (Spokane County)", TODO-21)."""
+        county = rule_county(rule.get("title"), rule.get("location"))
+        for text_upper in rule_match_texts(rule.get("title"), rule.get("location"), rule.get("details")):
+            for phrase, wb_id, wb_county in phrases:
+                if phrase_in(phrase, text_upper) and not county_conflicts(county, wb_county):
                     return wb_id
         return None
 
@@ -258,6 +269,8 @@ async def job_wdfw_emergency() -> None:
                     action=rule.get("action"),
                     location=rule.get("location"),
                     closes_fishing=bool(rule.get("closes_fishing")),
+                    details=rule.get("details"),
+                    notes=rule.get("notes"),
                     effective=_parse_date(rule.get("effective")),
                     expires=_parse_date(rule.get("expires")),
                     source_url=rule["source_url"],

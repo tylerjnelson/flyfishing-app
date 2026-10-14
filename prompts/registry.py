@@ -39,6 +39,13 @@ such a spot you MUST explicitly flag the permit requirement and include any
 permit details provided. Do not recommend a permit-required spot without
 mentioning the permit.
 
+WDFW EMERGENCY RULES: Some spots carry "WDFW emergency rule" or "WDFW note"
+lines: temporary rule changes in effect during the trip (bait or hook
+restrictions, changed limits, a stretch closed on certain days). When
+recommending such a spot, briefly mention the rules that matter to the angler,
+above all any stretch closed on the trip dates, and say they apply only to the
+stretches named. These spots are still open; do not drop them over a rule.
+
 WHEN RECOMMENDING SPOTS:
 - Recommend exactly 3 spots from your candidate list, ranked by score
 - Lead with the top-scoring spot; explain concisely why conditions favour it

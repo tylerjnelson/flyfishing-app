@@ -115,10 +115,21 @@ class TestHasActiveClosure:
         cl = make_closure(title="Stillaguamish River to close to all fishing Oct. 9", water_body_id=wb)
         assert _has_active_closure("Stillaguamish River", [cl], water_body_id=wb) is True
 
-    def test_partial_name_word_match(self):
-        # "Yakima" alone is enough to match "Yakima closed..."
-        cl = make_closure(title="Yakima closed to all angling")
-        assert _has_active_closure("Yakima River", [cl]) is True
+    def test_whole_name_required(self):
+        """TODO-21: the full name must appear. Matching on distinctive words
+        let a "Green River" closure close Green Lake too."""
+        cl = make_closure(title="Green River closed to all fishing")
+        assert _has_active_closure("Green River", [cl]) is True
+        assert _has_active_closure("Green Lake", [cl]) is False
+
+    def test_other_county_does_not_match(self):
+        cl = make_closure(title="Fish Lake closed", location="Fish Lake (Spokane County)")
+        assert _has_active_closure("Fish Lake", [cl], county="Chelan") is False
+        assert _has_active_closure("Fish Lake", [cl], county="Spokane") is True
+
+    def test_stocking_code_name_matches_plain_name(self):
+        cl = make_closure(title="Skagit River to close to all fishing")
+        assert _has_active_closure("SKAGIT R     03.0176", [cl]) is True
 
     def test_parenthetical_name_matches(self):
         cl = make_closure(title="Upper Green (Duwamish) River closed to fishing from Sept. 16–Oct. 31")

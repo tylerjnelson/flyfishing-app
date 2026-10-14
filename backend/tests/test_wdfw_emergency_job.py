@@ -134,8 +134,27 @@ async def test_spot_page_closures_query_only_real_in_effect_closures():
     assert "effective <=" in sql and "expires >=" in sql
 
 
-async def test_context_builder_query_only_closes_fishing():
-    import inspect
-    import chat.context_builder as cb
-    src = inspect.getsource(cb)
-    assert "EmergencyClosure.closes_fishing.is_(True)" in src
+def test_closure_gate_uses_the_trip_date_not_today():
+    """TODO-21: the context builder judged closures on today's date, so a
+    Nov. 5 trip lost the Green (closed through Oct. 31)."""
+    from datetime import date, datetime, timezone
+
+    from chat.context_builder import _trip_dates
+    from conditions.wdfw_advisories import in_effect
+
+    green = SimpleNamespace(effective=date(2026, 9, 16), expires=date(2026, 10, 31), closes_fishing=True)
+    start, end = _trip_dates(datetime(2026, 11, 5, 15, tzinfo=timezone.utc), None)
+    assert (start, end) == (date(2026, 11, 5), date(2026, 11, 5))
+    assert not in_effect(green, start)
+    assert in_effect(green, date(2026, 10, 20))
+
+
+def test_trip_dates_are_pacific_and_span_the_return():
+    from datetime import date, datetime, timezone
+
+    from chat.context_builder import _trip_dates
+
+    # 05:00 UTC on Oct 14 is still Oct 13 in Washington
+    start, end = _trip_dates(datetime(2026, 10, 14, 5, tzinfo=timezone.utc),
+                             datetime(2026, 10, 16, 1, tzinfo=timezone.utc))
+    assert (start, end) == (date(2026, 10, 13), date(2026, 10, 15))

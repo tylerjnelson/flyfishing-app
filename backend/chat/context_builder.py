@@ -21,10 +21,10 @@ and force_rerun=False. The pipeline re-runs only on confirmed FILTER_UPDATE.
 import asyncio
 import json
 import logging
-import re
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select, text
 
@@ -42,7 +42,7 @@ from conditions.routing import (
     haversine_miles,
 )
 from conditions.usgs import fetch_usgs_gauge
-from conditions.wdfw_emergency import location_head
+from conditions import wdfw_advisories
 from config import settings
 from db.connection import AsyncSessionLocal
 from db.models import (
@@ -209,13 +209,12 @@ def _filter_excluded(pairs: list[tuple], excluded_ids: set[str]) -> list[tuple]:
     return [(fs, wb) for fs, wb in pairs if str(fs.id) not in excluded_ids]
 
 
-_GEO_TYPE_WORDS: frozenset[str] = frozenset({
-    "river", "creek", "lake", "pond", "reservoir", "stream",
-    "tributary", "bay", "channel", "fork", "run",
-})
+_PACIFIC = ZoneInfo("America/Los_Angeles")
 
 
-def _has_active_closure(water_body_name: str, active_closures: list, water_body_id=None) -> bool:
+def _has_active_closure(
+    water_body_name: str, active_closures: list, water_body_id=None, *, aliases=None, county=None,
+) -> bool:
     """
     Return True if an active closure applies to this water body.
 
@@ -224,28 +223,29 @@ def _has_active_closure(water_body_name: str, active_closures: list, water_body_
     species-retention closures, and clears it when a later rule reopened the
     water. Before TODO-15 every linked rule was treated as a closure.
 
-    Prefers the FK match. For rules linked to no water body, the spot's
-    distinctive name words must all appear in the rule's title or the water
-    named at the head of its Location field, never in the full text, whose
-    boundary landmarks name other rivers.
+    Matching is wdfw_advisories.rule_applies, shared with the advisories: the
+    FK, or one of the water's names as a whole phrase in the rule's title,
+    Location head or a stretch heading (never the full text, whose boundary
+    landmarks name other rivers), and never across counties. Before TODO-21
+    any rule containing the name's distinctive words matched, so "Green River
+    closed" also closed Green Lake.
     """
     if not active_closures or not water_body_name:
         return False
-    all_name_words = frozenset(water_body_name.lower().split())
-    content_words = all_name_words - _GEO_TYPE_WORDS
-    if not content_words:
-        content_words = all_name_words
-    for cl in active_closures:
-        if cl.closes_fishing is not True:
-            continue
-        if water_body_id and cl.water_body_id == water_body_id:
-            return True
-        if cl.water_body_id is None:
-            text = f"{cl.title or ''} {location_head(cl.location)}"
-            text_words = frozenset(re.sub(r"[^\w\s]", " ", text.lower()).split())
-            if content_words <= text_words:
-                return True
-    return False
+    return any(
+        cl.closes_fishing is True
+        and wdfw_advisories.rule_applies(
+            cl, water_body_id=water_body_id, name=water_body_name, aliases=aliases, county=county,
+        )
+        for cl in active_closures
+    )
+
+
+def _trip_dates(departure_time: datetime, return_time) -> tuple[date, date]:
+    """First and last fishing day of the trip, in Pacific time."""
+    start = departure_time.astimezone(_PACIFIC).date()
+    end = return_time.astimezone(_PACIFIC).date() if isinstance(return_time, datetime) else start
+    return start, max(start, end)
 
 
 def _wildfire_near_spot(
@@ -998,6 +998,10 @@ def _render_spot_conditions_lines(
             text = (r.get("report_text") or "")[:200]
             lines.append(f"  [{date_str}] {text}")
 
+    # WDFW emergency rules in effect during the trip (TODO-21): gear/limit
+    # changes, stretches closed on some days. Never scored.
+    lines.extend(c.get("wdfw_rules") or [])
+
     # Surface penalty warnings so the LLM can advise the angler
     for w in (c.get("warnings") or []):
         lines.append(f"Advisory: {w}")
@@ -1572,16 +1576,22 @@ async def build_context(
         # Real-time conditions fetch
         await _fetch_and_cache_realtime(fishing_spots, water_bodies, _band_sites(flow_refs))
 
-        # Active emergency closures
-        today_date = date.today()
-        closure_result = await db.execute(
+        # WDFW emergency rules in effect at any point of the trip. Closures in
+        # effect on the first fishing day are hard filters; everything else
+        # (and a closure starting later in the trip) becomes an advisory. Both
+        # used to be judged on today's date, not the trip's (TODO-21).
+        trip_start, trip_end = _trip_dates(departure_time, trip.return_time)
+        rule_result = await db.execute(
             select(EmergencyClosure).where(
-                EmergencyClosure.closes_fishing.is_(True),
-                (EmergencyClosure.effective <= today_date) | EmergencyClosure.effective.is_(None),
-                (EmergencyClosure.expires >= today_date) | EmergencyClosure.expires.is_(None),
+                (EmergencyClosure.effective <= trip_end) | EmergencyClosure.effective.is_(None),
+                (EmergencyClosure.expires >= trip_start) | EmergencyClosure.expires.is_(None),
             )
         )
-        active_closures: list = closure_result.scalars().all()
+        wdfw_rules: list = rule_result.scalars().all()
+        active_closures = [
+            r for r in wdfw_rules
+            if r.closes_fishing is True and wdfw_advisories.in_effect(r, trip_start)
+        ]
 
         # InciWeb active WA fires
         inciweb_result = await db.execute(
@@ -1648,7 +1658,8 @@ async def build_context(
         flooded: set[str] = set()
         for fs, wb in pairs:
             wb_id = str(wb.id)
-            if _has_active_closure(wb.name, active_closures, water_body_id=wb.id):
+            if _has_active_closure(wb.name, active_closures, water_body_id=wb.id,
+                                   aliases=wb.aliases, county=wb.county):
                 continue
             if (flow_by_wb.get(wb_id) or {}).get("flood") == "flood":
                 flooded.add(wb.name)
@@ -1802,6 +1813,15 @@ async def build_context(
                 ),
                 "warnings": c.get("warnings") or [],
                 "flow_context": (c.get("flow") or {}).get("context") or [],
+                "wdfw_rules": wdfw_advisories.advisory_lines(
+                    wdfw_rules,
+                    water_body_id=c["water_body"].id,
+                    name=c["water_body"].name,
+                    aliases=c["water_body"].aliases,
+                    county=c["water_body"].county,
+                    start=trip_start,
+                    end=trip_end,
+                ),
                 "conditions": {
                     "usgs": c["usgs"],
                     "noaa_nws": c["nws"],

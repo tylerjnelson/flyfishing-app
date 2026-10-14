@@ -51,7 +51,8 @@ async def fetch_wdfw_emergency() -> list[dict]:
     Scrape active WDFW emergency closure rules.
 
     Returns a list of dicts:
-      {rule_text, effective (date str | None), expires (date str | None), source_url}
+      {rule_text, title, action, location, closes_fishing, details, notes,
+       effective (date str | None), expires (date str | None), source_url}
 
     Raises ScraperStructureError if the page structure has changed.
     Raises httpx.HTTPError on connection / HTTP failures (caller logs WARNING).
@@ -104,6 +105,7 @@ async def fetch_wdfw_emergency() -> list[dict]:
                 ]
                 rule_text = title + ". " + " ".join(paragraphs) if paragraphs else title
                 fields = _labeled_fields(paragraphs)
+                details, notes = parse_rule_body(_body_blocks(detail_soup))
 
                 # Prefer posted-date on detail page; fall back to month heading
                 posted = detail_soup.select_one("p.posted-date")
@@ -125,6 +127,8 @@ async def fetch_wdfw_emergency() -> list[dict]:
                     "action": fields.get("action"),
                     "location": fields.get("location"),
                     "closes_fishing": _closes_fishing(fields.get("action"), title),
+                    "details": details,
+                    "notes": notes,
                     "effective": effective,
                     "expires": expires,
                     "source_url": href,
@@ -140,6 +144,8 @@ async def fetch_wdfw_emergency() -> list[dict]:
                     "action": None,
                     "location": None,
                     "closes_fishing": _closes_fishing(None, title),
+                    "details": None,
+                    "notes": None,
                     "effective": effective,
                     "expires": None,
                     "source_url": href,
@@ -314,6 +320,181 @@ def location_head(location: str | None) -> str:
         s, maxsplit=1, flags=re.IGNORECASE,
     )[0]
     return " ".join(s.split())
+
+
+# ---------------------------------------------------------------------------
+# Rule body: per-stretch rules and notes (TODO-21)
+# ---------------------------------------------------------------------------
+# The rules for each stretch are bullet lists under a heading paragraph:
+#   "Skagit River from Gilligan Creek to Baker River:"
+#     • "Oct. 12–15: Closed to fishing for all species."
+# and the paragraph scrape above never saw them. Also kept: the "Additional
+# information" paragraphs ("Fish Lake is closed beginning Oct. 18.").
+
+# Boilerplate footer that every rule page ends with.
+_FOOTER_RE = re.compile(
+    r"^(?:fishery managers encourage|fishers must have|information contact|request this information"
+    r"|recursos en espa|request translations)",
+    re.IGNORECASE,
+)
+_LABEL_RE = re.compile(r"^([A-Za-z][\w /'()&,-]{0,100}?)\s*:\s*(.*)$", re.DOTALL)
+
+
+def _body_blocks(soup) -> list[tuple[str, str]]:
+    """("p" | "li", text) for the rule body in document order, up to the footer."""
+    out: list[tuple[str, str]] = []
+    for el in soup.select(".field-item p, .field-item li"):
+        if el.find_parent("li") is not None:
+            continue  # nested inside a bullet already read
+        text = " ".join(el.get_text(" ", strip=True).split())
+        if not text or text == "Site search":
+            continue
+        if _FOOTER_RE.match(text):
+            break
+        out.append((el.name, text))
+    return out
+
+
+def parse_rule_body(blocks: list[tuple[str, str]]) -> tuple[list[dict] | None, str | None]:
+    """
+    (details, notes) from _body_blocks output.
+
+    details: [{"heading": str | None, "items": [str, ...]}] — one per stretch
+    or rule group ("Skagit River from Gilligan Creek to Baker River",
+    "Rules", "Salmon Rules"); sections with no items are dropped.
+    notes: the "Additional information" paragraphs, joined.
+    """
+    sections: list[dict] = []
+    notes: list[str] = []
+    current: dict | None = None
+    mode = "body"  # body → notes after "Additional information"
+
+    for kind, text in blocks:
+        if kind == "li":
+            if mode == "body":
+                if current is None:
+                    current = {"heading": None, "items": []}
+                    sections.append(current)
+                current["items"].append(text)
+            continue
+        m = _LABEL_RE.match(text)
+        label = m.group(1).strip().lower() if m else ""
+        value = " ".join(m.group(2).split()) if m else ""
+        if label.startswith("additional information"):
+            mode = "notes"
+            text = value
+        if mode == "notes":
+            if not text or _FOOTER_RE.match(text):
+                break  # "Additional information: Fishery managers encourage ..." is boilerplate
+            notes.append(text)
+            continue
+        if label in ("specific locations and rules", "locations and rules"):
+            current = None
+            continue
+        if text.endswith(":"):
+            # A stretch heading; long ones are landmark descriptions ("From a
+            # north-south line through Buoy 10 to ... (a projected line ...):")
+            current = {"heading": text[:-1].strip(), "items": []}
+        elif not m or label.startswith(("action", "effective date", "species affected", "reason for action")):
+            current = None
+            continue
+        elif label.startswith("location"):
+            # "Locations: Icicle River (Chelan County)", bullets follow
+            current = {"heading": value or None, "items": []}
+        else:
+            # "Skagit River from the mouth to Gilligan Creek:", "Rules: Closed to
+            # all fishing.", "Salmon Rules: Minimum size is 12 inches. ..."
+            current = {"heading": m.group(1).strip(), "items": [value] if value else []}
+        sections.append(current)
+
+    details = [s for s in sections if s["items"]]
+    return details or None, " ".join(notes) or None
+
+
+# ---------------------------------------------------------------------------
+# Which water a rule names (TODO-21; shared by the job and the context builder)
+# ---------------------------------------------------------------------------
+
+_COUNTY_RE = re.compile(r"\(([A-Za-z .'-]+?)\s+County\)", re.IGNORECASE)
+# Stocking-report names: "SKAGIT R     03.0176", "BEAR CR      08.0435".
+_CODED_NAME_RE = re.compile(r"^(.+?)\s+(R|CR)\s+\d+\.\d+$")
+_WATER_TYPE_RE = re.compile(r"\b(?:river|creek|lake|pond|reservoir|slough|fork)s?\b", re.IGNORECASE)
+
+
+def rule_county(*texts: str | None) -> str | None:
+    """'Spokane' from 'Fish Lake (Spokane County)' in the first text that names a county."""
+    for t in texts:
+        m = _COUNTY_RE.search(t or "")
+        if m:
+            return m.group(1).strip().lower()
+    return None
+
+
+def _norm(text: str | None) -> str:
+    return " ".join(re.sub(r"\([^)]*\)", " ", text or "").upper().split())
+
+
+def water_phrases(name: str | None, aliases=None) -> list[str]:
+    """
+    Upper-case names a rule can call this water by: its name, its aliases,
+    and the plain form of a stocking code ("SKAGIT R 03.0176" → "SKAGIT RIVER").
+    Parenthesised stocking names ("MINERAL LK (LEWI)") never match prose.
+    """
+    out: list[str] = []
+    for n in [name, *(aliases or [])]:
+        if not n or "(" in n:
+            continue
+        n = " ".join(n.upper().split())
+        coded = _CODED_NAME_RE.match(n)
+        if coded:
+            n = f"{coded.group(1)} {'RIVER' if coded.group(2) == 'R' else 'CREEK'}"
+        if n not in out:
+            out.append(n)
+    return out
+
+
+def rule_match_texts(title: str | None, location: str | None, details=None) -> list[str]:
+    """
+    Where a rule names its water, most specific first: the title, the head of
+    the Location field, and the head of each stretch heading. Never the full
+    text, whose boundary landmarks name other waters (TODO-15).
+    """
+    texts = [_norm(title), _norm(location_head(location))]
+    for section in details or []:
+        texts.append(_norm(location_head(section.get("heading"))))
+    return [t for t in texts if t]
+
+
+def phrase_in(phrase: str, text: str) -> bool:
+    return re.search(rf"\b{re.escape(phrase)}\b", text) is not None
+
+
+def county_conflicts(rule_cty: str | None, water_county: str | None) -> bool:
+    """True when the rule names a county and the water body is in a different one."""
+    if not rule_cty or not water_county:
+        return False
+    return rule_cty != water_county.strip().lower().removesuffix(" county")
+
+
+def rule_names_water(*, title, location, details, name, aliases=None, county=None) -> bool:
+    """
+    True if the rule names this water: one of its names appears as a whole
+    phrase in the rule's title, Location head or a stretch heading, and the
+    rule's county (if it gives one) is the water's county. "Fish Lake
+    (Spokane County)" must not reach our Fish Lake in Chelan County.
+    """
+    if county_conflicts(rule_county(title, location), county):
+        return False
+    texts = rule_match_texts(title, location, details)
+    return any(phrase_in(p, t) for p in water_phrases(name, aliases) for t in texts)
+
+
+def section_names_other_water(heading: str | None, name: str | None, aliases=None) -> bool:
+    """A stretch heading that names a different water ("Cascade River from mouth ...")."""
+    head = _norm(location_head(heading))
+    if not head or not _WATER_TYPE_RE.search(head):
+        return False  # "Rules", "Salmon Rules"
+    return not any(phrase_in(p, head) for p in water_phrases(name, aliases))
 
 
 def _extract_dates(text: str) -> tuple[str | None, str | None]:
