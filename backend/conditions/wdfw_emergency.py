@@ -315,8 +315,12 @@ def location_head(location: str | None) -> str:
     if not location:
         return ""
     s = re.sub(r"\([^)]*\)", " ", location)
+    # Location lists write forks inverted: "Hoh River, South Fork" → "South Fork Hoh River"
+    s = re.sub(r"^\s*(.+?\s(?:river|creek))\s*,\s*(north|south|east|west|middle)\s+fork\b",
+               r"\2 Fork \1", s, flags=re.IGNORECASE)
     s = re.split(
-        r"[,;:.]|\b(?:from|north|south|east|west|upstream|downstream|near|at|between|including|below|above)\b",
+        r"[,;:.]|\b(?:north|south|east|west)\b(?!\s+fork)"
+        r"|\b(?:from|upstream|downstream|near|at|between|including|below|above)\b",
         s, maxsplit=1, flags=re.IGNORECASE,
     )[0]
     return " ".join(s.split())
@@ -453,16 +457,38 @@ def water_phrases(name: str | None, aliases=None) -> list[str]:
     return out
 
 
-def rule_match_texts(title: str | None, location: str | None, details=None) -> list[str]:
+def rule_match_texts(title: str | None, location: str | None, details=None) -> list[tuple[str, str | None]]:
     """
-    Where a rule names its water, most specific first: the title, the head of
-    the Location field, and the head of each stretch heading. Never the full
-    text, whose boundary landmarks name other waters (TODO-15).
+    Where a rule names its water, most specific first, as (text, county):
+    the title, the head of the Location field, the head of each stretch
+    heading, and each bullet of a "Locations" list ("Hoh and Quillayute
+    watersheds closing to all fishing" names its rivers only there). Never
+    the full text, whose boundary landmarks name other waters (TODO-15).
+    county is the one that text names, else the rule's.
     """
-    texts = [_norm(title), _norm(location_head(location))]
+    county = rule_county(title, location)
+    texts = [(_norm(title), county), (_norm(location_head(location)), county)]
     for section in details or []:
-        texts.append(_norm(location_head(section.get("heading"))))
-    return [t for t in texts if t]
+        texts.append((_norm(location_head(section.get("heading"))), county))
+        if is_location_list(section):
+            for item in section.get("items") or []:
+                texts.append((location_item_name(item), rule_county(item) or county))
+    return [(t, c) for t, c in texts if t]
+
+
+def is_location_list(section: dict) -> bool:
+    """A section whose bullets are waters: "Locations (including all tributaries to listed waters)"."""
+    return (section.get("heading") or "").strip().lower().startswith("location")
+
+
+def location_item_name(item: str) -> str:
+    """
+    The water a Locations bullet names: the text before its "(X County)", so
+    "Bear Creek (Clallam County) a Sol Duc River Tributary." is Bear Creek,
+    not the Sol Duc; "Hoh River, South Fork (Jefferson County) ..." is
+    "SOUTH FORK HOH RIVER".
+    """
+    return _norm(location_head(item.split("(", 1)[0]))
 
 
 def phrase_in(phrase: str, text: str) -> bool:
@@ -483,10 +509,11 @@ def rule_names_water(*, title, location, details, name, aliases=None, county=Non
     rule's county (if it gives one) is the water's county. "Fish Lake
     (Spokane County)" must not reach our Fish Lake in Chelan County.
     """
-    if county_conflicts(rule_county(title, location), county):
-        return False
-    texts = rule_match_texts(title, location, details)
-    return any(phrase_in(p, t) for p in water_phrases(name, aliases) for t in texts)
+    phrases = water_phrases(name, aliases)
+    return any(
+        not county_conflicts(text_county, county) and any(phrase_in(p, text) for p in phrases)
+        for text, text_county in rule_match_texts(title, location, details)
+    )
 
 
 def section_names_other_water(heading: str | None, name: str | None, aliases=None) -> bool:

@@ -277,3 +277,49 @@ def test_closure_in_effect_on_the_first_day_is_left_to_the_hard_filter():
                    expires=date(2026, 10, 31), closes_fishing=True)
     day = date(2026, 10, 14)
     assert advisory_lines([closure], water_body_id=None, name="Green River", start=day, end=day) == []
+
+
+# "Hoh and Quillayute watersheds closing to all fishing" (effective 2026-10-19)
+# names its waters only as bullets under a "Locations" heading.
+HOH_QUILLAYUTE_DETAILS = [{
+    "heading": "Locations (including all tributaries to listed waters)",
+    "items": [
+        "Bear Creek (Clallam County) a Sol Duc River Tributary.",
+        "Bogachiel River (Clallam County) from the mouth to the Olympic National Park boundary.",
+        "Hoh River, South Fork (Jefferson County) outside of the Olympic National Park boundary.",
+        "Quillayute River (Clallam County) from the Olympic National Park boundary upstream to confluence of "
+        "the Sol Duc and Bogachiel rivers.",
+        "Sol Duc River (Clallam County) from the mouth upstream to the National Park boundary.",
+    ],
+}]
+
+
+def test_location_list_bullets_name_the_closed_waters():
+    from chat.context_builder import _has_active_closure
+
+    closure = _row("Hoh and Quillayute watersheds closing to all fishing", "Closes all fishing.",
+                   effective=date(2026, 10, 19), closes_fishing=True, details=HOH_QUILLAYUTE_DETAILS)
+    assert _has_active_closure("South Fork Hoh", [closure])
+    assert _has_active_closure("SOL DUC R   20.0096", [closure], county="Clallam")
+    assert _has_active_closure("Bogachiel River", [closure], county="Clallam")
+    assert not _has_active_closure("Queets River", [closure], county="Jefferson")
+    assert not _has_active_closure("BEAR CR      08.0435", [closure], county="King")  # the bullet says Clallam
+    sol_duc = advisory_lines([closure], water_body_id=None, name="Sol Duc River", county="Clallam",
+                             start=date(2026, 10, 18), end=date(2026, 10, 19))
+    assert not any("Bear Creek" in ln for ln in sol_duc)  # "a Sol Duc River Tributary" is Bear Creek's bullet
+    # starting later in a trip: the advisory lists only this water's bullet
+    lines = advisory_lines([closure], water_body_id=None, name="Bogachiel River", county="Clallam",
+                           start=date(2026, 10, 18), end=date(2026, 10, 19))
+    assert lines[0] == "WDFW emergency rule (from Oct 19, until further notice): Closes all fishing."
+    assert [ln for ln in lines if ln.startswith("  - ")] == [
+        "  - Locations (including all tributaries to listed waters): Bogachiel River (Clallam County) from the "
+        "mouth to the Olympic National Park boundary."]
+
+
+def test_location_head_inverted_fork():
+    from conditions.wdfw_emergency import location_head
+
+    assert location_head("Hoh River, South Fork (Jefferson County) outside of the park.") == \
+        "South Fork Hoh River outside of the park"
+    assert location_head("North Fork Stillaguamish River from the mouth") == "North Fork Stillaguamish River"
+    assert location_head("Lake Washington (King County) north of Highway 520 Bridge") == "Lake Washington"

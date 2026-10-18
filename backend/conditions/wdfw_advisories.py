@@ -27,6 +27,8 @@ from conditions.wdfw_emergency import (
     _closes_fishing,
     _norm,
     county_conflicts,
+    is_location_list,
+    location_item_name,
     phrase_in,
     rule_county,
     rule_names_water,
@@ -151,6 +153,10 @@ def _rule_lines(rule, *, name, aliases, start: date, end: date) -> list[str]:
         if section_names_other_water(heading, name, aliases):
             continue  # "Cascade River from mouth ..." in a Skagit rule
         for item in section.get("items") or []:
+            if is_location_list(section) and not any(
+                phrase_in(p, location_item_name(item)) for p in water_phrases(name, aliases)
+            ):
+                continue  # another water in the rule's list
             span = item_dates(item, year)
             if span and (span[1] < start or span[0] > end):
                 continue  # a dated stretch rule outside the trip

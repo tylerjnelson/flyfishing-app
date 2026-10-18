@@ -47,7 +47,6 @@ from conditions.wdfw_emergency import (
     location_head,
     phrase_in,
     reopens_fishing,
-    rule_county,
     rule_match_texts,
     water_phrases,
 )
@@ -245,8 +244,7 @@ async def job_wdfw_emergency() -> None:
         boundary landmarks ("...to the confluence of Sol Duc and Bogachiel
         rivers") linked rules to the wrong water (TODO-15). A rule naming
         another county never links ("Fish Lake (Spokane County)", TODO-21)."""
-        county = rule_county(rule.get("title"), rule.get("location"))
-        for text_upper in rule_match_texts(rule.get("title"), rule.get("location"), rule.get("details")):
+        for text_upper, county in rule_match_texts(rule.get("title"), rule.get("location"), rule.get("details")):
             for phrase, wb_id, wb_county in phrases:
                 if phrase_in(phrase, text_upper) and not county_conflicts(county, wb_county):
                     return wb_id
