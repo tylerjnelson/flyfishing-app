@@ -24,3 +24,17 @@ os.environ.setdefault("AIRNOW_API_KEY", "test-airnow-key")
 os.environ.setdefault("HERE_API_KEY", "test-here-key")
 # main.py logs to a file; keep tests out of /var/log/flyfish/app.log.
 os.environ.setdefault("FLYFISH_LOG_FILE", os.path.join(tempfile.gettempdir(), "flyfish-test-app.log"))
+
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _close_circuit_breakers():
+    """Breakers are module-level and now trip: one test's failures must not open them for the next."""
+    from conditions.circuit_breaker import ALL_BREAKERS
+    for b in ALL_BREAKERS:
+        b.close()
+    yield
+    for b in ALL_BREAKERS:
+        b.close()

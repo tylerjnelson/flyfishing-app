@@ -5,10 +5,12 @@ Every fetcher's public entry point catches its own failures, logs exactly one
 `fetch_failed` WARNING through here, and returns None. Callers (scheduler jobs,
 the chat context builder) treat None as "no fresh data, serve stale".
 
-Before this, fetchers only caught pybreaker.CircuitBreakerError. The breakers
-never trip on async functions, so every real failure (DNS, 403, timeout,
-malformed payload) escaped raw: it aborted per-water-body job loops, or was
-logged by the caller with no source or cause.
+Before this, fetchers only caught pybreaker.CircuitBreakerError, and the
+breakers never tripped on async functions (fixed since: circuit_breaker.py),
+so every real failure (DNS, 403, timeout, malformed payload) escaped raw: it
+aborted per-water-body job loops, or was logged by the caller with no source
+or cause. The call that trips a breaker still logs fetch_failed with its cause;
+later calls log circuit_open until the breaker's reset_timeout passes.
 """
 
 import logging

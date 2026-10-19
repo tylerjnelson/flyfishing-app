@@ -30,6 +30,7 @@ from sqlalchemy import select, text
 
 from chat.response_cache import compute_intake_hash, get_cached_response
 from conditions.airnow import fetch_airnow
+from conditions.circuit_breaker import routing_breaker
 from conditions.cache import write_conditions_cache
 from conditions import flow_reference
 from conditions.normalizer import INTERVAL_REALTIME, compute_conditions_hash
@@ -1679,13 +1680,19 @@ async def build_context(
             # When HERE is disabled (batch/benchmark), skip the reserve entirely and
             # route every pair through get_drive_time, which returns deterministic
             # Haversine minutes with is_fallback=False (no budget touched, no banner).
+            circuit_open = not settings.here_disabled and routing_breaker.is_blocking()
             if settings.here_disabled:
                 granted = len(filtered_pairs)
+            elif circuit_open:
+                # HERE failed repeatedly in the last minute: don't spend budget
+                # on calls the breaker would refuse anyway.
+                granted = 0
+                log.warning("routing_circuit_open", extra={"via_haversine": len(filtered_pairs)})
             else:
                 granted = await here_budget.reserve(len(filtered_pairs))
             here_pairs = filtered_pairs[:granted]
             fallback_pairs = filtered_pairs[granted:]
-            if fallback_pairs:
+            if fallback_pairs and not circuit_open:
                 log.warning(
                     "here_budget_capped_build",
                     extra={

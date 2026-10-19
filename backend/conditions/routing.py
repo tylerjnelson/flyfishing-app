@@ -29,6 +29,7 @@ log = logging.getLogger(__name__)
 
 _HERE_ROUTING_URL = "https://router.hereapi.com/v8/routes"
 _TIMEOUT = httpx.Timeout(connect=3.0, read=3.0, write=3.0, pool=3.0)
+_DEADLINE_S = 3.0       # whole request; past this, Haversine fallback
 _ROAD_FACTOR = 1.4      # straight-line → estimated road distance
 _AVG_SPEED_KMH = 60.0  # used only in Haversine fallback
 
@@ -99,9 +100,12 @@ async def _here_request(
         "return": "summary",
         "apikey": settings.here_api_key,
     }
-    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-        resp = await client.get(_HERE_ROUTING_URL, params=params)
-        resp.raise_for_status()
+    # The 3 s deadline lives inside the breaker so a slow HERE counts as a
+    # failure (an outer wait_for would cancel, which the breaker ignores).
+    async with asyncio.timeout(_DEADLINE_S):
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            resp = await client.get(_HERE_ROUTING_URL, params=params)
+            resp.raise_for_status()
     duration_s = resp.json()["routes"][0]["sections"][0]["summary"]["duration"]
     return max(1, round(duration_s / 60))
 
@@ -128,15 +132,12 @@ async def get_drive_time(
         return haversine_drive_minutes(origin_lat, origin_lon, dest_lat, dest_lon), False
 
     try:
-        minutes = await asyncio.wait_for(
-            _here_request(origin_lat, origin_lon, dest_lat, dest_lon, departure_time),
-            timeout=3.0,
-        )
+        minutes = await _here_request(origin_lat, origin_lon, dest_lat, dest_lon, departure_time)
         log.debug("here_routing_ok", extra={"minutes": minutes})
         return minutes, False
     except Exception as exc:
-        log.warning(
-            "routing_fallback",
-            extra={"reason": type(exc).__name__, "detail": str(exc)[:120]},
-        )
+        # str() of an HTTPStatusError carries the URL, and the URL the apikey.
+        detail = (f"HTTP {exc.response.status_code}" if isinstance(exc, httpx.HTTPStatusError)
+                  else str(exc)[:120])
+        log.warning("routing_fallback", extra={"reason": type(exc).__name__, "detail": detail})
         return haversine_drive_minutes(origin_lat, origin_lon, dest_lat, dest_lon), True
