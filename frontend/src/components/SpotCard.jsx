@@ -21,14 +21,60 @@ const TYPE_LABELS = {
   pond: 'Pond',
 }
 
+function formatMinutes(m) {
+  if (m < 60) return `${m} min`
+  const h = Math.floor(m / 60)
+  const r = m % 60
+  return r ? `${h} h ${r} min` : `${h} h`
+}
+
 function formatDriveTime(card) {
   if (!card.is_haversine && card.drive_minutes) {
-    return { text: `${card.drive_minutes} min drive`, estimated: false }
+    const text = `${card.drive_estimated ? '~' : ''}${formatMinutes(card.drive_minutes)} drive`
+    return { text, estimated: !!card.drive_estimated }
   }
   if (card.is_haversine && card.straight_line_miles) {
     return { text: `~${Math.round(card.straight_line_miles)} mi`, estimated: true }
   }
   return null
+}
+
+const FERRY_DEMAND = {
+  peak: 'peak day',
+  summer: 'summer weekday',
+  normal: 'off-peak',
+}
+
+function formatFerryDate(iso) {
+  const d = new Date(`${iso}T12:00:00`)
+  return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })
+}
+
+function Ferry({ ferry }) {
+  return (
+    <p className="text-xs text-gray-600 mb-1">
+      <span className="text-gray-500">Ferry: </span>
+      {ferry.name}
+      <span className="text-gray-400"> · {ferry.crossing_minutes} min crossing</span>
+      <span className={ferry.demand === 'peak' ? 'text-amber-700' : 'text-gray-500'}>
+        {' '}· {formatFerryDate(ferry.date)}: {FERRY_DEMAND[ferry.demand] || ferry.demand}, ~{ferry.wait_minutes} min wait
+      </span>
+      {ferry.schedule_url && (
+        <>
+          {' '}
+          <a href={ferry.schedule_url} target="_blank" rel="noopener noreferrer"
+             className="text-blue-600 hover:text-blue-800 whitespace-nowrap">Schedule ↗</a>
+        </>
+      )}
+      {ferry.reservations_url && (
+        <>
+          {' '}
+          <a href={ferry.reservations_url} target="_blank" rel="noopener noreferrer"
+             className="text-blue-600 hover:text-blue-800 whitespace-nowrap">Reserve ↗</a>
+        </>
+      )}
+    </p>
+  )
 }
 
 const ACCESS_KINDS = {
@@ -180,6 +226,9 @@ export default function SpotCard({ card, conversationId, onExcluded, onLocked, l
           )}
         </p>
       )}
+
+      {/* Ferries the drive depends on, for the trip date */}
+      {card.ferries?.map((f) => <Ferry key={f.id} ferry={f} />)}
 
       {/* Where the drive time goes to */}
       {card.access && <AccessPoint access={card.access} />}

@@ -28,6 +28,8 @@ CANDIDATE_A = {
     "water_body_name": "Pilchuck River",
     "spot_type": "river",
     "drive_minutes": 45,
+    "drive_estimated": True,
+    "ferries": [{"id": "ed-king", "name": "Edmonds–Kingston"}],
     "is_haversine": False,
     "straight_line_miles": None,
     "access": {"name": "Old Monroe Road Access", "kind": "access",
@@ -224,6 +226,8 @@ class TestBuildTurn:
         assert card_a["conditions"]["air_temp_f"] == 58.0
         assert card_a["conditions"]["aqi"] == 12
         assert card_a["access"]["name"] == "Old Monroe Road Access"
+        assert card_a["drive_estimated"] is True
+        assert card_a["ferries"][0]["id"] == "ed-king"
 
     @pytest.mark.asyncio
     async def test_card_name_falls_back_to_water_body_name(self):

@@ -419,6 +419,22 @@ class HereUsageCounter(Base):
     updated_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
+class DriveTimeCache(Base):
+    """HERE drive times reused for 90 days (migration 0019, TODO-19); read and
+    written by conditions/drive_time_cache.py. Ferry waits are added at read
+    time (they depend on the trip date), never stored."""
+    __tablename__ = "drive_time_cache"
+
+    origin_lat = Column(Numeric(7, 3), primary_key=True)
+    origin_lon = Column(Numeric(7, 3), primary_key=True)
+    dest_lat = Column(Numeric(8, 5), primary_key=True)
+    dest_lon = Column(Numeric(8, 5), primary_key=True)
+    avoid = Column(Text, primary_key=True, server_default="")    # HERE avoid[areas], '' when none
+    minutes = Column(Integer, nullable=False)
+    ferries = Column(JSONB, nullable=False, server_default="[]")  # [[lat, lon, lat, lon, minutes]]
+    fetched_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
 # ---------------------------------------------------------------------------
 # Flow references (TODO-18) — see conditions/flow_reference.py
 # ---------------------------------------------------------------------------

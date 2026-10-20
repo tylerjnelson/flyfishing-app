@@ -8,10 +8,11 @@ For each candidate the context builder routes HERE to one access point: the one
 with the shortest estimated drive (free, no HERE), skipping any whose vehicle
 gate is closed on the first trip day. One HERE call per water, as before.
 
-The estimate is the Haversine drive estimate to the point, or, for river points,
-to the point's gateway (where its local roads leave the highway network) plus the
-precomputed drive from there: a straight line alone picks the wrong end of a
-mountain valley (from Seattle, the top of the 18-mile Icicle Road).
+The estimate is the road network's (conditions/road_network.py, TODO-19). Without
+the graph file it is the Haversine drive estimate to the point, or, for river
+points, to the point's gateway (where its local roads leave the highway network)
+plus the precomputed drive from there: a straight line alone picks the wrong end
+of a mountain valley (from Seattle, the top of the 18-mile Icicle Road).
 
 Weaker points cost a few minutes so an official access a little further wins
 over a road bridge: OpenStreetMap +1 min, a bridge +2, a low-confidence match +3.
@@ -83,8 +84,8 @@ def estimated_minutes(ap, origin_lat: float, origin_lon: float) -> float:
     return haversine_drive_minutes(origin_lat, origin_lon, float(ap.latitude), float(ap.longitude))
 
 
-def _cost(ap, origin_lat: float, origin_lon: float) -> float:
-    cost = estimated_minutes(ap, origin_lat, origin_lon)
+def _cost(ap, origin_lat: float, origin_lon: float, estimate=None) -> float:
+    cost = estimate(ap) if estimate else estimated_minutes(ap, origin_lat, origin_lon)
     if ap.source == "osm":
         cost += _PENALTY_MIN["osm"]
     if ap.kind == "bridge":
@@ -94,18 +95,27 @@ def _cost(ap, origin_lat: float, origin_lon: float) -> float:
     return cost
 
 
-def pick_access_point(points: list, origin_lat: float | None, origin_lon: float | None, day: date):
-    """The access point to route to, or None when the water has none."""
+def pick_access_point(points: list, origin_lat: float | None, origin_lon: float | None, day: date,
+                      estimate=None):
+    """The access point to route to, or None when the water has none.
+    `estimate(ap) -> minutes` replaces the straight-line estimate (the road
+    network's, TODO-19); it returns inf for a point it cannot reach."""
     if not points:
         return None
     usable = [p for p in points if vehicle_access(p.seasonal, day) is not False] or list(points)
     if origin_lat is None or origin_lon is None:
         rank = {"high": 0, "medium": 1, "low": 2}
         return min(usable, key=lambda p: (rank.get(p.confidence, 3), p.source == "osm", p.key))
-    return min(usable, key=lambda p: (_cost(p, origin_lat, origin_lon), p.key))
+    return min(usable, key=lambda p: (_cost(p, origin_lat, origin_lon, estimate), p.key))
+
+
+_STOCKING_NAME = re.compile(r"^[A-Z0-9 .#/'&-]+(\([A-Z]{3,4}\))?$")
 
 
 def display_name(ap) -> str:
+    if ap.source == "curated" and _STOCKING_NAME.match(ap.name):
+        # Hand-placed spots kept the stocking report's name: "LAKE TAHUYA (KITS)".
+        return re.sub(r"\s*\([A-Z]{3,4}\)$", "", ap.name).title()
     if ap.source == "wdfw_shore":
         return "WDFW shore access"
     if ap.source == "wdfw_was":

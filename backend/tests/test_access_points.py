@@ -135,6 +135,12 @@ class TestDisplay:
         ap = _ap("wdfw_shore:10001", 48.68, -119.51, source="wdfw_shore", kind="shore", name="Aeneas Lake")
         assert access_summary(ap, date(2026, 6, 1))["name"] == "WDFW shore access"
 
+    def test_stocking_style_curated_name_cleaned(self):
+        ap = _ap("curated:1", 47.5, -122.9, source="curated", kind="access", name="LAKE TAHUYA (KITS)")
+        assert access_summary(ap, date(2026, 6, 1))["name"] == "Lake Tahuya"
+        ok = _ap("curated:2", 47.5, -122.9, source="curated", kind="access", name="Old Monroe Road Access")
+        assert access_summary(ok, date(2026, 6, 1))["name"] == "Old Monroe Road Access"
+
     def test_no_access(self):
         assert access_line(None) is None
 
@@ -144,7 +150,8 @@ class TestRouteDestinations:
 
     def test_access_point_used_else_spot_coordinate(self):
         import uuid
-        from chat.context_builder import _render_spot_conditions_lines, _route_destinations
+        from chat.context_builder import _render_spot_conditions_lines
+        from chat.drive_times import estimate
 
         lake = SimpleNamespace(id=uuid.uuid4())
         river = SimpleNamespace(id=uuid.uuid4())
@@ -153,18 +160,18 @@ class TestRouteDestinations:
         kenmore = _ap("wdfw_shore:2", 47.7560, -122.2470, source="wdfw_shore", kind="shore")
         renton = _ap("wdfw_shore:1", 47.5064, -122.2033, source="wdfw_shore", kind="shore")
 
-        dest, access = _route_destinations(
-            [(lake_spot, lake), (river_spot, river)], {lake.id: [renton, kenmore]},
-            47.76, -122.26, date(2026, 6, 1))
+        est = estimate([(lake_spot, lake), (river_spot, river)], {lake.id: [renton, kenmore]},
+                       47.76, -122.26, date(2026, 6, 1), 180)
 
-        assert dest[lake_spot.id] == (47.7560, -122.2470)      # nearest shore site, not the spot
-        assert dest[river_spot.id] == (48.0, -121.0)           # no access points: the spot
-        assert access[lake_spot.id]["name"] == "WDFW shore access"
-        assert river_spot.id not in access
+        assert est[lake_spot.id].dest == (47.7560, -122.2470)   # nearest shore site, not the spot
+        assert est[river_spot.id].dest == (48.0, -121.0)        # no access points: the spot
+        assert est[lake_spot.id].access["name"] == "WDFW shore access"
+        assert est[river_spot.id].access is None
+        assert est[lake_spot.id].minutes < est[river_spot.id].minutes
 
         lines = _render_spot_conditions_lines(
             {"water_body_name": "Lake Washington", "fishing_spot_id": "x", "drive_minutes": 25,
-             "access": access[lake_spot.id]},
+             "access": est[lake_spot.id].access},
             is_future_trip=False, departure_time=None)
         assert "Drive time: 25 min" in lines
         assert any(l.startswith("Access: WDFW shore access (shore)") for l in lines)

@@ -35,8 +35,8 @@ const STATE_LABELS = {
 function DriveTimeBanner() {
   return (
     <div className="mx-4 mt-3 px-3 py-2 bg-amber-50 border border-amber-200 rounded-lg text-sm text-amber-800">
-      Drive time data unavailable — verify drive times before heading out.
-      Distances shown are straight-line estimates.
+      Live drive times unavailable — times shown are road-network estimates.
+      Verify before heading out.
     </div>
   )
 }

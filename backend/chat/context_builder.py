@@ -6,7 +6,8 @@ chat message. Returns a BuildResult containing the assembled Ollama messages
 and session metadata.
 
 Pipeline (§6.3):
-  [1] Hard pre-LLM filters — drive time, active closures, flood stage
+  [1] Hard pre-LLM filters — drive-time estimate (road network), active
+      closures, flood stage
   [2] Tier 2 volatile delta overlay → session_score per candidate (§7.5)
   [3] Variety rotation — 60-day rule (§7.6)
   [4] Response cache check
@@ -29,20 +30,15 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import select, text
 
 from chat.response_cache import compute_intake_hash, get_cached_response
-from conditions.access_points import access_line, access_summary, pick_access_point
+from chat import drive_times
+from conditions.access_points import access_line
 from conditions.airnow import fetch_airnow
-from conditions.circuit_breaker import routing_breaker
 from conditions.cache import write_conditions_cache
 from conditions import flow_reference
 from conditions.normalizer import INTERVAL_REALTIME, compute_conditions_hash
 from conditions.noaa_nws import fetch_noaa_nws
-from conditions import here_budget
-from conditions.routing import (
-    get_drive_time,
-    haversine_drive_minutes,
-    haversine_km,
-    haversine_miles,
-)
+from conditions import ferries
+from conditions.routing import haversine_km
 from conditions.usgs import fetch_usgs_gauge
 from conditions import wdfw_advisories
 from config import settings
@@ -131,7 +127,6 @@ def assess_context_state(messages: list[dict], tools: list[dict] | None = None) 
 
 # Drive-time defaults
 _DEFAULT_MAX_DRIVE_MINUTES = 180
-_PREFILTER_KM = 250           # rough Haversine pre-filter before HERE calls
 
 # Wildfire proximity threshold
 _WILDFIRE_PROXIMITY_KM = 25.0
@@ -242,22 +237,6 @@ def _has_active_closure(
         )
         for cl in active_closures
     )
-
-
-def _route_destinations(pairs: list[tuple], aps_by_wb: dict, origin_lat, origin_lon, day: date) -> tuple[dict, dict]:
-    """Where each candidate's drive time goes: its open access point nearest the
-    user, else the spot's own coordinate (TODO-5). Returns ({spot id: (lat, lon)},
-    {spot id: access summary}); a water with no access point has no summary."""
-    dest: dict = {}
-    access: dict = {}
-    for fs, wb in pairs:
-        ap = pick_access_point(aps_by_wb.get(wb.id, []), origin_lat, origin_lon, day)
-        if ap is None:
-            dest[fs.id] = (float(fs.latitude), float(fs.longitude))
-        else:
-            dest[fs.id] = (float(ap.latitude), float(ap.longitude))
-            access[fs.id] = access_summary(ap, day)
-    return dest, access
 
 
 def _trip_dates(departure_time: datetime, return_time) -> tuple[date, date]:
@@ -957,8 +936,13 @@ def _render_spot_conditions_lines(
 
     if c.get("is_haversine"):
         lines.append(f"Distance: ~{c.get('straight_line_miles', '?')} miles straight-line")
+    elif c.get("drive_minutes") and c.get("drive_estimated"):
+        lines.append(f"Drive time: ~{c['drive_minutes']} min (estimate, not a live route)")
     elif c.get("drive_minutes"):
         lines.append(f"Drive time: {c['drive_minutes']} min")
+    ferry = ferries.ferry_line(c.get("ferries"))
+    if ferry:
+        lines.append(ferry)
     access = access_line(c.get("access"))
     if access:
         lines.append(access)
@@ -1180,7 +1164,9 @@ def _format_compact_menu(candidates: list[dict]) -> str:
         name = c.get("spot_name") or c.get("water_body_name") or "unknown"
         typ = c.get("spot_type", "?")
         if c.get("drive_minutes"):
-            drive = f"{c['drive_minutes']} min"
+            drive = f"~{c['drive_minutes']} min est." if c.get("drive_estimated") else f"{c['drive_minutes']} min"
+            if c.get("ferries"):
+                drive += " incl. ferry"
         elif c.get("is_haversine"):
             drive = f"~{c.get('straight_line_miles', '?')} mi"
         else:
@@ -1578,15 +1564,19 @@ async def build_context(
         excluded_ids = {str(e) for e in (conversation.excluded_spot_ids or [])}
         pairs = _filter_excluded(pairs, excluded_ids)
 
-        # Rough geo pre-filter before calling HERE
-        if origin_lat and origin_lon:
-            pairs = [
-                (fs, wb) for fs, wb in pairs
-                if haversine_km(
-                    float(fs.latitude), float(fs.longitude),
-                    origin_lat, origin_lon,
-                ) <= _PREFILTER_KM
-            ]
+        # Drive-time estimate on the road network, before any conditions fetch
+        # (TODO-19): picks each water's access point (TODO-5) and drops waters
+        # estimated well past the limit. HERE checks only the cards, after ranking.
+        trip_start, trip_end = _trip_dates(departure_time, trip.return_time)
+        aps_by_wb: dict = {}
+        if pairs:
+            ap_result = await db.execute(
+                select(AccessPoint).where(AccessPoint.water_body_id.in_({wb.id for _, wb in pairs}))
+            )
+            for ap in ap_result.scalars().all():
+                aps_by_wb.setdefault(ap.water_body_id, []).append(ap)
+        drive_est = drive_times.estimate(pairs, aps_by_wb, origin_lat, origin_lon, trip_start, max_drive_minutes)
+        pairs = [(fs, wb) for fs, wb in pairs if drive_times.within_margin(drive_est[fs.id], max_drive_minutes)]
 
         fishing_spots = [fs for fs, _ in pairs]
         water_bodies = [wb for _, wb in pairs]
@@ -1602,7 +1592,6 @@ async def build_context(
         # effect on the first fishing day are hard filters; everything else
         # (and a closure starting later in the trip) becomes an advisory. Both
         # used to be judged on today's date, not the trip's (TODO-21).
-        trip_start, trip_end = _trip_dates(departure_time, trip.return_time)
         rule_result = await db.execute(
             select(EmergencyClosure).where(
                 (EmergencyClosure.effective <= trip_end) | EmergencyClosure.effective.is_(None),
@@ -1690,108 +1679,28 @@ async def build_context(
         if flooded:
             log.info("flood_gated", extra={"water_bodies": sorted(flooded)})
 
-        # Each water is routed to its open access point nearest the user (TODO-5);
-        # the spot's own coordinate only when the water has none.
-        aps_by_wb: dict = {}
-        if filtered_pairs:
-            ap_result = await db.execute(
-                select(AccessPoint).where(AccessPoint.water_body_id.in_({wb.id for _, wb in filtered_pairs}))
-            )
-            for ap in ap_result.scalars().all():
-                aps_by_wb.setdefault(ap.water_body_id, []).append(ap)
-        dest, access = _route_destinations(filtered_pairs, aps_by_wb, origin_lat, origin_lon, trip_start)
-
-        # Drive-time filter — parallel HERE calls
         drive_time_unavailable = False
         candidates_raw: list[dict] = []
-
-        if origin_lat and origin_lon and filtered_pairs:
-            # Claim the monthly HERE budget up front (§19.6 hard cap). Only the
-            # granted spots may call HERE this build; any remainder fall back to
-            # Haversine WITHOUT a HERE request, so we can never exceed the cap.
-            # When HERE is disabled (batch/benchmark), skip the reserve entirely and
-            # route every pair through get_drive_time, which returns deterministic
-            # Haversine minutes with is_fallback=False (no budget touched, no banner).
-            circuit_open = not settings.here_disabled and routing_breaker.is_blocking()
-            if settings.here_disabled:
-                granted = len(filtered_pairs)
-            elif circuit_open:
-                # HERE failed repeatedly in the last minute: don't spend budget
-                # on calls the breaker would refuse anyway.
-                granted = 0
-                log.warning("routing_circuit_open", extra={"via_haversine": len(filtered_pairs)})
-            else:
-                granted = await here_budget.reserve(len(filtered_pairs))
-            here_pairs = filtered_pairs[:granted]
-            fallback_pairs = filtered_pairs[granted:]
-            if fallback_pairs and not circuit_open:
-                log.warning(
-                    "here_budget_capped_build",
-                    extra={
-                        "total": len(filtered_pairs),
-                        "via_here": len(here_pairs),
-                        "via_haversine": len(fallback_pairs),
-                    },
-                )
-
-            here_results = (
-                await asyncio.gather(*[
-                    get_drive_time(origin_lat, origin_lon, *dest[fs.id], departure_time)
-                    for fs, _ in here_pairs
-                ])
-                if here_pairs
-                else []
-            )
-            # Budget-denied spots: Haversine fallback, flagged is_fallback=True so
-            # the drive_time_unavailable banner fires exactly as on a HERE outage.
-            fallback_results = [
-                (haversine_drive_minutes(origin_lat, origin_lon, *dest[fs.id]), True)
-                for fs, _ in fallback_pairs
-            ]
-            ordered_pairs = here_pairs + fallback_pairs
-            drive_results = here_results + fallback_results
-
-            for (fs, wb), (drive_min, is_fallback) in zip(ordered_pairs, drive_results):
-                if is_fallback:
-                    drive_time_unavailable = True
-                if drive_min > max_drive_minutes:
-                    continue
-                wb_id = str(wb.id)
-                candidates_raw.append({
-                    "fishing_spot": fs,
-                    "water_body": wb,
-                    "drive_minutes": drive_min,
-                    "is_haversine": is_fallback,
-                    "straight_line_miles": (
-                        haversine_miles(origin_lat, origin_lon, *dest[fs.id]) if is_fallback else None
-                    ),
-                    "access": access.get(fs.id),
-                    "usgs": cond_by.get((wb_id, "usgs")),
-                    "nws": cond_by.get((wb_id, "noaa_nws")),
-                    "nwrfc": cond_by.get((wb_id, "noaa_nwrfc")),
-                    "wta": cond_by.get((wb_id, "wta")),
-                    "airnow": cond_by.get((wb_id, "airnow")),
-                    "snotel": cond_by.get((wb_id, "snotel")),
-                    "flow": flow_by_wb.get(wb_id),
-                })
-        else:
-            for fs, wb in filtered_pairs:
-                wb_id = str(wb.id)
-                candidates_raw.append({
-                    "fishing_spot": fs,
-                    "water_body": wb,
-                    "drive_minutes": None,
-                    "is_haversine": False,
-                    "straight_line_miles": None,
-                    "access": access.get(fs.id),
-                    "usgs": cond_by.get((wb_id, "usgs")),
-                    "nws": cond_by.get((wb_id, "noaa_nws")),
-                    "nwrfc": cond_by.get((wb_id, "noaa_nwrfc")),
-                    "wta": cond_by.get((wb_id, "wta")),
-                    "airnow": cond_by.get((wb_id, "airnow")),
-                    "snotel": cond_by.get((wb_id, "snotel")),
-                    "flow": flow_by_wb.get(wb_id),
-                })
+        for fs, wb in filtered_pairs:
+            wb_id = str(wb.id)
+            est = drive_est[fs.id]
+            candidates_raw.append({
+                "fishing_spot": fs,
+                "water_body": wb,
+                "drive_minutes": round(est.minutes) if est.minutes is not None else None,
+                "drive_estimated": est.minutes is not None,
+                "route_to": list(est.dest),
+                "ferries": drive_times.ferry_summaries(est.ferries, trip_start),
+                "route_warnings": drive_times.pass_warnings(est.passes, trip_start),
+                "access": est.access,
+                "usgs": cond_by.get((wb_id, "usgs")),
+                "nws": cond_by.get((wb_id, "noaa_nws")),
+                "nwrfc": cond_by.get((wb_id, "noaa_nwrfc")),
+                "wta": cond_by.get((wb_id, "wta")),
+                "airnow": cond_by.get((wb_id, "airnow")),
+                "snotel": cond_by.get((wb_id, "snotel")),
+                "flow": flow_by_wb.get(wb_id),
+            })
 
         # --------------------------------------------------------------
         # [2] Tier 2 volatile delta → session_score
@@ -1816,14 +1725,19 @@ async def build_context(
                 if permit_detail:
                     advisory = f"Permit required — {permit_detail}"
                 warnings = [advisory] + warnings
-            c["warnings"] = warnings
-            base = float(wb.score or 0) + delta
+            c["warnings"] = warnings + c["route_warnings"]
+            # A ferry is a fixed schedule and an uncertain wait: a small cost,
+            # more on a summer weekend or holiday (conditions/ferries.py).
+            base = float(wb.score or 0) + delta - ferries.score_penalty(c["ferries"])
             if trip_goal == "explore" and fs.last_visited is None:
                 base += 2.0
             c["session_score"] = base
 
-        candidates_raw.sort(key=lambda c: c["session_score"], reverse=True)
-        candidates_raw = candidates_raw[:_MAX_CANDIDATES]
+        # Ties (many stocked lakes share a score) go to the shorter drive: nearer
+        # waters first, and fewer HERE calls spent on cards near the limit.
+        candidates_raw.sort(key=lambda c: (-round(c["session_score"], 2), c["drive_minutes"] or 0))
+        # A few extra: verify_top below drops cards HERE puts past the limit.
+        candidates_raw = candidates_raw[:_MAX_CANDIDATES + drive_times.MAX_HERE_CALLS]
 
         # Serialise to JSONB-safe dicts
         candidates = [
@@ -1836,8 +1750,11 @@ async def build_context(
                 "spot_type": c["water_body"].type,
                 "session_score": round(c["session_score"], 4),
                 "drive_minutes": c["drive_minutes"],
-                "is_haversine": c["is_haversine"],
-                "straight_line_miles": c["straight_line_miles"],
+                "drive_estimated": c["drive_estimated"],
+                "is_haversine": False,
+                "straight_line_miles": None,
+                "route_to": c["route_to"],
+                "ferries": c["ferries"],
                 "access": c.get("access"),
                 "last_visited": (
                     c["fishing_spot"].last_visited.isoformat()
@@ -1875,6 +1792,13 @@ async def build_context(
         # [3] Variety rotation — 60-day rule (§7.6)
         # --------------------------------------------------------------
         candidates = _apply_variety_rotation(candidates)
+
+        # HERE for the cards only (TODO-19): the top three after ranking and
+        # rotation, from the 90-day cache when it has them.
+        candidates, drive_time_unavailable = await drive_times.verify_top(
+            candidates, origin_lat, origin_lon, departure_time, trip_start, max_drive_minutes,
+        )
+        candidates = candidates[:_MAX_CANDIDATES]
 
     # ------------------------------------------------------------------
     # Agentic harness (Phase 4): frozen prefix + lean follow-ups. Distinct
