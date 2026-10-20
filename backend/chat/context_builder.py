@@ -40,7 +40,8 @@ from conditions.noaa_nws import fetch_noaa_nws
 from conditions import ferries
 from conditions.routing import haversine_km
 from conditions.usgs import fetch_usgs_gauge
-from conditions import wdfw_advisories
+from conditions import wdfw_advisories, wdfw_seasons
+from conditions.wdfw_emergency import reopens_fishing
 from config import settings
 from db.connection import AsyncSessionLocal
 from db.models import (
@@ -208,6 +209,43 @@ def _filter_excluded(pairs: list[tuple], excluded_ids: set[str]) -> list[tuple]:
 
 
 _PACIFIC = ZoneInfo("America/Los_Angeles")
+
+
+def _season_filter(pairs: list[tuple], wdfw_rules: list, start: date, end: date) -> tuple[list[tuple], dict]:
+    """
+    Drop waters whose annual season (the WDFW pamphlet, conditions/wdfw_seasons.py)
+    is closed on every day of the trip (TODO-22). An emergency rule that opens
+    the water during the trip ("Mineral Lake fishing season extended through
+    Oct. 31") overrides the pamphlet: the water stays and its rule reaches the
+    model as an advisory. Returns (pairs, {water_body_id: [season advisories]}).
+    """
+    by_wb: dict = {}
+    kept, gated = [], set()
+    for fs, wb in pairs:
+        if wb.id not in by_wb:
+            st = wdfw_seasons.status(wb.name, wb.aliases, wb.county, wb.type, start, end)
+            if st.gate and any(
+                reopens_fishing(_rule_attr(r, "action")) and wdfw_advisories.rule_applies(
+                    r, water_body_id=wb.id, name=wb.name, aliases=wb.aliases, county=wb.county)
+                for r in wdfw_rules
+            ):
+                st = wdfw_seasons.SeasonStatus(gate=False, lines=[
+                    f"Annual season: closed on these dates under the WDFW pamphlet"
+                    f"{f' ({st.entry.title()})' if st.entry else ''}, but an emergency rule opens it; "
+                    f"see the WDFW rule."], entry=st.entry)
+            by_wb[wb.id] = st
+        st = by_wb[wb.id]
+        if st.gate:
+            gated.add(wb.name)
+            continue
+        kept.append((fs, wb))
+    if gated:
+        log.info("season_gated", extra={"count": len(gated), "water_bodies": sorted(gated)[:40]})
+    return kept, {k: v.lines for k, v in by_wb.items() if v.lines}
+
+
+def _rule_attr(rule, name):
+    return rule.get(name) if isinstance(rule, dict) else getattr(rule, name, None)
 
 
 def _has_active_closure(
@@ -1564,10 +1602,31 @@ async def build_context(
         excluded_ids = {str(e) for e in (conversation.excluded_spot_ids or [])}
         pairs = _filter_excluded(pairs, excluded_ids)
 
+        trip_start, trip_end = _trip_dates(departure_time, trip.return_time)
+
+        # WDFW emergency rules in effect at any point of the trip. Closures in
+        # effect on the first fishing day are hard filters; everything else
+        # (and a closure starting later in the trip) becomes an advisory. Both
+        # used to be judged on today's date, not the trip's (TODO-21).
+        rule_result = await db.execute(
+            select(EmergencyClosure).where(
+                (EmergencyClosure.effective <= trip_end) | EmergencyClosure.effective.is_(None),
+                (EmergencyClosure.expires >= trip_start) | EmergencyClosure.expires.is_(None),
+            )
+        )
+        wdfw_rules: list = rule_result.scalars().all()
+        active_closures = [
+            r for r in wdfw_rules
+            if r.closes_fishing is True and wdfw_advisories.in_effect(r, trip_start)
+        ]
+
+        # Annual seasons from the WDFW pamphlet (TODO-22): a water closed for
+        # the whole trip is dropped, unless an emergency rule opens it.
+        pairs, season_warnings = _season_filter(pairs, wdfw_rules, trip_start, trip_end)
+
         # Drive-time estimate on the road network, before any conditions fetch
         # (TODO-19): picks each water's access point (TODO-5) and drops waters
         # estimated well past the limit. HERE checks only the cards, after ranking.
-        trip_start, trip_end = _trip_dates(departure_time, trip.return_time)
         aps_by_wb: dict = {}
         if pairs:
             ap_result = await db.execute(
@@ -1587,22 +1646,6 @@ async def build_context(
 
         # Real-time conditions fetch
         await _fetch_and_cache_realtime(fishing_spots, water_bodies, _band_sites(flow_refs))
-
-        # WDFW emergency rules in effect at any point of the trip. Closures in
-        # effect on the first fishing day are hard filters; everything else
-        # (and a closure starting later in the trip) becomes an advisory. Both
-        # used to be judged on today's date, not the trip's (TODO-21).
-        rule_result = await db.execute(
-            select(EmergencyClosure).where(
-                (EmergencyClosure.effective <= trip_end) | EmergencyClosure.effective.is_(None),
-                (EmergencyClosure.expires >= trip_start) | EmergencyClosure.expires.is_(None),
-            )
-        )
-        wdfw_rules: list = rule_result.scalars().all()
-        active_closures = [
-            r for r in wdfw_rules
-            if r.closes_fishing is True and wdfw_advisories.in_effect(r, trip_start)
-        ]
 
         # InciWeb active WA fires
         inciweb_result = await db.execute(
@@ -1725,7 +1768,7 @@ async def build_context(
                 if permit_detail:
                     advisory = f"Permit required — {permit_detail}"
                 warnings = [advisory] + warnings
-            c["warnings"] = warnings + c["route_warnings"]
+            c["warnings"] = warnings + c["route_warnings"] + season_warnings.get(wb.id, [])
             # A ferry is a fixed schedule and an uncertain wait: a small cost,
             # more on a summer weekend or holiday (conditions/ferries.py).
             base = float(wb.score or 0) + delta - ferries.score_penalty(c["ferries"])
