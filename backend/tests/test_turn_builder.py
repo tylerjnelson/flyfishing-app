@@ -30,6 +30,8 @@ CANDIDATE_A = {
     "drive_minutes": 45,
     "is_haversine": False,
     "straight_line_miles": None,
+    "access": {"name": "Old Monroe Road Access", "kind": "access",
+               "directions_url": "https://www.google.com/maps/dir/?api=1&destination=47.987200%2C-122.035300"},
     "session_score": 8.5,
     "last_visited": "2025-08-15",
     "warnings": [],
@@ -221,6 +223,7 @@ class TestBuildTurn:
         assert card_a["conditions"]["weather_summary"] == "Partly Cloudy"
         assert card_a["conditions"]["air_temp_f"] == 58.0
         assert card_a["conditions"]["aqi"] == 12
+        assert card_a["access"]["name"] == "Old Monroe Road Access"
 
     @pytest.mark.asyncio
     async def test_card_name_falls_back_to_water_body_name(self):

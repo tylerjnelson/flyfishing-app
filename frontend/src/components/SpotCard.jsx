@@ -31,6 +31,48 @@ function formatDriveTime(card) {
   return null
 }
 
+const ACCESS_KINDS = {
+  boat_ramp: 'boat ramp',
+  hand_launch: 'hand launch',
+  shore: 'shore access',
+  pier: 'pier/dock',
+  access_area: 'access area',
+  beach: 'beach access',
+  campground: 'campground',
+  parking: 'parking',
+  bridge: 'road bridge',
+}
+
+function AccessPoint({ access }) {
+  const kind = ACCESS_KINDS[access.kind]
+  const details = [access.description, access.parking, access.pass_required].filter(Boolean)
+  return (
+    <div className="text-xs text-gray-600 mb-2">
+      <p>
+        <span className="text-gray-500">Access: </span>
+        {access.name}
+        {kind && access.name.toLowerCase() !== kind && <span className="text-gray-400"> · {kind}</span>}
+        {' '}
+        <a
+          href={access.directions_url}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-blue-600 hover:text-blue-800 whitespace-nowrap"
+        >
+          Directions ↗
+        </a>
+      </p>
+      {details.length > 0 && <p className="text-gray-400">{details.join(' · ')}</p>}
+      {access.vehicle_access === false && (
+        <p className="text-amber-700">Vehicle gate closed on your trip date: {access.seasonal}</p>
+      )}
+      {access.vehicle_access == null && access.seasonal && (
+        <p className="text-gray-500">Seasonal: {access.seasonal}</p>
+      )}
+    </div>
+  )
+}
+
 function CfsDisplay({ cfs, trend }) {
   const arrow = trend === 'rising' ? ' ↑' : trend === 'dropping' ? ' ↓' : ''
   return (
@@ -138,6 +180,9 @@ export default function SpotCard({ card, conversationId, onExcluded, onLocked, l
           )}
         </p>
       )}
+
+      {/* Where the drive time goes to */}
+      {card.access && <AccessPoint access={card.access} />}
 
       {/* Conditions row */}
       {(cond.cfs != null || cond.water_temp_f != null || cond.weather_summary) && (

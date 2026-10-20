@@ -169,6 +169,38 @@ class FishingSpot(Base):
     saved_spots = relationship("SavedSpot", back_populates="fishing_spot")
 
 
+class AccessPoint(Base):
+    """A public place to park and get on a water body (migration 0018, TODO-5).
+    Drive time is routed to the open one with the shortest estimated drive."""
+    __tablename__ = "access_points"
+    __table_args__ = (UniqueConstraint("water_body_id", "key"),)
+
+    id = Column(Uuid(), primary_key=True, default=uuid.uuid4)
+    water_body_id = Column(Uuid(), ForeignKey("water_bodies.id", ondelete="CASCADE"), nullable=False)
+    key = Column(Text, nullable=False)        # "<source>:<source id>", e.g. "wdfw_was:204"
+    source = Column(Text, nullable=False)     # wdfw_was | wdfw_shore | parks_launch | ecology | curated | osm
+    name = Column(Text, nullable=False)
+    kind = Column(Text, nullable=False)       # boat_ramp | hand_launch | shore | pier | access_area | beach |
+                                              # campground | parking | bridge | access (hand-placed)
+    latitude = Column(Numeric(9, 6), nullable=False)
+    longitude = Column(Numeric(9, 6), nullable=False)
+    description = Column(Text)
+    parking = Column(Text)
+    facilities = Column(ARRAY(Text))
+    seasonal = Column(Text)                   # vehicle-gate text, e.g. "Year-round. Closed to vehicles October 1 - February 28."
+    pass_required = Column(Text)
+    managing_entity = Column(Text)
+    # Where the local roads to this point leave the highway network, and the drive
+    # from there (river points; scripts/build_access_points.py road_gateways).
+    gateway_latitude = Column(Numeric(9, 6))
+    gateway_longitude = Column(Numeric(9, 6))
+    gateway_minutes = Column(Numeric)
+    confidence = Column(Text, nullable=False)  # high | medium | low
+    match_method = Column(Text)
+    match_note = Column(Text)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
 class Note(Base):
     __tablename__ = "notes"
 

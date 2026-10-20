@@ -29,6 +29,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import select, text
 
 from chat.response_cache import compute_intake_hash, get_cached_response
+from conditions.access_points import access_line, access_summary, pick_access_point
 from conditions.airnow import fetch_airnow
 from conditions.circuit_breaker import routing_breaker
 from conditions.cache import write_conditions_cache
@@ -47,6 +48,7 @@ from conditions import wdfw_advisories
 from config import settings
 from db.connection import AsyncSessionLocal
 from db.models import (
+    AccessPoint,
     ConditionsCache,
     Conversation,
     EmergencyClosure,
@@ -240,6 +242,22 @@ def _has_active_closure(
         )
         for cl in active_closures
     )
+
+
+def _route_destinations(pairs: list[tuple], aps_by_wb: dict, origin_lat, origin_lon, day: date) -> tuple[dict, dict]:
+    """Where each candidate's drive time goes: its open access point nearest the
+    user, else the spot's own coordinate (TODO-5). Returns ({spot id: (lat, lon)},
+    {spot id: access summary}); a water with no access point has no summary."""
+    dest: dict = {}
+    access: dict = {}
+    for fs, wb in pairs:
+        ap = pick_access_point(aps_by_wb.get(wb.id, []), origin_lat, origin_lon, day)
+        if ap is None:
+            dest[fs.id] = (float(fs.latitude), float(fs.longitude))
+        else:
+            dest[fs.id] = (float(ap.latitude), float(ap.longitude))
+            access[fs.id] = access_summary(ap, day)
+    return dest, access
 
 
 def _trip_dates(departure_time: datetime, return_time) -> tuple[date, date]:
@@ -941,6 +959,9 @@ def _render_spot_conditions_lines(
         lines.append(f"Distance: ~{c.get('straight_line_miles', '?')} miles straight-line")
     elif c.get("drive_minutes"):
         lines.append(f"Drive time: {c['drive_minutes']} min")
+    access = access_line(c.get("access"))
+    if access:
+        lines.append(access)
 
     cfs = usgs.get("cfs")
     temp = usgs.get("temp_f")
@@ -1669,6 +1690,17 @@ async def build_context(
         if flooded:
             log.info("flood_gated", extra={"water_bodies": sorted(flooded)})
 
+        # Each water is routed to its open access point nearest the user (TODO-5);
+        # the spot's own coordinate only when the water has none.
+        aps_by_wb: dict = {}
+        if filtered_pairs:
+            ap_result = await db.execute(
+                select(AccessPoint).where(AccessPoint.water_body_id.in_({wb.id for _, wb in filtered_pairs}))
+            )
+            for ap in ap_result.scalars().all():
+                aps_by_wb.setdefault(ap.water_body_id, []).append(ap)
+        dest, access = _route_destinations(filtered_pairs, aps_by_wb, origin_lat, origin_lon, trip_start)
+
         # Drive-time filter — parallel HERE calls
         drive_time_unavailable = False
         candidates_raw: list[dict] = []
@@ -1704,11 +1736,7 @@ async def build_context(
 
             here_results = (
                 await asyncio.gather(*[
-                    get_drive_time(
-                        origin_lat, origin_lon,
-                        float(fs.latitude), float(fs.longitude),
-                        departure_time,
-                    )
+                    get_drive_time(origin_lat, origin_lon, *dest[fs.id], departure_time)
                     for fs, _ in here_pairs
                 ])
                 if here_pairs
@@ -1717,12 +1745,7 @@ async def build_context(
             # Budget-denied spots: Haversine fallback, flagged is_fallback=True so
             # the drive_time_unavailable banner fires exactly as on a HERE outage.
             fallback_results = [
-                (
-                    haversine_drive_minutes(
-                        origin_lat, origin_lon, float(fs.latitude), float(fs.longitude)
-                    ),
-                    True,
-                )
+                (haversine_drive_minutes(origin_lat, origin_lon, *dest[fs.id]), True)
                 for fs, _ in fallback_pairs
             ]
             ordered_pairs = here_pairs + fallback_pairs
@@ -1740,9 +1763,9 @@ async def build_context(
                     "drive_minutes": drive_min,
                     "is_haversine": is_fallback,
                     "straight_line_miles": (
-                        haversine_miles(origin_lat, origin_lon, float(fs.latitude), float(fs.longitude))
-                        if is_fallback else None
+                        haversine_miles(origin_lat, origin_lon, *dest[fs.id]) if is_fallback else None
                     ),
+                    "access": access.get(fs.id),
                     "usgs": cond_by.get((wb_id, "usgs")),
                     "nws": cond_by.get((wb_id, "noaa_nws")),
                     "nwrfc": cond_by.get((wb_id, "noaa_nwrfc")),
@@ -1760,6 +1783,7 @@ async def build_context(
                     "drive_minutes": None,
                     "is_haversine": False,
                     "straight_line_miles": None,
+                    "access": access.get(fs.id),
                     "usgs": cond_by.get((wb_id, "usgs")),
                     "nws": cond_by.get((wb_id, "noaa_nws")),
                     "nwrfc": cond_by.get((wb_id, "noaa_nwrfc")),
@@ -1814,6 +1838,7 @@ async def build_context(
                 "drive_minutes": c["drive_minutes"],
                 "is_haversine": c["is_haversine"],
                 "straight_line_miles": c["straight_line_miles"],
+                "access": c.get("access"),
                 "last_visited": (
                     c["fishing_spot"].last_visited.isoformat()
                     if c["fishing_spot"].last_visited else None

@@ -143,6 +143,7 @@ async def build_turn(
                 "drive_minutes": cand.get("drive_minutes"),
                 "is_haversine": cand.get("is_haversine", False),
                 "straight_line_miles": cand.get("straight_line_miles"),
+                "access": cand.get("access"),
                 "session_score": cand.get("session_score"),
                 "last_visited": cand.get("last_visited"),
                 "warnings": list(cand.get("warnings") or []),

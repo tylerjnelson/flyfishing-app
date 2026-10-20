@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.sql.elements import TextClause
 
 from conditions.cache import CACHE_TTL_HOURS
 
@@ -137,3 +138,44 @@ async def test_stocking_job_skips_removal_when_fetch_empty():
          patch.object(sched, "AsyncSessionLocal", _session_factory(session)):
         await sched.job_wdfw_stocking()
     assert not any(hasattr(s, "compile") and _sql(s).startswith("DELETE") for s in executed)
+
+
+async def test_stocking_job_links_by_alias_after_a_merge():
+    """TODO-5 merged "MINERAL LK (LEWI)" into "Mineral Lake", keeping the stocking
+    name as an alias: its stockings must land on the merged row. An alias two
+    waters share links nowhere."""
+    import conditions.scheduler as sched
+    mineral, other_a, other_b = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    records = [
+        {"water_name": "MINERAL LK (LEWI)", "stocked_date": "2026-10-15", "species": "Rainbow",
+         "count": 10, "size_description": "Legals", "source_record_id": "m-1"},
+        {"water_name": "SHARED ALIAS", "stocked_date": "2026-10-15", "species": "Rainbow",
+         "count": 10, "size_description": "Legals", "source_record_id": "s-1"},
+    ]
+    lookup = MagicMock()
+    lookup.all.return_value = [
+        SimpleNamespace(id=mineral, name="Mineral Lake", aliases=["Mineral Lake", "MINERAL LK (LEWI)"]),
+        SimpleNamespace(id=other_a, name="A Lake", aliases=["SHARED ALIAS"]),
+        SimpleNamespace(id=other_b, name="B Lake", aliases=["SHARED ALIAS"]),
+    ]
+    inserts, updates = [], []
+
+    async def execute(stmt, params=None, *a, **k):
+        sql = str(stmt) if isinstance(stmt, TextClause) else _sql(stmt)
+        if sql.startswith("SELECT"):
+            return lookup
+        if sql.startswith("INSERT INTO stocking_events"):
+            inserts.append(stmt.compile(dialect=postgresql.dialect()).params)
+        if "UPDATE water_bodies" in sql:
+            updates.append(params)
+        return MagicMock(rowcount=1)
+
+    session = MagicMock()
+    session.execute = execute
+    with patch.object(sched, "fetch_wdfw_stocking", AsyncMock(return_value=records)), \
+         patch.object(sched, "AsyncSessionLocal", _session_factory(session)):
+        await sched.job_wdfw_stocking()
+
+    by_record = {p["source_record_id"]: p["water_body_id"] for p in inserts}
+    assert by_record == {"m-1": mineral, "s-1": None}
+    assert [u["wb_id"] for u in updates] == [mineral]

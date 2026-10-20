@@ -507,12 +507,21 @@ async def job_wdfw_stocking() -> None:
         _log_job_done("wdfw_stocking", failed=1, serving="stale_cache")
         return
 
-    # Build name→water_body_id map for linking stocking events
+    # Build name→water_body_id map for linking stocking events. Aliases count
+    # too: duplicate rows were merged into the recommendable one, keeping the
+    # stocking name ("MINERAL LK (LEWI)") as an alias (TODO-5). A name wins over
+    # an alias; an alias two waters share links nowhere.
     name_to_wb_id: dict[str, object] = {}
+    alias_to_wb_ids: dict[str, set] = {}
     async with AsyncSessionLocal() as session:
-        result = await session.execute(select(WaterBody.id, WaterBody.name))
+        result = await session.execute(select(WaterBody.id, WaterBody.name, WaterBody.aliases))
         for row in result.all():
             name_to_wb_id[row.name.upper()] = row.id
+            for alias in row.aliases or []:
+                alias_to_wb_ids.setdefault(alias.upper(), set()).add(row.id)
+    for alias, ids in alias_to_wb_ids.items():
+        if alias not in name_to_wb_id and len(ids) == 1:
+            name_to_wb_id[alias] = next(iter(ids))
 
     async with AsyncSessionLocal() as session:
         async with session.begin():
@@ -560,14 +569,17 @@ async def job_wdfw_stocking() -> None:
         async with AsyncSessionLocal() as session:
             async with session.begin():
                 for name_upper, stocked_date in latest_by_name.items():
+                    wb_id = name_to_wb_id.get(name_upper)
+                    if wb_id is None:
+                        continue
                     result = await session.execute(
                         text("""
                             UPDATE water_bodies
                                SET last_stocked_date = :stocked_date
-                             WHERE UPPER(name) = :name
+                             WHERE id = :wb_id
                                AND (last_stocked_date IS NULL OR last_stocked_date < :stocked_date)
                         """),
-                        {"name": name_upper, "stocked_date": stocked_date},
+                        {"wb_id": wb_id, "stocked_date": stocked_date},
                     )
                     water_bodies_updated += result.rowcount
 
