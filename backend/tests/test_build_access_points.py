@@ -109,3 +109,29 @@ class TestActivationAndNames:
         assert proper_name(w, aps, {}) == "Silver Lake"
         assert proper_name(_wb("Y", "Yakima Basin watershed", type="river", source="dnr"), [], {}) == "Yakima River"
         assert proper_name(_wb("M", "Mineral Lake", "Lewis"), [], {}) is None
+
+
+# --- TODO-5 review corrections (2026-10-21) ------------------------------------
+
+def test_wdfw_shore_typos_are_corrected():
+    from scripts.build_access_points import from_wdfw_shore
+    f = {"attributes": {"AccessSiteID": 10639, "LakeName": "Spearfish Lake", "Description": "Boat ramp",
+                        "Latitude": 46.626002, "Longitude": -121.128247, "County": "Klickitat"}}
+    ap = from_wdfw_shore(f)
+    assert (ap.lat, ap.lon) == (45.626002, -121.128247)
+    f["attributes"].update(AccessSiteID=1, Latitude=47.1, Longitude=-120.2)
+    assert (from_wdfw_shore(f).lat, from_wdfw_shore(f).lon) == (47.1, -120.2)
+
+
+def test_shipped_file_has_the_review_fixes():
+    import json
+    from pathlib import Path
+    d = json.loads((Path(__file__).resolve().parent.parent / "data" / "access_points.json").read_text())
+    aps = {a["key"]: a for a in d["access_points"]}
+    assert aps["wdfw_shore:10639"]["lat"] == 45.626002          # Spearfish Lake
+    assert aps["wdfw_shore:10607"]["lon"] == -121.375493        # Rowland, South
+    assert "wdfw_shore:10344" not in aps and "osm:374042226" not in aps
+    used = {x["key"] for e in d["water_bodies"].values() for x in e["access"]}
+    assert used <= set(aps)
+    assert {m["from_name"] for m in d["merges"]} >= {"COFFEEPOT LK (LINC)", "ICE HOUSE LK (SKAM)",
+                                                      "GOLF COURSE PD (ASOT)", "BLACK LK (PACI)"}

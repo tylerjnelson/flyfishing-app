@@ -8779,8 +8779,8 @@
    "source_id": "10088",
    "name": "Carlisle Lake",
    "kind": "boat_ramp",
-   "lat": 46.724113,
-   "lon": -122.72651,
+   "lat": 46.57821,
+   "lon": -122.72659,
    "county": "Lewis",
    "water_name": "Carlisle Lake",
    "description": "Boat ramp, trail around lake offers shore fishing",
@@ -12496,7 +12496,7 @@
    "source_id": "10266",
    "name": "Icehouse Lake",
    "kind": "shore",
-   "lat": 46.661441,
+   "lat": 45.661441,
    "lon": -121.906395,
    "county": "Skamania",
    "water_name": "Icehouse Lake",
@@ -14128,27 +14128,6 @@
    "gateway_minutes": null,
    "key": "wdfw_shore:10345",
    "nhd_water": "Lake Morton"
-  },
-  {
-   "source": "wdfw_shore",
-   "source_id": "10344",
-   "name": "Lake Morton",
-   "kind": "boat_ramp",
-   "lat": 47.42827,
-   "lon": -122.10701,
-   "county": "King",
-   "water_name": "Lake Morton",
-   "description": "Very limited shore fishing at boat ramp",
-   "parking": null,
-   "facilities": [],
-   "seasonal": null,
-   "pass_required": "Discover Pass or WDFW Vehicle Access Pass",
-   "managing_entity": "WDFW",
-   "gateway_lat": null,
-   "gateway_lon": null,
-   "gateway_minutes": null,
-   "key": "wdfw_shore:10344",
-   "nhd_water": "Shady Lake"
   },
   {
    "source": "wdfw_shore",
@@ -19616,7 +19595,7 @@
    "name": "Rowland, South",
    "kind": "shore",
    "lat": 45.709121,
-   "lon": -122.375493,
+   "lon": -121.375493,
    "county": "Klickitat",
    "water_name": "Rowland, South",
    "description": "Gravel parking area, shore fishing east and west of parking area along HWY 14, do not fish the lake shore on the railroad side of the lake",
@@ -20266,7 +20245,7 @@
    "source_id": "10639",
    "name": "Spearfish Lake",
    "kind": "boat_ramp",
-   "lat": 46.626002,
+   "lat": 45.626002,
    "lon": -121.128247,
    "county": "Klickitat",
    "water_name": "Spearfish Lake",
@@ -21169,7 +21148,7 @@
    "source_id": "10682",
    "name": "Tunnel Lake",
    "kind": "shore",
-   "lat": 45.617709,
+   "lat": 45.717709,
    "lon": -121.617709,
    "county": "Skamania",
    "water_name": "Tunnel Lake",
@@ -24360,48 +24339,6 @@
    "nhd_water": "Klickitat River"
   },
   {
-   "source": "curated",
-   "source_id": "03c41a8e-a73c-47d7-b47b-f41aae07d9af",
-   "name": "LAKE TAHUYA (KITS)",
-   "kind": "access",
-   "lat": 47.52713,
-   "lon": -122.68421,
-   "county": "Kitsap",
-   "water_name": null,
-   "description": null,
-   "parking": null,
-   "facilities": [],
-   "seasonal": null,
-   "pass_required": null,
-   "managing_entity": null,
-   "gateway_lat": null,
-   "gateway_lon": null,
-   "gateway_minutes": null,
-   "key": "curated:03c41a8e-a73c-47d7-b47b-f41aae07d9af",
-   "nhd_water": "Anderson Creek"
-  },
-  {
-   "source": "curated",
-   "source_id": "07f22e7a-00fc-4b41-829a-069eefbcb1ac",
-   "name": "Lake Lenore",
-   "kind": "access",
-   "lat": 47.11818,
-   "lon": -119.27006,
-   "county": "Grant",
-   "water_name": null,
-   "description": null,
-   "parking": null,
-   "facilities": [],
-   "seasonal": null,
-   "pass_required": null,
-   "managing_entity": null,
-   "gateway_lat": null,
-   "gateway_lon": null,
-   "gateway_minutes": null,
-   "key": "curated:07f22e7a-00fc-4b41-829a-069eefbcb1ac",
-   "nhd_water": null
-  },
-  {
    "source": "ecology",
    "source_id": "c2f3c63e-f02c-4186-b086-cfe35c9b285d",
    "name": "Langley Boat Harbor & Fishing Pier",
@@ -24465,27 +24402,6 @@
    "nhd_water": null
   },
   {
-   "source": "curated",
-   "source_id": "7dc3e349-eba9-4f99-993c-204e578a57e0",
-   "name": "Lenice Lake",
-   "kind": "access",
-   "lat": 47.42626,
-   "lon": -119.28883,
-   "county": "Grant",
-   "water_name": null,
-   "description": null,
-   "parking": null,
-   "facilities": [],
-   "seasonal": null,
-   "pass_required": null,
-   "managing_entity": null,
-   "gateway_lat": null,
-   "gateway_lon": null,
-   "gateway_minutes": null,
-   "key": "curated:7dc3e349-eba9-4f99-993c-204e578a57e0",
-   "nhd_water": null
-  },
-  {
    "source": "ecology",
    "source_id": "853240e5-803d-4602-982e-f7840898651b",
    "name": "Les Davis Pier",
@@ -24525,27 +24441,6 @@
    "gateway_lon": -120.716945,
    "gateway_minutes": 44.3,
    "key": "curated:e7d51328-6daf-4785-9668-75a36d28a3fd",
-   "nhd_water": null
-  },
-  {
-   "source": "curated",
-   "source_id": "4a2a730d-6f1e-40f0-a5ca-2764efc91bf8",
-   "name": "Lone Lake",
-   "kind": "access",
-   "lat": 48.0471,
-   "lon": -122.46293,
-   "county": "Island",
-   "water_name": null,
-   "description": null,
-   "parking": null,
-   "facilities": [],
-   "seasonal": null,
-   "pass_required": null,
-   "managing_entity": null,
-   "gateway_lat": null,
-   "gateway_lon": null,
-   "gateway_minutes": null,
-   "key": "curated:4a2a730d-6f1e-40f0-a5ca-2764efc91bf8",
    "nhd_water": null
   },
   {
@@ -24589,27 +24484,6 @@
    "gateway_minutes": null,
    "key": "ecology:8d59acb8-7082-4071-830b-59f60f50796f",
    "nhd_water": null
-  },
-  {
-   "source": "curated",
-   "source_id": "f0f66f15-fc37-4a69-906a-261bd631f062",
-   "name": "MCCABE POND (KITT)",
-   "kind": "access",
-   "lat": 46.85483,
-   "lon": -120.47525,
-   "county": "Kittitas",
-   "water_name": null,
-   "description": null,
-   "parking": null,
-   "facilities": [],
-   "seasonal": null,
-   "pass_required": null,
-   "managing_entity": null,
-   "gateway_lat": null,
-   "gateway_lon": null,
-   "gateway_minutes": null,
-   "key": "curated:f0f66f15-fc37-4a69-906a-261bd631f062",
-   "nhd_water": "Yakima River"
   },
   {
    "source": "ecology",
@@ -24969,27 +24843,6 @@
    "nhd_water": null
   },
   {
-   "source": "curated",
-   "source_id": "c947dcd6-a8f3-40b1-8bda-70eb5d59fef9",
-   "name": "Omak Lake",
-   "kind": "access",
-   "lat": 48.41078,
-   "lon": -119.52724,
-   "county": "Okanogan",
-   "water_name": null,
-   "description": null,
-   "parking": null,
-   "facilities": [],
-   "seasonal": null,
-   "pass_required": null,
-   "managing_entity": null,
-   "gateway_lat": null,
-   "gateway_lon": null,
-   "gateway_minutes": null,
-   "key": "curated:c947dcd6-a8f3-40b1-8bda-70eb5d59fef9",
-   "nhd_water": "Okanogan River"
-  },
-  {
    "source": "ecology",
    "source_id": "2a2a1e86-d269-42e3-8d69-919ac1e8c5e9",
    "name": "Park Avenue Street End",
@@ -25013,18 +24866,18 @@
   {
    "source": "curated",
    "source_id": "0f41440e-eb7b-4374-9475-5dde0e67ce1b",
-   "name": "Pass Lake",
-   "kind": "access",
-   "lat": 48.39917,
-   "lon": -122.23782,
+   "name": "Pass Lake Boat Launch",
+   "kind": "boat_ramp",
+   "lat": 48.417,
+   "lon": -122.64426,
    "county": "Skagit",
    "water_name": null,
    "description": null,
    "parking": null,
    "facilities": [],
    "seasonal": null,
-   "pass_required": null,
-   "managing_entity": null,
+   "pass_required": "Discover Pass",
+   "managing_entity": "Washington State Parks (Deception Pass)",
    "gateway_lat": null,
    "gateway_lon": null,
    "gateway_minutes": null,
@@ -25958,18 +25811,18 @@
   {
    "source": "curated",
    "source_id": "659d8d2a-4e7e-4983-abd7-24dc0a67efff",
-   "name": "Yahoo Lake",
-   "kind": "access",
-   "lat": 48.05513,
-   "lon": -117.6124,
-   "county": null,
+   "name": "Yahoo Lake Campground",
+   "kind": "campground",
+   "lat": 47.67601,
+   "lon": -124.01947,
+   "county": "Jefferson",
    "water_name": null,
    "description": null,
    "parking": null,
    "facilities": [],
    "seasonal": null,
-   "pass_required": null,
-   "managing_entity": null,
+   "pass_required": "Discover Pass",
+   "managing_entity": "DNR",
    "gateway_lat": null,
    "gateway_lon": null,
    "gateway_minutes": null,
@@ -30556,27 +30409,6 @@
   },
   {
    "source": "osm",
-   "source_id": "374042226",
-   "name": "Northeast Caples Road bridge",
-   "kind": "bridge",
-   "lat": 45.742764,
-   "lon": -122.546561,
-   "county": null,
-   "water_name": null,
-   "description": "OSM bridge",
-   "parking": null,
-   "facilities": [],
-   "seasonal": null,
-   "pass_required": null,
-   "managing_entity": null,
-   "gateway_lat": 45.742764,
-   "gateway_lon": -122.546561,
-   "gateway_minutes": 0.0,
-   "key": "osm:374042226",
-   "nhd_water": "Weaver Creek"
-  },
-  {
-   "source": "osm",
    "source_id": "705027056",
    "name": "Earthship Drive bridge",
    "kind": "bridge",
@@ -32233,7 +32065,8 @@
      "confidence": "medium",
      "note": "NHD names the lake here Black Lake"
     }
-   ]
+   ],
+   "rename_to": "Black Lake"
   },
   "77cd2633-df53-41de-ab97-9e9e8e01456e": {
    "name": "Blackbird Island Pond",
@@ -37062,12 +36895,6 @@
    "activate_reason": "already has a spot",
    "access": [
     {
-     "key": "curated:03c41a8e-a73c-47d7-b47b-f41aae07d9af",
-     "method": "existing_spot",
-     "confidence": "medium",
-     "note": "hand-placed spot, unverified"
-    },
-    {
      "key": "wdfw_was:664",
      "method": "nhd_lake",
      "confidence": "high",
@@ -38030,12 +37857,6 @@
    "activate_reason": "already has a spot",
    "access": [
     {
-     "key": "curated:07f22e7a-00fc-4b41-829a-069eefbcb1ac",
-     "method": "existing_spot",
-     "confidence": "medium",
-     "note": "hand-placed spot, unverified"
-    },
-    {
      "key": "wdfw_was:1024",
      "method": "nhd_lake",
      "confidence": "medium",
@@ -38214,12 +38035,6 @@
      "method": "name+county",
      "confidence": "high",
      "note": null
-    },
-    {
-     "key": "wdfw_shore:10344",
-     "method": "name+county",
-     "confidence": "medium",
-     "note": "NHD names the lake here Shady Lake"
     }
    ]
   },
@@ -39229,12 +39044,6 @@
    "activate_reason": "already has a spot",
    "access": [
     {
-     "key": "curated:7dc3e349-eba9-4f99-993c-204e578a57e0",
-     "method": "existing_spot",
-     "confidence": "medium",
-     "note": "hand-placed spot, unverified"
-    },
-    {
      "key": "wdfw_shore:10443",
      "method": "name+county",
      "confidence": "high",
@@ -39484,12 +39293,6 @@
    "activate": true,
    "activate_reason": "already has a spot",
    "access": [
-    {
-     "key": "curated:4a2a730d-6f1e-40f0-a5ca-2764efc91bf8",
-     "method": "existing_spot",
-     "confidence": "medium",
-     "note": "hand-placed spot, unverified"
-    },
     {
      "key": "wdfw_was:459",
      "method": "nhd_lake",
@@ -40107,12 +39910,6 @@
    "activate": true,
    "activate_reason": "already has a spot",
    "access": [
-    {
-     "key": "curated:f0f66f15-fc37-4a69-906a-261bd631f062",
-     "method": "existing_spot",
-     "confidence": "medium",
-     "note": "hand-placed spot, unverified"
-    },
     {
      "key": "wdfw_shore:10489",
      "method": "name+county",
@@ -41385,14 +41182,7 @@
    "has_spot": true,
    "activate": true,
    "activate_reason": "already has a spot",
-   "access": [
-    {
-     "key": "curated:c947dcd6-a8f3-40b1-8bda-70eb5d59fef9",
-     "method": "existing_spot",
-     "confidence": "medium",
-     "note": "hand-placed spot, unverified"
-    }
-   ]
+   "access": []
   },
   "a4f18888-a0e5-452c-af62-b6145118c09e": {
    "name": "Orchard Pond",
@@ -41599,8 +41389,8 @@
     {
      "key": "curated:0f41440e-eb7b-4374-9475-5dde0e67ce1b",
      "method": "existing_spot",
-     "confidence": "medium",
-     "note": "hand-placed spot, unverified"
+     "confidence": "high",
+     "note": "corrected 2026-10-21 (TODO-5 review) from OpenStreetMap"
     }
    ]
   },
@@ -45332,14 +45122,7 @@
    "has_spot": false,
    "activate": false,
    "activate_reason": "stocked creek (usually a juvenile salmon release), review",
-   "access": [
-    {
-     "key": "osm:374042226",
-     "method": "osm",
-     "confidence": "low",
-     "note": "9 m from the river"
-    }
-   ]
+   "access": []
   },
   "f8f3d6ed-5258-408b-9e3c-94c2e268e4f9": {
    "name": "WESTERN LK (PACI)",
@@ -46085,8 +45868,8 @@
     {
      "key": "curated:659d8d2a-4e7e-4983-abd7-24dc0a67efff",
      "method": "existing_spot",
-     "confidence": "medium",
-     "note": "hand-placed spot, unverified"
+     "confidence": "high",
+     "note": "corrected 2026-10-21 (TODO-5 review) from OpenStreetMap"
     }
    ]
   },
@@ -47077,6 +46860,34 @@
    "from_name": "WOODHOUSE PDS (KITT)",
    "into_id": "317a2b4f-4779-4b9e-bec2-b6ac75d90c8b",
    "into_name": "Woodhouse Pond",
+   "drop_spot": false
+  },
+  {
+   "from_id": "5b91c178-6e0c-433a-98f3-b8ceb4ac81ac",
+   "from_name": "COFFEEPOT LK (LINC)",
+   "into_id": "fe4fae81-30ed-4ad2-b9d9-87eccd979c44",
+   "into_name": "Coffee Pot Lake",
+   "drop_spot": false
+  },
+  {
+   "from_id": "6b9b57a1-a8f5-4403-998b-519de8f6678c",
+   "from_name": "ICE HOUSE LK (SKAM)",
+   "into_id": "3ac4a1aa-6736-40c5-9b2e-3a2dd8c498b4",
+   "into_name": "Icehouse Lake",
+   "drop_spot": false
+  },
+  {
+   "from_id": "6b276fa3-6859-44c6-9dae-76fce3576924",
+   "from_name": "GOLF COURSE PD (ASOT)",
+   "into_id": "bd42a7db-4ede-489c-801a-705f2bee25c0",
+   "into_name": "Golf Course Pond",
+   "drop_spot": false
+  },
+  {
+   "from_id": "0e5482a3-6846-49a8-b2cb-07daefd749b2",
+   "from_name": "BLACK LK (PACI)",
+   "into_id": "1cc412aa-c311-4d2a-aaf6-4bc4f234c58e",
+   "into_name": "Black Lake pacific county",
    "drop_spot": false
   }
  ],

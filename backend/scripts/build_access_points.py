@@ -107,6 +107,22 @@ _NAME_OVERRIDES = {
 }
 
 
+# WDFW shore-access sites placed wrong in WDFW's own layer (TODO-5 review,
+# 2026-10-21): each one checked against OpenStreetMap and the lake's launch.
+_SHORE_FIXES = {
+    "10639": (45.626002, -121.128247),   # Spearfish Lake: the layer says 46.6 N (Rimrock Lake)
+    "10266": (45.661441, -121.906395),   # Icehouse Lake: 46.6 N (Greenwood Lake)
+    "10607": (45.709121, -121.375493),   # Rowland, South: 122.4 W (Clark County)
+    "10682": (45.717709, -121.617709),   # Tunnel Lake: 45.6 N (Collins Creek)
+    "10088": (46.578210, -122.726590),   # Carlisle Lake: 16 km north; this is its boat launch
+}
+# Points that serve some other water than the one they match.
+_DROP_KEYS = {
+    "wdfw_shore:10344",     # "Lake Morton" site that sits on Shady Lake, 12 km north
+    "osm:374042226",        # a Weaver Creek bridge in Clark County, not Mason's Weaver Creek
+}
+
+
 def _county_list(raw: str | None) -> list[str]:
     if not raw:
         return []
@@ -352,10 +368,12 @@ def from_wdfw_was(f: dict) -> AccessPoint:
 def from_wdfw_shore(f: dict) -> AccessPoint:
     a = f["attributes"]
     desc = (a.get("Description") or "").strip() or None
+    sid = str(int(a["AccessSiteID"]))
+    lat, lon = _SHORE_FIXES.get(sid) or (round(a["Latitude"], 6), round(a["Longitude"], 6))
     return AccessPoint(
-        source="wdfw_shore", source_id=str(int(a["AccessSiteID"])),
+        source="wdfw_shore", source_id=sid,
         name=(a.get("LakeName") or "").strip(), kind=_kind_from_text(desc or ""),
-        lat=round(a["Latitude"], 6), lon=round(a["Longitude"], 6),
+        lat=lat, lon=lon,
         county=(a.get("County") or "").strip() or None,
         water_name=(a.get("LakeName") or "").strip() or None,
         description=desc,
@@ -1041,6 +1059,7 @@ async def build(args) -> None:
     finally:
         await fetch.close()
 
+    matches = [m for m in matches if f"{aps[m.ap_index].source}:{aps[m.ap_index].source_id}" not in _DROP_KEYS]
     new_lakes = propose_new_lakes(aps, matches, wbs)
     write_outputs(args, aps, wbs, matches, river_feat, merges, conflicts, new_lakes)
 
