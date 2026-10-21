@@ -31339,15 +31339,6 @@
    "activate_reason": "no access point",
    "access": []
   },
-  "0e5482a3-6846-49a8-b2cb-07daefd749b2": {
-   "name": "BLACK LK (PACI)",
-   "type": "lake",
-   "county": "Pacific",
-   "has_spot": false,
-   "activate": false,
-   "activate_reason": "no access point",
-   "access": []
-  },
   "3734c8be-2ef3-4937-a0e6-ad69897cdfbf": {
    "name": "BLUE LK (COLU)",
    "type": "lake",
@@ -32712,15 +32703,6 @@
     }
    ],
    "rename_to": "Clear Lake"
-  },
-  "5b91c178-6e0c-433a-98f3-b8ceb4ac81ac": {
-   "name": "COFFEEPOT LK (LINC)",
-   "type": "lake",
-   "county": "Lincoln",
-   "has_spot": false,
-   "activate": false,
-   "activate_reason": "no access point",
-   "access": []
   },
   "d2542227-7675-42c5-8b1c-34241654b713": {
    "name": "COLUMBIA PARK PD (BENT)",
@@ -35205,15 +35187,6 @@
    "activate_reason": "no access point",
    "access": []
   },
-  "6b276fa3-6859-44c6-9dae-76fce3576924": {
-   "name": "GOLF COURSE PD (ASOT)",
-   "type": "lake",
-   "county": "Asotin",
-   "has_spot": false,
-   "activate": false,
-   "activate_reason": "no access point",
-   "access": []
-  },
   "694dfa93-8c7f-4854-bbab-6dbe18a25fab": {
    "name": "GRAYS R      25.0093",
    "type": "river",
@@ -36183,15 +36156,6 @@
      "note": null
     }
    ]
-  },
-  "6b9b57a1-a8f5-4403-998b-519de8f6678c": {
-   "name": "ICE HOUSE LK (SKAM)",
-   "type": "lake",
-   "county": "Skamania",
-   "has_spot": false,
-   "activate": false,
-   "activate_reason": "no access point",
-   "access": []
   },
   "7c6ccd6a-c26b-4915-9a17-1c30f873e57e": {
    "name": "ISLAND LK (KITS)",

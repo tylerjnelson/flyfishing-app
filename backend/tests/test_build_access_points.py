@@ -135,3 +135,9 @@ def test_shipped_file_has_the_review_fixes():
     assert used <= set(aps)
     assert {m["from_name"] for m in d["merges"]} >= {"COFFEEPOT LK (LINC)", "ICE HOUSE LK (SKAM)",
                                                       "GOLF COURSE PD (ASOT)", "BLACK LK (PACI)"}
+    # A merged-away row is deleted by its merge; listing it too makes every later
+    # load fail ("water body ... not found"), as BLACK LK (PACI) did after 5c525d2.
+    assert not {m["from_id"] for m in d["merges"]} & set(d["water_bodies"])
+    # DI-0 deleted four DNR rows that are not waters.
+    assert not {"af056b6b-aedf-4cc4-83b1-19c8595e539a", "27b6c050-b748-465d-be50-29937f7957b8",
+                "00002512-a267-4f5f-80fb-f1682b732b67", "baaae21f-fa68-40a4-9049-050ef823d4a4"} & set(d["water_bodies"])
