@@ -6,8 +6,10 @@ no consistent schema. This script:
   1. Fetches each page's HTML and extracts visible text.
   2. Uses call_json_llm() to identify water bodies and fishing status.
   3. Geocodes extractable water body names via HERE Geocoding API.
-  4. Seeds new spots at probable confidence; sets fly_fishing_legal=False
-     where the page explicitly states no fishing (e.g. bull trout closures).
+  4. Seeds new spots at probable confidence. Legality is never taken from
+     DNR prose (an LLM read of it hid the Snoqualmie River; DI-0): seasons and
+     closures come from the WDFW pamphlet and emergency rules. A page saying
+     "no fishing" is only logged.
 
 seed_confidence='probable', source='dnr'
 type inferred from name suffix (creek/river/lake/pond); defaults to 'river'.
@@ -281,7 +283,7 @@ async def _run(dry_run: bool, page_filter: str | None) -> None:
                             source="dnr",
                             seed_confidence="probable",
                             is_public=True,
-                            fly_fishing_legal=fishing_allowed,
+                            fly_fishing_legal=True,
                             min_temp_f=40.0 if fishing_allowed else None,
                         ))
 

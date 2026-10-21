@@ -334,6 +334,7 @@ async def compute_and_store_score(water_body_id: str, db) -> float:
     from datetime import datetime, timezone
     from sqlalchemy import func, select
     from db.models import ConditionsCache, FishingSpot, Note, Trip, WaterBody
+    from conditions.cache import fresh as cache_fresh
 
     result = await db.execute(select(WaterBody).where(WaterBody.id == water_body_id))
     water_body = result.scalar_one_or_none()
@@ -408,6 +409,7 @@ async def compute_and_store_score(water_body_id: str, db) -> float:
             select(ConditionsCache.data)
             .where(ConditionsCache.water_body_id == water_body.id)
             .where(ConditionsCache.source == "snotel")
+            .where(cache_fresh())
             .order_by(ConditionsCache.fetched_at.desc())
             .limit(1)
         )

@@ -19,14 +19,14 @@ _EXPECTED_JOB_IDS = {
     "wta",
     "snotel",
     "score_all_spots",
-    "wdfw_regulations",
+    "cache_prune",
 }
 
 _TWO_HOUR_JOBS = {"wdfw_emergency", "inciweb", "noaa_nwrfc", "nps_alerts"}
 # All scheduled non-realtime jobs that use CronTrigger
-_CRON_JOBS = {"wdfw_stocking", "wta", "snotel", "score_all_spots", "wdfw_regulations"}
-# 3 AM Pacific jobs (excludes score_all_spots at 3:30, wdfw_regulations annual)
-_THREE_AM_JOBS = {"wdfw_stocking", "wta", "snotel"}
+_CRON_JOBS = {"wdfw_stocking", "wta", "snotel", "score_all_spots", "cache_prune"}
+# 3 AM Pacific jobs (excludes score_all_spots at 3:30)
+_THREE_AM_JOBS = {"wdfw_stocking", "wta", "snotel", "cache_prune"}
 
 
 def _make_test_scheduler() -> AsyncIOScheduler:
@@ -45,7 +45,7 @@ def _register_jobs(scheduler: AsyncIOScheduler) -> None:
     from conditions.scheduler import (
         job_inciweb, job_noaa_nwrfc, job_nps_alerts, job_snotel,
         job_wdfw_emergency, job_wdfw_stocking, job_wta,
-        job_score_all_spots, job_wdfw_regulations,
+        job_score_all_spots, job_cache_prune,
     )
 
     scheduler.add_job(job_wdfw_emergency, IntervalTrigger(hours=2),
@@ -66,9 +66,7 @@ def _register_jobs(scheduler: AsyncIOScheduler) -> None:
     scheduler.add_job(job_score_all_spots,
                       CronTrigger(hour=3, minute=30, timezone="America/Los_Angeles"),
                       id="score_all_spots", replace_existing=True)
-    scheduler.add_job(job_wdfw_regulations,
-                      CronTrigger(month=12, day=1, hour=4, minute=0, timezone="America/Los_Angeles"),
-                      id="wdfw_regulations", replace_existing=True)
+    scheduler.add_job(job_cache_prune, _daily, id="cache_prune", replace_existing=True)
 
 
 class TestSchedulerJobRegistration:
@@ -133,9 +131,9 @@ class TestJobFunctionCallables:
         from conditions.scheduler import (
             job_inciweb, job_noaa_nwrfc, job_nps_alerts, job_snotel,
             job_wdfw_emergency, job_wdfw_stocking, job_wta,
-            job_score_all_spots, job_wdfw_regulations,
+            job_score_all_spots, job_cache_prune,
         )
         for fn in [job_wdfw_emergency, job_inciweb, job_noaa_nwrfc, job_nps_alerts,
                    job_wdfw_stocking, job_wta, job_snotel,
-                   job_score_all_spots, job_wdfw_regulations]:
+                   job_score_all_spots, job_cache_prune]:
             assert asyncio.iscoroutinefunction(fn), f"{fn.__name__} must be async"

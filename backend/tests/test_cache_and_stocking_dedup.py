@@ -167,7 +167,7 @@ async def test_stocking_job_links_by_alias_after_a_merge():
         if sql.startswith("INSERT INTO stocking_events"):
             inserts.append(stmt.compile(dialect=postgresql.dialect()).params)
         if "UPDATE water_bodies" in sql:
-            updates.append(params)
+            updates.append(sql)
         return MagicMock(rowcount=1)
 
     session = MagicMock()
@@ -178,4 +178,5 @@ async def test_stocking_job_links_by_alias_after_a_merge():
 
     by_record = {p["source_record_id"]: p["water_body_id"] for p in inserts}
     assert by_record == {"m-1": mineral, "s-1": None}
-    assert [u["wb_id"] for u in updates] == [mineral]
+    # Last stocked date/species are then recomputed from the linked events (DI-0).
+    assert updates == [sched.REFRESH_LAST_STOCKED_SQL]

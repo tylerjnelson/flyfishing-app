@@ -515,6 +515,27 @@ def _day_rules(reach: dict, day: date) -> str:
     return " ".join(out)
 
 
+def gear_line(name: str, aliases, county, water_type, day: date, pamphlet: Pamphlet | None = None) -> str:
+    """The pamphlet's gear and release rules on the stretches open that day
+    ('Fly fishing only. Catch and Release.'), or '' when the water isn't listed,
+    nothing is open, or the open stretches have no special gear rules."""
+    p = pamphlet or load()
+    if p is None or pamphlet_year(day) != p.year:
+        return ""
+    entry = match(name, aliases, county, water_type, pamphlet=p)
+    if entry is None:
+        return ""
+    ruled = [(r, _day_rules(r, day)) for r in open_reaches(entry, day)]
+    if not any(rules for _, rules in ruled):
+        return ""
+    head = f"WDFW special rules ({p.year} pamphlet)"
+    if len({rules for _, rules in ruled}) == 1:
+        return f"{head}: {ruled[0][1]}"
+    parts = [f"{_reach_label(r)}: {rules or 'statewide rules'}" for r, rules in ruled[:_MAX_REACHES]]
+    more = f" (+{len(ruled) - _MAX_REACHES} more)" if len(ruled) > _MAX_REACHES else ""
+    return f"{head} by stretch: {'; '.join(parts)}{more}"
+
+
 def _stretch_lines(entry: Entry, open_on_day: list[dict], day: date, year: str) -> list[str]:
     """Which stretches are open on the first fishable day, when not all are. The
     shorter list is named: the open stretches, or the closed ones."""

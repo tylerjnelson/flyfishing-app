@@ -74,7 +74,7 @@ async def _semantic_lookup(embedding: list[float], db: AsyncSession) -> list[dic
     )
     return [
         {
-            "spot_id": r.fishing_spot_id or r.water_body_id,
+            "spot_id": r.fishing_spot_id,  # None for a water with no fishing spot
             "water_body_id": r.water_body_id,
             "name": r.name,
             "county": r.county,
@@ -113,7 +113,7 @@ async def _fuzzy_lookup(location_string: str, db: AsyncSession) -> list[dict]:
     )
     return [
         {
-            "spot_id": r.fishing_spot_id or r.water_body_id,
+            "spot_id": r.fishing_spot_id,  # None for a water with no fishing spot
             "water_body_id": r.water_body_id,
             "name": r.name,
             "county": r.county,
@@ -177,15 +177,21 @@ async def resolve_spot(note_text: str, db: AsyncSession) -> dict:
     embedding = await embed_text(location_string)
     semantic = await _semantic_lookup(embedding, db)
     fuzzy = await _fuzzy_lookup(location_string, db)
-    candidates = _merge_results(semantic, fuzzy)
+    ranked = _merge_results(semantic, fuzzy)
+    # A note links to a fishing spot; a water with none (86 in 2026-10) can't
+    # take it. Its water body id used to be returned as the spot id, which the
+    # notes.fishing_spot_id foreign key rejects (DI-0). Rank with them, so a
+    # weaker match never auto-links in their place, but only offer real spots.
+    candidates = [c for c in ranked if c["spot_id"]]
+    top = ranked[0] if ranked else None
 
-    if not candidates:
+    if top is None:
         band = "low"
         auto_spot_id = None
-    elif candidates[0]["combined_score"] >= _AUTO_LINK_THRESHOLD:
+    elif top["combined_score"] >= _AUTO_LINK_THRESHOLD and top["spot_id"]:
         band = "auto"
-        auto_spot_id = candidates[0]["spot_id"]
-    elif candidates[0]["combined_score"] >= _CANDIDATE_THRESHOLD:
+        auto_spot_id = top["spot_id"]
+    elif top["combined_score"] >= _CANDIDATE_THRESHOLD and candidates:
         band = "medium"
         auto_spot_id = None
     else:
@@ -197,7 +203,7 @@ async def resolve_spot(note_text: str, db: AsyncSession) -> dict:
         extra={
             "band": band,
             "location_string": location_string,
-            "top_score": candidates[0]["combined_score"] if candidates else 0.0,
+            "top_score": top["combined_score"] if top else 0.0,
         },
     )
     return {

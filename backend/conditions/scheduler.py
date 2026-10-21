@@ -13,7 +13,7 @@ BackgroundScheduler and PostgreSQLJobStore entirely.
 
 Schedule summary:
   Every 2 hours   : WDFW emergency closures, InciWeb wildfires, NOAA NWRFC
-  Daily 3 AM PT   : WDFW stocking, WTA reports, SNOTEL snowpack
+  Daily 3 AM PT   : WDFW stocking, WTA reports, SNOTEL snowpack, conditions_cache prune
 
 Real-time fetchers (USGS, NOAA NWS, AirNow) are triggered at session open
 by the chat context builder — they are NOT scheduled here.
@@ -34,7 +34,7 @@ from sqlalchemy import delete, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from config import settings
-from conditions.cache import write_conditions_cache
+from conditions.cache import prune_expired, write_conditions_cache
 from conditions.fetch_errors import log_fetch_failure
 from conditions.gauge_reference import REFRESH_AFTER, fetch_flood_stages, fetch_flow_normals
 from conditions.noaa_nwrfc import NO_FORECAST_GAUGES, fetch_noaa_nwrfc, resolve_gauge_id
@@ -50,7 +50,6 @@ from conditions.wdfw_emergency import (
     rule_match_texts,
     water_phrases,
 )
-from conditions.wdfw_regulations import fetch_and_update_regulations
 from conditions.wdfw_stocking import fetch_wdfw_stocking
 from conditions.wta_scraper import fetch_wta_reports
 from db.connection import AsyncSessionLocal
@@ -159,6 +158,7 @@ def start_scheduler() -> None:
     scheduler.add_job(job_wdfw_stocking, trigger=_daily, id="wdfw_stocking", replace_existing=True)
     scheduler.add_job(job_wta, trigger=_daily, id="wta", replace_existing=True)
     scheduler.add_job(job_snotel, trigger=_daily, id="snotel", replace_existing=True)
+    scheduler.add_job(job_cache_prune, trigger=_daily, id="cache_prune", replace_existing=True)
     # Nightly scorer runs at 3:30 AM — after stocking and WTA jobs have written new data
     scheduler.add_job(
         job_score_all_water_bodies,
@@ -174,14 +174,6 @@ def start_scheduler() -> None:
         id="gauge_reference",
         replace_existing=True,
         next_run_time=datetime.now(tz=timezone.utc),  # gauges refreshed <6 days ago are skipped
-    )
-
-    # --- Annual December 1 — WDFW regulations re-scrape ---
-    scheduler.add_job(
-        job_wdfw_regulations,
-        trigger=CronTrigger(month=12, day=1, hour=4, minute=0, timezone="America/Los_Angeles"),
-        id="wdfw_regulations",
-        replace_existing=True,
     )
 
     scheduler.start()
@@ -499,6 +491,29 @@ async def job_gauge_reference() -> None:
 # WDFW stocking — daily 3 AM
 # ---------------------------------------------------------------------------
 
+REFRESH_LAST_STOCKED_SQL = """
+    WITH latest AS (
+        SELECT water_body_id, max(stocked_date) AS d
+          FROM stocking_events
+         WHERE water_body_id IS NOT NULL AND stocked_date IS NOT NULL
+         GROUP BY water_body_id
+    ), last AS (
+        SELECT l.water_body_id, l.d,
+               array_agg(DISTINCT s.species ORDER BY s.species)
+                   FILTER (WHERE s.species IS NOT NULL) AS species
+          FROM latest l
+          JOIN stocking_events s ON s.water_body_id = l.water_body_id AND s.stocked_date = l.d
+         GROUP BY l.water_body_id, l.d
+    )
+    UPDATE water_bodies w
+       SET last_stocked_date = last.d, last_stocked_species = last.species
+      FROM last
+     WHERE w.id = last.water_body_id
+       AND (w.last_stocked_date IS DISTINCT FROM last.d
+            OR w.last_stocked_species IS DISTINCT FROM last.species)
+"""
+
+
 @_scheduled_job("wdfw_stocking")
 async def job_wdfw_stocking() -> None:
     year = datetime.now(tz=timezone.utc).year
@@ -553,35 +568,12 @@ async def job_wdfw_stocking() -> None:
                 )
                 removed = result.rowcount
 
-    # Propagate most-recent stocked_date per water body
-    latest_by_name: dict[str, object] = {}
-    for r in records:
-        water_name = (r.get("water_name") or "").strip()
-        stocked_date = _parse_date(r.get("stocked_date"))
-        if not water_name or stocked_date is None:
-            continue
-        key = water_name.upper()
-        if key not in latest_by_name or stocked_date > latest_by_name[key]:
-            latest_by_name[key] = stocked_date
-
-    water_bodies_updated = 0
-    if latest_by_name:
-        async with AsyncSessionLocal() as session:
-            async with session.begin():
-                for name_upper, stocked_date in latest_by_name.items():
-                    wb_id = name_to_wb_id.get(name_upper)
-                    if wb_id is None:
-                        continue
-                    result = await session.execute(
-                        text("""
-                            UPDATE water_bodies
-                               SET last_stocked_date = :stocked_date
-                             WHERE id = :wb_id
-                               AND (last_stocked_date IS NULL OR last_stocked_date < :stocked_date)
-                        """),
-                        {"wb_id": wb_id, "stocked_date": stocked_date},
-                    )
-                    water_bodies_updated += result.rowcount
+    # Each water's latest stocking (date and species) from all its linked events,
+    # not just this fetch: the species used to stay at the April seed (DI-0).
+    async with AsyncSessionLocal() as session:
+        async with session.begin():
+            result = await session.execute(text(REFRESH_LAST_STOCKED_SQL))
+            water_bodies_updated = result.rowcount
 
     _log_job_done(
         "wdfw_stocking",
@@ -707,15 +699,19 @@ async def job_score_all_water_bodies() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Annual WDFW regulations re-scrape — December 1, 4 AM Pacific
+# conditions_cache prune — daily 3 AM. Writes prune only their own
+# (water body, source); rows for waters nobody fetches again stayed forever.
+# The annual seasons come from data/wdfw_seasons.json (TODO-22), rebuilt by
+# scripts/build_wdfw_seasons.py each July; the old December regulations
+# re-scrape was removed in DI-0 (its parser no longer matched WDFW's eRegulations pages).
 # ---------------------------------------------------------------------------
 
-@_scheduled_job("wdfw_regulations")
-async def job_wdfw_regulations() -> None:
+@_scheduled_job("cache_prune")
+async def job_cache_prune() -> None:
     async with AsyncSessionLocal() as session:
         async with session.begin():
-            await fetch_and_update_regulations(session)
-    _log_job_done("wdfw_regulations")
+            removed = await prune_expired(session)
+    _log_job_done("cache_prune", rows_removed=removed)
 
 
 # ---------------------------------------------------------------------------

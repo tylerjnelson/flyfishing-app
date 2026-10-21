@@ -2,7 +2,7 @@
 Manually trigger all scheduled fetcher jobs in sequence.
 
 Runs every job that APScheduler would run nightly/bi-hourly.
-Skips job_wdfw_regulations (annual; run only in December).
+(Annual seasons are a data file, not a job: scripts/build_wdfw_seasons.py.)
 
 Usage (from backend/):
   sudo /opt/flyfish/venv/bin/python scripts/run_all_fetchers.py

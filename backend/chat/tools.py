@@ -37,6 +37,7 @@ from chat.context_builder import (
     _fetch_spot_notes,
     _format_spot_bundle,
 )
+from conditions.cache import fresh as cache_fresh
 from db.models import ConditionsCache, FishingSpot, WaterBody
 from llm.client import ollama_chat
 from prompts.registry import PLANNING_SYSTEM_PROMPT
@@ -393,6 +394,7 @@ async def _build_candidate_from_db(db: AsyncSession, spot_id: str) -> dict | Non
     cc_result = await db.execute(
         select(ConditionsCache.source, ConditionsCache.data)
         .where(ConditionsCache.water_body_id == wb.id)
+        .where(cache_fresh())
         .order_by(ConditionsCache.source, ConditionsCache.fetched_at.desc())
         .distinct(ConditionsCache.source)
     )
@@ -509,6 +511,7 @@ async def _compare_spots(db: AsyncSession, spot_ids: list) -> dict:
                 select(ConditionsCache.source, ConditionsCache.data)
                 .where(ConditionsCache.water_body_id == wb_id)
                 .where(ConditionsCache.source == "usgs")
+                .where(cache_fresh())
                 .order_by(ConditionsCache.fetched_at.desc())
                 .limit(1)
             )

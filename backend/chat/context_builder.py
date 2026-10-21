@@ -33,7 +33,7 @@ from chat.response_cache import compute_intake_hash, get_cached_response
 from chat import drive_times
 from conditions.access_points import access_line
 from conditions.airnow import fetch_airnow
-from conditions.cache import write_conditions_cache
+from conditions.cache import fresh as cache_fresh, write_conditions_cache
 from conditions import flow_reference
 from conditions.normalizer import INTERVAL_REALTIME, compute_conditions_hash
 from conditions.noaa_nws import fetch_noaa_nws
@@ -62,6 +62,7 @@ from db.models import (
 from prompts.registry import DEBRIEF_CONVERSATION_PROMPT, RECOMMENDATION_SYSTEM_PROMPT
 from rag.embedder import embed_text
 from spots.scorer import cfs_similarity
+from spots import species as species_vocab
 
 log = logging.getLogger(__name__)
 
@@ -334,7 +335,7 @@ _SPECIES_CEILINGS: dict[str, float] = {
 
 
 def _species_temp_ceiling(target_species: list[str]) -> float | None:
-    ceilings = [_SPECIES_CEILINGS[s] for s in target_species if s in _SPECIES_CEILINGS]
+    ceilings = [_SPECIES_CEILINGS[s] for s in species_vocab.targets(target_species) if s in _SPECIES_CEILINGS]
     return min(ceilings) if ceilings else None
 
 
@@ -637,17 +638,19 @@ def _nwrfc_value_at(nwrfc_data: dict, departure_time: datetime, key: str) -> flo
 
 def _species_match_delta(target_species: list[str], water_body: WaterBody) -> float:
     """
-    Compare session target_species against water_body.species_primary.
+    Compare the session's target species (intake groups: trout, steelhead, ...)
+    with the fish at the water (species_primary and the last stocking, named
+    'Rainbow', 'Coho', ...), both as spots.species groups.
     Full match → +1.5, partial → +0.5, no match → -0.5.
-    Returns 0.0 if either side is empty.
+    Returns 0.0 if either side is empty or the angler takes anything.
     """
-    if not target_species or not water_body.species_primary:
+    wanted = species_vocab.targets(target_species)
+    present = species_vocab.water_groups(water_body.species_primary, water_body.last_stocked_species)
+    if not wanted or not present:
         return 0.0
-    target_lower = {s.lower() for s in target_species}
-    spot_lower = {s.lower() for s in water_body.species_primary}
-    if target_lower & spot_lower == target_lower:
+    if wanted <= present:
         return 1.5
-    if target_lower & spot_lower:
+    if wanted & present:
         return 0.5
     return -0.5
 
@@ -913,8 +916,7 @@ async def _hybrid_rag(
             if season_delta <= 1:
                 boost += 0.30
 
-        note_species = r["species"] or []
-        if any(sp in " ".join(note_species).lower() for sp in target_species):
+        if species_vocab.targets(target_species) & species_vocab.water_groups(r["species"]):
             boost += 0.40
 
         if current_cfs and r["approx_cfs"]:
@@ -1102,16 +1104,6 @@ def _truncate(text: str, max_chars: int) -> str:
 # [7b] Frozen prefix — per-spot bundle + compact menu (Phase 4)
 # ---------------------------------------------------------------------------
 
-def _regs_str(regs) -> str:
-    """Render `WaterBody.fishing_regs` (JSONB — dict or string) terse."""
-    if isinstance(regs, dict):
-        summary = regs.get("summary")
-        if summary:
-            return str(summary)[:160]
-        return "; ".join(f"{k}: {v}" for k, v in list(regs.items())[:3])[:160]
-    return str(regs)[:160] if regs else ""
-
-
 def _format_note_line(n: dict) -> str:
     """One spot-anchored note, structured-fields-first (date · outcome · species ·
     cfs · flies) then a truncated content snippet — advertises to the 4B that
@@ -1136,7 +1128,7 @@ def _format_spot_bundle(
     candidate: dict, *, notes: list[dict], details: dict, departure_time: datetime | None = None
 ) -> str:
     """Render a single spot's COMPLETE section: conditions + spot-anchored notes +
-    details (regs / fly-only / species / stocking / permit). Called from two sites
+    details (gear rules / species / stocking / permit). Called from two sites
     with byte-identical shape — the freeze (each frozen top-3 spot) and, in Phase 5,
     get_spot on promotion (so a promoted spot has everything a top-3 had). A2-depth
     (full) because the catalog collapse makes get_spot the only way to fetch a spot's
@@ -1154,10 +1146,13 @@ def _format_spot_bundle(
 
     if details:
         detail_parts: list[str] = []
-        regs = _regs_str(details.get("fishing_regs"))
-        if regs:
-            detail_parts.append(f"Regs: {regs}")
-        detail_parts.append(f"Fly-only: {'yes' if details.get('fly_fishing_legal') else 'no'}")
+        # Gear rules come from the annual pamphlet (TODO-22); the April-scraped
+        # fishing_regs were stale and truncated, and "fly-only" was never what
+        # fly_fishing_legal meant (DI-0).
+        if details.get("fly_fishing_legal") is False:
+            detail_parts.append("Fly fishing not legal here")
+        if details.get("gear_rules"):
+            detail_parts.append(details["gear_rules"])
         species = details.get("species_primary") or []
         if species:
             detail_parts.append(f"Species: {', '.join(species)}")
@@ -1243,9 +1238,10 @@ async def _fetch_spot_notes(db, fishing_spot_id: str, limit: int = 5) -> list[di
     ]
 
 
-async def _fetch_spot_details(db, fishing_spot_id: str) -> dict:
-    """Regs / fly-only / species / stocking / permit for one spot. Used at freeze time
-    and by the `get_spot` tool (Phase 5) — one details read, shared by both."""
+async def _fetch_spot_details(db, fishing_spot_id: str, departure_time: datetime | None = None) -> dict:
+    """Gear rules / legality / species / stocking / permit for one spot. Used at freeze
+    time and by the `get_spot` tool (Phase 5) — one details read, shared by both.
+    Gear rules are the pamphlet's for the trip's first day (today without one)."""
     result = await db.execute(
         select(FishingSpot, WaterBody)
         .join(WaterBody, FishingSpot.water_body_id == WaterBody.id)
@@ -1255,8 +1251,9 @@ async def _fetch_spot_details(db, fishing_spot_id: str) -> dict:
     if not row:
         return {}
     fs, wb = row
+    day = (departure_time or datetime.now(tz=timezone.utc)).astimezone(_PACIFIC).date()
     return {
-        "fishing_regs": wb.fishing_regs,
+        "gear_rules": wdfw_seasons.gear_line(wb.name, wb.aliases, wb.county, wb.type, day),
         "fly_fishing_legal": wb.fly_fishing_legal,
         "species_primary": list(wb.species_primary or []),
         "last_stocked_date": str(wb.last_stocked_date) if wb.last_stocked_date else None,
@@ -1297,6 +1294,7 @@ async def _refresh_candidate_conditions(db, candidates: list[dict]) -> list[dict
     cond_result = await db.execute(
         select(ConditionsCache.water_body_id, ConditionsCache.source, ConditionsCache.data)
         .where(ConditionsCache.water_body_id.in_([uuid.UUID(w) for w in wb_ids]))
+        .where(cache_fresh())
         .order_by(
             ConditionsCache.water_body_id,
             ConditionsCache.source,
@@ -1332,7 +1330,7 @@ async def _freeze_context(db, user: User, candidates: list[dict], departure_time
     for c in top:
         sid = c["fishing_spot_id"]
         notes = await _fetch_spot_notes(db, sid)
-        details = await _fetch_spot_details(db, sid)
+        details = await _fetch_spot_details(db, sid, departure_time)
         bundles.append(
             _format_spot_bundle(c, notes=notes, details=details, departure_time=departure_time)
         )
@@ -1668,7 +1666,8 @@ async def build_context(
         )
         nps_data: dict | None = nps_result.scalar_one_or_none()
 
-        # Conditions cache — one row per (water_body_id, source), freshest wins.
+        # Conditions cache — one row per (water_body_id, source), freshest wins,
+        # and none older than its source's read limit (conditions/cache.py).
         # DISTINCT ON with ORDER BY fetched_at DESC guarantees correct row regardless
         # of how many historical rows remain in the table.
         cond_result = await db.execute(
@@ -1678,6 +1677,7 @@ async def build_context(
                 ConditionsCache.data,
             )
             .where(ConditionsCache.water_body_id.in_(water_body_ids))
+            .where(cache_fresh())
             .order_by(
                 ConditionsCache.water_body_id,
                 ConditionsCache.source,

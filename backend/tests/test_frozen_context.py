@@ -48,7 +48,8 @@ class TestSpotBundle:
             "flies": ["hopper-dropper"], "content": "worked mid-morning near the seam",
         }]
         details = {
-            "fishing_regs": {"summary": "selective gear, catch-and-release"},
+            "fishing_regs": {"summary": "stale April scrape"},
+            "gear_rules": "WDFW special rules (2026-27 pamphlet): Selective gear rules.",
             "fly_fishing_legal": True,
             "species_primary": ["rainbow trout", "cutthroat"],
             "last_stocked_date": "2025-05-01",
@@ -60,7 +61,9 @@ class TestSpotBundle:
 
         assert "=== Yakima ===" in out
         assert "Flow: 450 CFS (rising)" in out
-        assert "Fly-only: yes" in out
+        assert "WDFW special rules (2026-27 pamphlet): Selective gear rules." in out
+        # DI-0: no "Fly-only" claim from fly_fishing_legal, no stale scraped regs
+        assert "Fly-only" not in out and "Regs:" not in out and "stale April" not in out
         assert "Species: rainbow trout, cutthroat" in out
         assert "Last stocked: 2025-05-01 (rainbow trout)" in out
         assert "Permit required — WA discover pass" in out
@@ -84,10 +87,11 @@ class TestSpotBundle:
         assert line.startswith("[2025-08-01] NEGATIVE · steelhead · ~300 cfs · flies: egg — ")
         assert line.endswith('"blown out"')
 
-    def test_regs_str_handles_dict_and_string(self):
-        assert cb._regs_str({"summary": "C&R only"}) == "C&R only"
-        assert cb._regs_str("no bait") == "no bait"
-        assert cb._regs_str(None) == ""
+    def test_bundle_says_when_fly_fishing_is_not_legal(self):
+        out = cb._format_spot_bundle(_candidate(), notes=[], details={"fly_fishing_legal": False})
+        assert "Fly fishing not legal here" in out
+        out = cb._format_spot_bundle(_candidate(), notes=[], details={"fly_fishing_legal": True})
+        assert "legal" not in out
 
 
 class TestCompactMenu:

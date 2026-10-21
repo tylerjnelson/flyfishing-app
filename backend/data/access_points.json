@@ -39465,15 +39465,6 @@
     }
    ]
   },
-  "af056b6b-aedf-4cc4-83b1-19c8595e539a": {
-   "name": "Loup Loup State Forest's Sportsmen's Camp",
-   "type": "river",
-   "county": null,
-   "has_spot": false,
-   "activate": false,
-   "activate_reason": "no access point",
-   "access": []
-  },
   "d49ec809-0a48-4df9-b3b3-b7e970a0d206": {
    "name": "Lower Antilon Lake",
    "type": "lake",
@@ -40119,15 +40110,6 @@
      "note": "Methow River (49 m)"
     }
    ]
-  },
-  "27b6c050-b748-465d-be50-29937f7957b8": {
-   "name": "Middle Fork Road stream",
-   "type": "river",
-   "county": null,
-   "has_spot": false,
-   "activate": false,
-   "activate_reason": "no access point",
-   "access": []
   },
   "e3724802-c477-43fd-9a27-9b22a258db94": {
    "name": "Midway Beach Access",
@@ -41149,15 +41131,6 @@
      "note": "11 m from the river"
     }
    ]
-  },
-  "00002512-a267-4f5f-80fb-f1682b732b67": {
-   "name": "Olsen Creek State Forest stream",
-   "type": "river",
-   "county": null,
-   "has_spot": false,
-   "activate": false,
-   "activate_reason": "no access point",
-   "access": []
   },
   "38dd50ef-ab4c-46ce-897e-9993eb65a568": {
    "name": "Olson's Marina - Marina Access",
@@ -44873,15 +44846,6 @@
      "note": "NHD names the lake here Caliche Lakes"
     }
    ]
-  },
-  "baaae21f-fa68-40a4-9049-050ef823d4a4": {
-   "name": "Upper Clearwater",
-   "type": "river",
-   "county": null,
-   "has_spot": false,
-   "activate": false,
-   "activate_reason": "no access point",
-   "access": []
   },
   "78ab3f69-fbcb-4657-ab05-1b6a55aed3bb": {
    "name": "Upper Goose Lake",
